@@ -241,9 +241,9 @@ fn writes_do_not_clone_table_while_generations_are_pinned() {
     drop(generation);
 }
 
-/// S1C-004: a read generation registers a ReadGeneration pin at its birth
-/// epoch; compaction preserves the pinned versions until the generation
-/// drops, then reclaims them.
+/// S1C-004 / P0.5-X8: a read generation registers a ReadGeneration pin at its
+/// birth epoch; compaction preserves the pinned versions (HLC/epoch visibility)
+/// until the generation drops, then reclaims them.
 #[test]
 fn pinned_read_generation_blocks_version_reclamation_until_dropped() {
     let dir = tempdir().unwrap();

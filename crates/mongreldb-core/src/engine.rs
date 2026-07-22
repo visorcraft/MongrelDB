@@ -1449,6 +1449,8 @@ pub(crate) struct SharedWalCtx {
     /// S1A-004: the owning core's lifecycle, poisoned at every fsync-error
     /// site so the whole core rejects later operations.
     pub lifecycle: Arc<crate::core::LifecycleController>,
+    /// Database HLC clock used to stamp single-table commit row versions (P0.5).
+    pub hlc: Arc<mongreldb_types::hlc::HlcClock>,
 }
 
 /// Where a table's WAL records go. A standalone table owns a `Private` WAL; a
@@ -2300,12 +2302,12 @@ impl Table {
             for (key, &row_id) in &winner_pks {
                 if let Some(old_rid) = db.hot.get(key) {
                     if old_rid != row_id {
-                        db.tombstone_row(old_rid, epoch, false);
+                        db.tombstone_row(old_rid, epoch, None, false);
                     }
                 }
             }
             for &loser_rid in &losers {
-                db.tombstone_row(loser_rid, epoch, false);
+                db.tombstone_row(loser_rid, epoch, None, false);
             }
             for (key, row_id) in winner_pks {
                 db.insert_hot_pk(key, row_id);
@@ -2329,7 +2331,7 @@ impl Table {
         }
 
         if recovered_manifest_dirty {
-            let rows = db.visible_rows(Snapshot::at(Epoch(u64::MAX)))?;
+            let rows = db.visible_rows(Snapshot::unbounded())?;
             db.live_count = rows.len() as u64;
             db.persist_manifest(Epoch(recovered_epoch))?;
         }
@@ -2990,7 +2992,7 @@ impl Table {
     /// checkpoints the seeded counter).
     fn scan_max_int64(&mut self, column_id: u16) -> Result<i64> {
         let mut max: i64 = 0;
-        for r in self.memtable.visible_versions(Epoch(u64::MAX)) {
+        for r in self.memtable.visible_versions_at(Snapshot::unbounded()) {
             if let Some(Value::Int64(n)) = r.columns.get(&column_id) {
                 if *n > max {
                     max = *n;
@@ -3267,7 +3269,7 @@ impl Table {
                         if probe {
                             if let Some(old_rid) = self.hot.get(&key) {
                                 if old_rid != r.row_id {
-                                    self.tombstone_row(old_rid, r.committed_epoch, true);
+                                    self.tombstone_row(old_rid, r.committed_epoch, r.commit_ts, true);
                                 }
                             }
                         }
@@ -3311,7 +3313,7 @@ impl Table {
                     if check_existing_pk {
                         if let Some(old_rid) = self.hot.get(&key) {
                             if old_rid != row.row_id {
-                                self.tombstone_row(old_rid, epoch, true);
+                                self.tombstone_row(old_rid, epoch, row.commit_ts, true);
                             }
                         }
                     }
@@ -3379,17 +3381,18 @@ impl Table {
         let (losers, winner_pks) = self.partition_pk_winners(rows);
         let epoch = rows.first().map(|r| r.committed_epoch).unwrap_or(Epoch(0));
         // Tombstone pre-existing rows that conflict with winners.
+        let group_ts = rows.first().and_then(|r| r.commit_ts);
         for (key, &row_id) in &winner_pks {
             if let Some(old_rid) = self.hot.get(key) {
                 if old_rid != row_id {
-                    self.tombstone_row(old_rid, epoch, true);
+                    self.tombstone_row(old_rid, epoch, group_ts, true);
                 }
             }
         }
         // Hide duplicate-PK rows inside this uniform-epoch run by tombstoning
         // their row ids in the memtable overlay (the overlay wins over the run).
         for &loser_rid in &losers {
-            self.tombstone_row(loser_rid, epoch, false);
+            self.tombstone_row(loser_rid, epoch, group_ts, false);
         }
         // Insert the winners into HOT.
         for (key, row_id) in winner_pks {
@@ -3454,10 +3457,11 @@ impl Table {
         for (epoch, group) in by_epoch {
             let (losers, winner_pks) = self.partition_pk_winners(&group);
             // Tombstone pre-existing PK owners.
+            let group_ts = group.first().and_then(|r| r.commit_ts);
             for (key, &row_id) in &winner_pks {
                 if let Some(old_rid) = self.hot.get(key) {
                     if old_rid != row_id {
-                        self.tombstone_row(old_rid, epoch, false);
+                        self.tombstone_row(old_rid, epoch, group_ts, false);
                     }
                 }
             }
@@ -3674,18 +3678,35 @@ impl Table {
     /// Apply a tombstone (already-durable on the WAL) at `epoch` without
     /// appending to the per-table WAL. Used by the cross-table `Transaction`.
     pub(crate) fn apply_delete(&mut self, row_id: RowId, epoch: Epoch) {
+        self.apply_delete_at(row_id, epoch, None);
+    }
+
+    /// Apply a tombstone stamped with an optional HLC commit timestamp (P0.5).
+    pub(crate) fn apply_delete_at(
+        &mut self,
+        row_id: RowId,
+        epoch: Epoch,
+        commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) {
         self.remove_hot_for_row(row_id, epoch);
-        self.tombstone_row(row_id, epoch, true);
+        self.tombstone_row(row_id, epoch, commit_ts, true);
         self.data_generation = self.data_generation.wrapping_add(1);
     }
 
     /// Tombstone `row_id` at `epoch`. When `adjust_live_count` is true the
     /// table's `live_count` is decremented (used on the live write path); during
     /// recovery the manifest is authoritative so the flag is false.
-    fn tombstone_row(&mut self, row_id: RowId, epoch: Epoch, adjust_live_count: bool) {
+    fn tombstone_row(
+        &mut self,
+        row_id: RowId,
+        epoch: Epoch,
+        commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+        adjust_live_count: bool,
+    ) {
         let tombstone = Row {
             row_id,
             committed_epoch: epoch,
+            commit_ts,
             columns: std::collections::HashMap::new(),
             deleted: true,
         };
@@ -4083,7 +4104,19 @@ impl Table {
         let new_epoch = self.epoch.bump_assigned();
         let epoch_authority = Arc::clone(&self.epoch);
         let mut epoch_guard = EpochGuard::new(epoch_authority.as_ref(), new_epoch);
-        let commit_seq = match wal.append_commit(txn_id, new_epoch, &[]) {
+        // P0.5: stamp every row version with the database HLC so visibility is
+        // HLC-authoritative on the single-table commit path too.
+        let commit_ts = s.hlc.now().map_err(|skew| {
+            MongrelError::Other(format!(
+                "clock skew rejected commit timestamp allocation: {skew}"
+            ))
+        })?;
+        let commit_seq = match wal.append_commit_at(
+            txn_id,
+            new_epoch,
+            &[],
+            commit_ts.physical_micros.saturating_mul(1_000),
+        ) {
             Ok(commit_seq) => commit_seq,
             Err(error) => {
                 s.poisoned.store(true, Ordering::Relaxed);
@@ -4113,6 +4146,7 @@ impl Table {
         if !rows.is_empty() {
             for r in &mut rows {
                 r.committed_epoch = new_epoch;
+                r.commit_ts = Some(commit_ts);
             }
             let auto_inc_flags = std::mem::take(&mut self.pending_rows_auto_inc);
             let all_auto_generated =
@@ -4123,7 +4157,7 @@ impl Table {
         }
         let dels = std::mem::take(&mut self.pending_dels);
         for rid in dels {
-            self.apply_delete(rid, new_epoch);
+            self.apply_delete_at(rid, new_epoch, Some(commit_ts));
         }
 
         self.invalidate_pending_cache();
@@ -4540,7 +4574,7 @@ impl Table {
         // `live_count` tracks logical tombstones, not wall-clock TTL expiry.
         // Use a time before every representable timestamp so TTL cannot hide a
         // row while rebuilding authoritative manifest metadata.
-        let rows = self.visible_rows_at_time(Snapshot::at(Epoch(u64::MAX)), i64::MIN)?;
+        let rows = self.visible_rows_at_time(Snapshot::unbounded(), i64::MIN)?;
         let live_count = u64::try_from(rows.len())
             .map_err(|_| MongrelError::Full("table live-row count exceeds u64".into()))?;
         let auto_inc = match self.auto_inc {
@@ -4691,29 +4725,51 @@ impl Table {
     }
 
     /// Read the row at `row_id` visible to `snapshot`, merging the newest
-    /// version across the memtable and all sorted runs.
+    /// version across the memtable, mutable-run tier, and all sorted runs.
+    ///
+    /// In-memory tiers use full-[`Snapshot`] HLC visibility (P0.5-T3). Sorted
+    /// runs restore optional [`crate::sorted_run::SYS_COMMIT_TS`] when present
+    /// and fall back to epoch-only for legacy runs; candidates are filtered
+    /// with [`Snapshot::observes_row`] so HLC-stamped versions never win under
+    /// an epoch-only pin.
     pub fn get(&self, row_id: RowId, snapshot: Snapshot) -> Option<Row> {
-        let mut best: Option<(Epoch, Row)> = self.memtable.get_version(row_id, snapshot.epoch);
-        if let Some((epoch, row)) = self.mutable_run.get_version(row_id, snapshot.epoch) {
-            if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
-                best = Some((epoch, row));
+        let mut best: Option<Row> = None;
+        let mut consider = |row: Row| {
+            if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                return;
             }
+            if best.as_ref().is_none_or(|current| {
+                Snapshot::version_is_newer(
+                    row.committed_epoch,
+                    row.commit_ts,
+                    current.committed_epoch,
+                    current.commit_ts,
+                )
+            }) {
+                best = Some(row);
+            }
+        };
+        if let Some((_, row)) = self.memtable.get_version_at(row_id, snapshot) {
+            consider(row);
+        }
+        if let Some((_, row)) = self.mutable_run.get_version_at(row_id, snapshot) {
+            consider(row);
         }
         for rr in &self.run_refs {
             let Ok(mut reader) = self.open_reader(rr.run_id) else {
                 continue;
             };
-            let Ok(Some((epoch, row))) = reader.get_version(row_id, snapshot.epoch) else {
+            // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
+            // legacy runs without the column fall back to epoch visibility.
+            let Ok(Some((_, row))) = reader.get_version(row_id, snapshot.epoch) else {
                 continue;
             };
-            if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
-                best = Some((epoch, row));
-            }
+            consider(row);
         }
         let now_nanos = unix_nanos_now();
         match best {
-            Some((_, r)) if r.deleted || self.row_expired_at(&r, now_nanos) => None,
-            Some((_, r)) => Some(r),
+            Some(r) if r.deleted || self.row_expired_at(&r, now_nanos) => None,
+            Some(r) => Some(r),
             None => None,
         }
     }
@@ -4748,25 +4804,29 @@ impl Table {
         &self,
         snapshot: Snapshot,
         control: &crate::ExecutionControl,
-        visit: F,
+        mut visit: F,
     ) -> Result<()>
     where
         F: FnMut(Row) -> Result<()>,
     {
         let mut sources = Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
-        let memtable = self.memtable.visible_versions(snapshot.epoch);
+        // Pass the full snapshot so HLC-stamped memtable versions are observed.
+        let memtable = self.memtable.visible_versions_at(snapshot);
         if !memtable.is_empty() {
             sources.push(ControlledVisibleSource::memory(memtable));
         }
         control.checkpoint()?;
-        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
+        // Mutable-run is HLC-aware (P0.5-T3); still re-check observes_row for
+        // epoch-keyed sorted-run materialisation below.
+        let mutable = self.mutable_run.visible_versions_at(snapshot);
         if !mutable.is_empty() {
             sources.push(ControlledVisibleSource::memory(mutable));
         }
         for run in &self.run_refs {
             control.checkpoint()?;
             let reader = self.open_reader(run.run_id)?;
+            // Residual: sorted runs are epoch-keyed on disk (no commit_ts column).
             sources.push(ControlledVisibleSource::run(
                 reader.into_visible_version_cursor(snapshot.epoch)?,
             ));
@@ -4776,37 +4836,53 @@ impl Table {
             &mut sources,
             control,
             |row| self.row_expired_at(row, now_nanos),
-            visit,
+            |row| {
+                // Epoch-keyed sorted runs can surface versions an epoch-only
+                // snapshot must not observe under dual authority (P0.5-T7).
+                if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                    return Ok(());
+                }
+                visit(row)
+            },
         )
     }
 
     #[doc(hidden)]
     pub fn visible_rows_at_time(&self, snapshot: Snapshot, now_nanos: i64) -> Result<Vec<Row>> {
-        let mut best: HashMap<u64, (Epoch, Row)> = HashMap::new();
+        let mut best: HashMap<u64, Row> = HashMap::new();
         let mut fold = |row: Row| {
+            if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                return;
+            }
             best.entry(row.row_id.0)
-                .and_modify(|e| {
-                    if row.committed_epoch > e.0 {
-                        *e = (row.committed_epoch, row.clone());
+                .and_modify(|existing| {
+                    if Snapshot::version_is_newer(
+                        row.committed_epoch,
+                        row.commit_ts,
+                        existing.committed_epoch,
+                        existing.commit_ts,
+                    ) {
+                        *existing = row.clone();
                     }
                 })
-                .or_insert_with(|| (row.committed_epoch, row));
+                .or_insert(row);
         };
-        for row in self.memtable.visible_versions(snapshot.epoch) {
+        for row in self.memtable.visible_versions_at(snapshot) {
             fold(row);
         }
-        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+        for row in self.mutable_run.visible_versions_at(snapshot) {
             fold(row);
         }
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
+            // P0.5-T3: optional SYS_COMMIT_TS restored when present on the run.
             for row in reader.visible_versions(snapshot.epoch)? {
                 fold(row);
             }
         }
         let mut out: Vec<Row> = best
             .into_values()
-            .filter_map(|(_, r)| {
+            .filter_map(|r| {
                 if r.deleted || self.row_expired_at(&r, now_nanos) {
                     None
                 } else {
@@ -4858,7 +4934,7 @@ impl Table {
     /// Resolve a primary-key value to a row id (latest version).
     pub fn lookup_pk(&self, key: &[u8]) -> Option<RowId> {
         let row_id = self.hot.get(key)?;
-        if self.ttl.is_none() || self.get(row_id, Snapshot::at(Epoch(u64::MAX))).is_some() {
+        if self.ttl.is_none() || self.get(row_id, Snapshot::unbounded()).is_some() {
             Some(row_id)
         } else {
             None
@@ -5619,10 +5695,19 @@ impl Table {
             if let Some(context) = context {
                 context.consume(1)?;
             }
-            let mem = self.memtable.get_version(row_id, snapshot.epoch);
-            let mutable = self.mutable_run.get_version(row_id, snapshot.epoch);
+            let mem = self.memtable.get_version_at(row_id, snapshot);
+            let mutable = self.mutable_run.get_version_at(row_id, snapshot);
             let overlay = match (mem, mutable) {
-                (Some(left), Some(right)) => Some(if left.0 >= right.0 { left } else { right }),
+                (Some(left), Some(right)) => Some(if Snapshot::version_is_newer(
+                    left.1.committed_epoch,
+                    left.1.commit_ts,
+                    right.1.committed_epoch,
+                    right.1.commit_ts,
+                ) {
+                    left
+                } else {
+                    right
+                }),
                 (Some(value), None) | (None, Some(value)) => Some(value),
                 (None, None) => None,
             };
@@ -5705,6 +5790,7 @@ impl Table {
                     Row {
                         row_id: *row_id,
                         committed_epoch: snapshot.epoch,
+                        commit_ts: None,
                         columns: std::collections::HashMap::new(),
                         deleted: false,
                     },
@@ -6166,6 +6252,11 @@ impl Table {
             let score_started = std::time::Instant::now();
             let mut scores = std::collections::HashMap::with_capacity(vectors.len());
             for (row_id, value) in vectors {
+                if let Some(meta) = value.generated_embedding_metadata() {
+                    if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
+                        continue;
+                    }
+                }
                 let Some(vector) = value.as_embedding() else {
                     continue;
                 };
@@ -6516,6 +6607,11 @@ impl Table {
         };
         let mut reranked = Vec::with_capacity(values.len().min(request.limit));
         for (row_id, value) in values {
+            if let Some(meta) = value.generated_embedding_metadata() {
+                if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
+                    continue;
+                }
+            }
             let Some(vector) = value.as_embedding() else {
                 continue;
             };
@@ -6928,18 +7024,23 @@ impl Table {
         let mut out = Vec::with_capacity(row_ids.len());
         for &raw_row_id in row_ids {
             let row_id = RowId(raw_row_id);
-            let mem = self.memtable.get_version(row_id, snapshot.epoch);
-            let mutable = self.mutable_run.get_version(row_id, snapshot.epoch);
+            let mem = self.memtable.get_version_at(row_id, snapshot);
+            let mutable = self.mutable_run.get_version_at(row_id, snapshot);
             let overlay = match (mem, mutable) {
-                (Some((a_epoch, a)), Some((b_epoch, b))) => Some(if a_epoch >= b_epoch {
-                    (a_epoch, a)
+                (Some((_, a)), Some((_, b))) => Some(if Snapshot::version_is_newer(
+                    a.committed_epoch,
+                    a.commit_ts,
+                    b.committed_epoch,
+                    b.commit_ts,
+                ) {
+                    a
                 } else {
-                    (b_epoch, b)
+                    b
                 }),
-                (Some(value), None) | (None, Some(value)) => Some(value),
+                (Some((_, value)), None) | (None, Some((_, value))) => Some(value),
                 (None, None) => None,
             };
-            if let Some((_, row)) = overlay {
+            if let Some(row) = overlay {
                 if !row.deleted && !self.row_expired_at(&row, now) {
                     if let Some(value) = row.columns.get(&column_id) {
                         out.push((row_id, value.clone()));
@@ -7013,10 +7114,8 @@ impl Table {
         use std::collections::HashMap;
         let mut rows = Vec::with_capacity(rids.len());
         // Overlay (memtable + mutable-run) newest visible version per rid —
-        // these shadow any stale version stored in a run. A rid may have an
-        // older version in the mutable-run tier and a newer one in the memtable
-        // (an update after a flush), so keep the **newest by epoch** across both
-        // tiers, not whichever is inserted last.
+        // these shadow any stale version stored in a run. Prefer HLC order via
+        // version_is_newer when stamps are present (P0.5-T3).
         //
         // `rids` is already index-resolved (the caller's condition set), so it
         // is normally tiny relative to the memtable/mutable-run tiers — a
@@ -7025,9 +7124,9 @@ impl Table {
         // behavior) cost O(tier size) regardless, which meant an unrelated
         // full-table-sized scan (plus the drop cost of the resulting map) on
         // every point lookup once the table grew large. Below the crossover,
-        // a direct per-rid probe (`get_version`, O(log tier size) each) wins;
-        // once `rids` approaches tier size, one linear materializing pass
-        // beats `rids.len()` separate probes, so fall back to it.
+        // a direct per-rid probe (`get_version_at`) wins; once `rids` approaches
+        // tier size, one linear materializing pass beats `rids.len()` separate
+        // probes, so fall back to it.
         let tier_size = self.memtable.len() + self.mutable_run.len();
         let mut overlay: HashMap<u64, Row> = HashMap::with_capacity(rids.len());
         if rids.len().saturating_mul(24) < tier_size {
@@ -7037,10 +7136,19 @@ impl Table {
                         .map(crate::ExecutionControl::checkpoint)
                         .transpose()?;
                 }
-                let mem = self.memtable.get_version(RowId(rid), snapshot.epoch);
-                let mrun = self.mutable_run.get_version(RowId(rid), snapshot.epoch);
+                let mem = self.memtable.get_version_at(RowId(rid), snapshot);
+                let mrun = self.mutable_run.get_version_at(RowId(rid), snapshot);
                 let newest = match (mem, mrun) {
-                    (Some((me, mr)), Some((re, rr))) => Some(if me >= re { mr } else { rr }),
+                    (Some((_, mr)), Some((_, rr))) => Some(if Snapshot::version_is_newer(
+                        mr.committed_epoch,
+                        mr.commit_ts,
+                        rr.committed_epoch,
+                        rr.commit_ts,
+                    ) {
+                        mr
+                    } else {
+                        rr
+                    }),
                     (Some((_, mr)), None) => Some(mr),
                     (None, Some((_, rr))) => Some(rr),
                     (None, None) => None,
@@ -7054,7 +7162,12 @@ impl Table {
                 overlay
                     .entry(row.row_id.0)
                     .and_modify(|e| {
-                        if row.committed_epoch > e.committed_epoch {
+                        if Snapshot::version_is_newer(
+                            row.committed_epoch,
+                            row.commit_ts,
+                            e.committed_epoch,
+                            e.commit_ts,
+                        ) {
                             *e = row.clone();
                         }
                     })
@@ -7062,7 +7175,7 @@ impl Table {
             };
             for (index, row) in self
                 .memtable
-                .visible_versions(snapshot.epoch)
+                .visible_versions_at(snapshot)
                 .into_iter()
                 .enumerate()
             {
@@ -7075,7 +7188,7 @@ impl Table {
             }
             for (index, row) in self
                 .mutable_run
-                .visible_versions(snapshot.epoch)
+                .visible_versions_at(snapshot)
                 .into_iter()
                 .enumerate()
             {
@@ -7642,10 +7755,10 @@ impl Table {
     /// Collect the set of row-ids visible in the memtable / mutable-run overlay.
     fn overlay_rid_set(&self, snapshot: Snapshot) -> HashSet<u64> {
         let mut s = HashSet::new();
-        for row in self.memtable.visible_versions(snapshot.epoch) {
+        for row in self.memtable.visible_versions_at(snapshot) {
             s.insert(row.row_id.0);
         }
-        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+        for row in self.mutable_run.visible_versions_at(snapshot) {
             s.insert(row.row_id.0);
         }
         s
@@ -7660,17 +7773,29 @@ impl Table {
         snapshot: Snapshot,
     ) {
         // Collapse both overlay tiers to the newest visible version per row id
-        // (the memtable supersedes the mutable run) before range-checking, so a
-        // stale in-range mutable-run version cannot shadow a newer out-of-range
+        // (HLC-aware when stamped; P0.5-T3) before range-checking, so a stale
+        // in-range mutable-run version cannot shadow a newer out-of-range
         // memtable version of the same row.
-        let mut newest: HashMap<u64, &Row> = HashMap::new();
-        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
-        let memtable = self.memtable.visible_versions(snapshot.epoch);
-        for r in &mutable {
-            newest.entry(r.row_id.0).or_insert(r);
-        }
-        for r in &memtable {
+        // Both tiers already applied version_is_newer within themselves; when
+        // both report a rid, prefer the HLC-newer of the two.
+        let mut newest: HashMap<u64, Row> = HashMap::new();
+        for r in self.mutable_run.visible_versions_at(snapshot) {
             newest.insert(r.row_id.0, r);
+        }
+        for r in self.memtable.visible_versions_at(snapshot) {
+            newest
+                .entry(r.row_id.0)
+                .and_modify(|cur| {
+                    if Snapshot::version_is_newer(
+                        r.committed_epoch,
+                        r.commit_ts,
+                        cur.committed_epoch,
+                        cur.commit_ts,
+                    ) {
+                        *cur = r.clone();
+                    }
+                })
+                .or_insert(r);
         }
         for row in newest.values() {
             if !row.deleted {
@@ -7696,14 +7821,24 @@ impl Table {
     ) {
         // See `range_scan_overlay_i64`: dedup to the newest version per row id
         // across the memtable + mutable run before range-checking.
-        let mut newest: HashMap<u64, &Row> = HashMap::new();
-        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
-        let memtable = self.memtable.visible_versions(snapshot.epoch);
-        for r in &mutable {
-            newest.entry(r.row_id.0).or_insert(r);
-        }
-        for r in &memtable {
+        let mut newest: HashMap<u64, Row> = HashMap::new();
+        for r in self.mutable_run.visible_versions_at(snapshot) {
             newest.insert(r.row_id.0, r);
+        }
+        for r in self.memtable.visible_versions_at(snapshot) {
+            newest
+                .entry(r.row_id.0)
+                .and_modify(|cur| {
+                    if Snapshot::version_is_newer(
+                        r.committed_epoch,
+                        r.commit_ts,
+                        cur.committed_epoch,
+                        cur.commit_ts,
+                    ) {
+                        *cur = r.clone();
+                    }
+                })
+                .or_insert(r);
         }
         for row in newest.values() {
             if !row.deleted {
@@ -7747,14 +7882,24 @@ impl Table {
         want_nulls: bool,
         snapshot: Snapshot,
     ) {
-        let mut newest: HashMap<u64, &Row> = HashMap::new();
-        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
-        let memtable = self.memtable.visible_versions(snapshot.epoch);
-        for r in &mutable {
-            newest.entry(r.row_id.0).or_insert(r);
-        }
-        for r in &memtable {
+        let mut newest: HashMap<u64, Row> = HashMap::new();
+        for r in self.mutable_run.visible_versions_at(snapshot) {
             newest.insert(r.row_id.0, r);
+        }
+        for r in self.memtable.visible_versions_at(snapshot) {
+            newest
+                .entry(r.row_id.0)
+                .and_modify(|cur| {
+                    if Snapshot::version_is_newer(
+                        r.committed_epoch,
+                        r.commit_ts,
+                        cur.committed_epoch,
+                        cur.commit_ts,
+                    ) {
+                        *cur = r.clone();
+                    }
+                })
+                .or_insert(r);
         }
         for row in newest.values() {
             if row.deleted {
@@ -7769,7 +7914,18 @@ impl Table {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot::at(self.epoch.visible())
+        let epoch = self.epoch.visible();
+        // P0.5: mounted tables pin the shared HLC so HLC-stamped row versions
+        // remain visible under at_hlc. Standalone private-WAL tables fall back
+        // to epoch-only (private commits do not stamp HLC today).
+        match &self.wal {
+            WalSink::Shared(shared) => match shared.hlc.now() {
+                Ok(commit_ts) => Snapshot::at_hlc(epoch, commit_ts),
+                // Clock skew must not hide committed HLC rows from product reads.
+                Err(_) => Snapshot::at_hlc(epoch, mongreldb_types::hlc::HlcTimestamp::MAX),
+            },
+            WalSink::Private(_) | WalSink::ReadOnly => Snapshot::at(epoch),
+        }
     }
 
     /// Generation of this table's row contents for table-local caches.
@@ -7836,6 +7992,14 @@ impl Table {
                 &self.sparse,
                 &self.minhash,
                 visible_through,
+                // P0.5-T5: authoritative HLC readiness watermark.
+                match &self.wal {
+                    WalSink::Shared(shared) => shared
+                        .hlc
+                        .now()
+                        .unwrap_or(mongreldb_types::hlc::HlcTimestamp::MAX),
+                    _ => mongreldb_types::hlc::HlcTimestamp::MAX,
+                },
             )),
             visible_through,
         }
@@ -7931,12 +8095,59 @@ impl Table {
             .saturating_add(self.live_count.saturating_mul(64))
     }
 
-    /// Pin the current epoch as a read snapshot; compaction will preserve the
-    /// versions it needs until [`Table::unpin_snapshot`] is called.
+    /// Pin the current read snapshot; compaction will preserve the versions it
+    /// needs until [`Table::unpin_snapshot`] is called.
+    ///
+    /// Mounted (shared-WAL) tables pin HLC via [`Snapshot::at_hlc`] so HLC is
+    /// the cluster-wide authority. Standalone private-WAL tables remain
+    /// epoch-only until they stamp HLC on commit.
     pub fn pin_snapshot(&mut self) -> Snapshot {
-        let e = self.epoch.visible();
-        *self.pinned.entry(e).or_insert(0) += 1;
-        Snapshot::at(e)
+        let snap = self.snapshot();
+        *self.pinned.entry(snap.epoch).or_insert(0) += 1;
+        snap
+    }
+
+    /// P0.5-T6: report the HLC GC floor as named pin sources.
+    ///
+    /// Epoch pins that cannot yet be projected to a durable HLC report
+    /// [`HlcTimestamp::ZERO`](mongreldb_types::hlc::HlcTimestamp::ZERO). Physical
+    /// reclamation still consults the epoch floor ([`Self::version_gc_floor`]).
+    ///
+    /// `project_epoch` maps a local pin epoch to an HLC (typically
+    /// [`crate::Database::commit_ts_for_epoch`]); return `None` / `ZERO` when
+    /// the epoch has no durable stamp.
+    pub fn hlc_gc_floor(
+        &self,
+        mut project_epoch: impl FnMut(Epoch) -> Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) -> crate::epoch::GcFloor {
+        let mut project = |epoch: Option<Epoch>| -> mongreldb_types::hlc::HlcTimestamp {
+            epoch
+                .and_then(&mut project_epoch)
+                .filter(|ts| *ts != mongreldb_types::hlc::HlcTimestamp::ZERO)
+                .unwrap_or(mongreldb_types::hlc::HlcTimestamp::ZERO)
+        };
+        let transaction = [
+            self.pinned.keys().next().copied(),
+            self.snapshots.min_pinned(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let history = self.snapshots.history_floor(self.current_epoch());
+        crate::epoch::GcFloor {
+            transaction_snapshot: project(transaction),
+            history_retention: project(history),
+            backup_pitr: project(self.pins.oldest_for(crate::retention::PinSource::BackupPitr)),
+            replication: project(self.pins.oldest_for(crate::retention::PinSource::Replication)),
+            read_generation: project(
+                self.pins
+                    .oldest_for(crate::retention::PinSource::ReadGeneration),
+            ),
+            online_index_build: project(
+                self.pins
+                    .oldest_for(crate::retention::PinSource::OnlineIndexBuild),
+            ),
+        }
     }
 
     /// Release a pinned snapshot.
@@ -10449,6 +10660,14 @@ impl Table {
         &self.schema
     }
 
+    pub fn ann_index(&self, column_id: u16) -> Option<&crate::index::AnnIndex> {
+        self.ann.get(&column_id)
+    }
+
+    pub fn ann_index_mut(&mut self, column_id: u16) -> Option<&mut crate::index::AnnIndex> {
+        self.ann.get_mut(&column_id)
+    }
+
     pub(crate) fn set_catalog_name(&mut self, name: String) {
         self.name = name;
     }
@@ -11891,6 +12110,18 @@ fn index_into(
             }
             IndexKind::Ann => {
                 if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
+                    if let Some(meta) = val.generated_embedding_metadata() {
+                        // P1.5-T3: pending/failed generated vectors stay out of ANN.
+                        if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
+                            continue;
+                        }
+                        if a
+                            .bind_or_check_semantic_identity(&meta.semantic_identity)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                    }
                     a.insert_validated(v, row.row_id);
                 }
             }
@@ -11951,6 +12182,18 @@ fn index_into_single(
         }
         IndexKind::Ann => {
             if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
+                if let Some(meta) = val.generated_embedding_metadata() {
+                    // P1.5-T3: pending/failed generated vectors stay out of ANN.
+                    if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
+                        return;
+                    }
+                    if a
+                        .bind_or_check_semantic_identity(&meta.semantic_identity)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 a.insert_validated(v, row.row_id);
             }
         }

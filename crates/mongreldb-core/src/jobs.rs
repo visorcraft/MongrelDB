@@ -235,6 +235,8 @@ pub enum JobKind {
     KeyRotation,
     /// Bulk import too large for the interactive write path.
     LargeImport,
+    /// Async embedding generation for a row/column (P1.5).
+    EmbeddingGeneration,
 }
 
 /// Table/index identifiers a job operates on.

@@ -210,4 +210,35 @@ mod tests {
         let (_, det) = redacted_ddl_detail("DROP TABLE items", true);
         assert!(det.contains("DROP TABLE items"));
     }
+
+    // P1.6-X6: audit event for long-running ops links the job id.
+    #[test]
+    fn audit_event_links_job_id() {
+        let log = AuditLog::new(16);
+        let job_id = "job-42";
+        // Mirrors accept_ops_job / JobControl detail shape in cluster_admin.
+        log.record(
+            "admin",
+            "admin.sql.job.accepted",
+            format!("command=BACKUP DATABASE job_id={job_id} kind=backup state=pending"),
+        );
+        log.record(
+            "admin",
+            "admin.sql.job_control.ok",
+            format!("action=CANCEL job_id={job_id} state=cancelling"),
+        );
+        let recent = log.recent();
+        assert_eq!(recent.len(), 2);
+        assert!(
+            recent[0].detail.contains("job_id=job-42"),
+            "accepted audit must link job_id: {}",
+            recent[0].detail
+        );
+        assert!(
+            recent[1].detail.contains("job_id=job-42"),
+            "job_control audit must link job_id: {}",
+            recent[1].detail
+        );
+        assert_eq!(recent[0].action, "admin.sql.job.accepted");
+    }
 }

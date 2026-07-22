@@ -207,31 +207,27 @@ impl DatabaseManager {
             }
         };
         let unbound = Database::from_core(Arc::clone(&core), None, true);
-        let (handle_identity, principal, service_permissions) = match identity {
+        let (handle_identity, principal) = match identity {
             OpenIdentity::Credentialless => {
                 if unbound.require_auth_enabled() {
                     return Err(crate::error::MongrelError::AuthRequired);
                 }
-                (crate::handle::HandleIdentity::Credentialless, None, None)
+                (crate::handle::HandleIdentity::Credentialless, None)
             }
-            OpenIdentity::ServicePrincipal { principal_id } => {
-                let permissions = Vec::new();
-                let principal = service_principal(principal_id, permissions.clone());
+            OpenIdentity::ServiceCredentials { token_id, secret } => {
+                // Authority comes only from the shared store after secret
+                // verification (P0.1). Callers cannot supply permissions.
+                let def = core
+                    .service_principals
+                    .authenticate(&token_id, secret.expose())?;
+                let principal = service_principal_from_def(&def);
                 (
-                    crate::handle::HandleIdentity::ServicePrincipal { principal_id },
+                    crate::handle::HandleIdentity::ServicePrincipal {
+                        token_id: def.token_id,
+                        principal_id: def.principal_id,
+                        creation_version: def.creation_version,
+                    },
                     Some(principal),
-                    Some(permissions),
-                )
-            }
-            OpenIdentity::ScopedServicePrincipal {
-                principal_id,
-                permissions,
-            } => {
-                let principal = service_principal(principal_id, permissions.clone());
-                (
-                    crate::handle::HandleIdentity::ServicePrincipal { principal_id },
-                    Some(principal),
-                    Some(permissions),
                 )
             }
             OpenIdentity::CatalogCredentials { username, password } => {
@@ -248,16 +244,11 @@ impl DatabaseManager {
                     user_id: principal.user_id,
                     created_version: principal.created_epoch,
                 };
-                (identity, Some(principal), None)
+                (identity, Some(principal))
             }
         };
         let facade = Database::from_core(core, principal, true);
-        Ok(DatabaseHandle::new(
-            facade,
-            handle_identity,
-            access,
-            service_permissions,
-        ))
+        Ok(DatabaseHandle::new(facade, handle_identity, access, None))
     }
 
     /// Number of registry entries (all states). Diagnostics and tests.
@@ -291,17 +282,16 @@ impl DatabaseManager {
     }
 }
 
-fn service_principal(
-    principal_id: [u8; 16],
-    permissions: Vec<crate::auth::Permission>,
+fn service_principal_from_def(
+    def: &crate::service_principal::ServicePrincipalDefinition,
 ) -> crate::auth::Principal {
     crate::auth::Principal {
         user_id: 0,
-        created_epoch: 0,
-        username: format!("service:{principal_id:02x?}"),
+        created_epoch: def.creation_version,
+        username: format!("service:{}", def.token_id),
         is_admin: false,
         roles: Vec::new(),
-        permissions,
+        permissions: def.permissions.clone(),
     }
 }
 

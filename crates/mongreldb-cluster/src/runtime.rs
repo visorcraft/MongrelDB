@@ -66,8 +66,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mongreldb_consensus::engine_sink::{
-    open_engine_sink, EngineApplySink, EngineGroupConfig, EngineSinkError, EngineTabletPin,
-    TabletDataCommand, TabletDataCommandRecord, TabletDataMutation, COMMAND_TYPE_TABLET_DATA,
+    build_tablet_write_envelope, open_engine_sink, EngineApplySink, EngineGroupConfig,
+    EngineSinkError, EngineTabletPin, TabletDataCommand, TabletDataCommandRecord,
+    TabletDataMutation, TabletTableBinding, TabletWriteOperation, COMMAND_TYPE_TABLET_DATA,
 };
 use mongreldb_consensus::error::ConsensusError;
 use mongreldb_consensus::group::{ConsensusGroup, GroupCommitReceipt, GroupConfig, GroupMetrics};
@@ -203,12 +204,32 @@ pub struct NodeRuntimeConfig {
 }
 
 impl NodeRuntimeConfig {
-    /// A configuration with production transport bounds, plaintext security,
-    /// and no meta membership; callers adjust the fields they need.
-    pub fn new(node_data: PathBuf, listen_address: String) -> Self {
+    /// Test-only plaintext constructor (P1.3).
+    #[cfg(any(test, feature = "dangerous-test-transport"))]
+    pub fn plaintext_for_tests(node_data: PathBuf, listen_address: String) -> Self {
+        Self::new_inner(node_data, listen_address, TransportSecurity::PlaintextForTesting)
+    }
+
+    /// Production constructor requiring mTLS (P1.3).
+    ///
+    /// Rejects [`TransportSecurity::PlaintextForTesting`].
+    pub fn production(
+        node_data: PathBuf,
+        listen_address: String,
+        security: TransportSecurity,
+    ) -> Result<Self, String> {
+        match security {
+            TransportSecurity::PlaintextForTesting => Err(
+                "production NodeRuntimeConfig rejects plaintext cluster transport".into(),
+            ),
+            other => Ok(Self::new_inner(node_data, listen_address, other)),
+        }
+    }
+
+    fn new_inner(node_data: PathBuf, listen_address: String, security: TransportSecurity) -> Self {
         Self {
             node_data,
-            security: TransportSecurity::PlaintextForTesting,
+            security,
             transport: TransportConfig::default(),
             listen_address,
             rpc_address: None,
@@ -217,7 +238,43 @@ impl NodeRuntimeConfig {
             timing: None,
         }
     }
+
+    /// Prefer [`Self::production`] or [`Self::plaintext_for_tests`].
+    #[cfg(any(test, feature = "dangerous-test-transport"))]
+    pub fn new(node_data: PathBuf, listen_address: String) -> Self {
+        Self::plaintext_for_tests(node_data, listen_address)
+    }
 }
+
+#[cfg(test)]
+mod node_runtime_config_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn production_rejects_plaintext_transport() {
+        let err = NodeRuntimeConfig::production(
+            PathBuf::from("/tmp/node"),
+            "127.0.0.1:0".into(),
+            TransportSecurity::PlaintextForTesting,
+        )
+        .unwrap_err();
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn plaintext_for_tests_is_usable() {
+        let cfg = NodeRuntimeConfig::plaintext_for_tests(
+            PathBuf::from("/tmp/node"),
+            "127.0.0.1:0".into(),
+        );
+        assert!(matches!(
+            cfg.security,
+            TransportSecurity::PlaintextForTesting
+        ));
+    }
+}
+
 
 /// Status of the meta group member on this node.
 #[derive(Clone, Debug)]
@@ -908,7 +965,22 @@ impl NodeRuntime {
             let mut engine = sink
                 .lock()
                 .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?;
-            engine.initialize_tablet_keyspace()?;
+            // P0.3: new production tablets use typed user-table bindings, not
+            // the opaque `__mongreldb_tablet_rows` envelope. `initialize_tablet_keyspace`
+            // still opens *existing* opaque keyspaces (reopen / migration);
+            // when it refuses creation, leave the sink unbound for a later
+            // `bind_tablet_user_table` (public data plane / P0.2 gateway).
+            match engine.initialize_tablet_keyspace() {
+                Ok(()) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.contains("opaque tablet keyspace is disabled") {
+                        // Fresh typed tablet: no opaque envelope.
+                    } else {
+                        return Err(RuntimeError::from(error));
+                    }
+                }
+            }
             let legacy_path = engine_config
                 .group_dir()
                 .join("raft")
@@ -1024,7 +1096,11 @@ impl NodeRuntime {
     }
 
     /// The engine MVCC sink of one locally hosted tablet.
-    fn tablet_sink(&self, tablet_id: TabletId) -> Option<Arc<Mutex<EngineApplySink>>> {
+    ///
+    /// Server fragment/AI workers use this to resolve the applied
+    /// `ClusterReplica` core for a hosted tablet without opening tablet
+    /// files from the gateway query path.
+    pub fn tablet_sink(&self, tablet_id: TabletId) -> Option<Arc<Mutex<EngineApplySink>>> {
         self.tablets
             .get(&tablet_id)
             .map(|tablet| tablet.sink.clone())
@@ -2017,6 +2093,9 @@ impl NodeRuntime {
     /// proposal rides the local group, so
     /// it must be the leader — a [`ConsensusError::NotLeader`] surfaces with
     /// the leader hint for the caller to route by.
+    ///
+    /// Requires an opaque tablet keyspace (legacy). Prefer
+    /// [`Self::write_tablet_ops`] on typed user-table tablets.
     pub async fn write_tablet_rows(
         &self,
         tablet_id: TabletId,
@@ -2042,8 +2121,66 @@ impl NodeRuntime {
         Ok(receipt)
     }
 
+    /// Raft-proposes typed user-table mutations (`COMMAND_TYPE_TABLET_WRITE`).
+    ///
+    /// The tablet must already be bound via [`Self::bind_tablet_user_table`].
+    /// Local replica must be the group leader.
+    pub async fn write_tablet_ops(
+        &self,
+        tablet_id: TabletId,
+        operations: Vec<TabletWriteOperation>,
+        control: &ExecutionControl,
+    ) -> Result<GroupCommitReceipt, RuntimeError> {
+        let tablet = self.hosted_tablet(tablet_id)?;
+        let envelope = build_tablet_write_envelope(new_data_command_id()?, operations);
+        let receipt = tablet
+            .group
+            .propose(CommandKind::Catalog, envelope, control)
+            .await?;
+        Ok(receipt)
+    }
+
+    /// Binds a hosted tablet sink to a real user-table schema fragment (P0.3).
+    pub fn bind_tablet_user_table(
+        &self,
+        tablet_id: TabletId,
+        binding: TabletTableBinding,
+    ) -> Result<TabletTableBinding, RuntimeError> {
+        let sink = self.tablet_sink(tablet_id).ok_or_else(|| {
+            RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))
+        })?;
+        let mut locked = sink
+            .lock()
+            .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?;
+        Ok(locked.bind_tablet_user_table(binding)?)
+    }
+
+    /// Typed user-table binding on a hosted tablet, when present.
+    pub fn tablet_table_binding(&self, tablet_id: TabletId) -> Option<TabletTableBinding> {
+        let sink = self.tablet_sink(tablet_id)?;
+        let locked = sink.lock().ok()?;
+        locked.tablet_table_binding().cloned()
+    }
+
+    /// Visible typed rows of a bound user-table tablet.
+    pub fn tablet_typed_rows(
+        &self,
+        tablet_id: TabletId,
+    ) -> Result<mongreldb_consensus::engine_sink::TypedTabletRows, RuntimeError> {
+        let sink = self.tablet_sink(tablet_id).ok_or_else(|| {
+            RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))
+        })?;
+        let locked = sink
+            .lock()
+            .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?;
+        Ok(locked.tablet_typed_rows()?)
+    }
+
     /// The current applied rows of a hosted tablet (the local replica's
     /// point-in-time view; run a read barrier first for linearizability).
+    ///
+    /// Opaque keyspace path only. Prefer [`Self::tablet_typed_rows`] for
+    /// typed user-table tablets.
     pub fn tablet_rows(&self, tablet_id: TabletId) -> Result<BTreeMap<Key, Vec<u8>>, RuntimeError> {
         let sink = self.tablet_sink(tablet_id).ok_or_else(|| {
             RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))

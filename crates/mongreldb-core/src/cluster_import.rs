@@ -143,7 +143,8 @@ pub fn cluster_import_prepare(source: impl AsRef<Path>, database: &str) -> Resul
     let db = crate::Database::open_with_options(source.as_ref(), options)?;
     let source_storage_mode = db.storage_mode()?;
     let snapshot_epoch = db.visible_epoch();
-    let snapshot = crate::epoch::Snapshot::at(snapshot_epoch);
+    // P0.5: HLC-stamped versions require an HLC-pinned snapshot.
+    let snapshot = db.snapshot_for_epoch(snapshot_epoch);
 
     let mut tables = Vec::new();
     for name in db.table_names() {
@@ -244,7 +245,7 @@ mod tests {
         let handle = db.table("items").unwrap();
         let expected_rows = handle
             .lock()
-            .visible_rows(crate::epoch::Snapshot::at(snapshot_epoch))
+            .visible_rows(db.snapshot_for_epoch(snapshot_epoch))
             .unwrap();
         drop(handle);
         drop(db);
@@ -273,7 +274,7 @@ mod tests {
         let handle = db.table("items").unwrap();
         let rows = handle
             .lock()
-            .visible_rows(crate::epoch::Snapshot::at(snapshot_epoch))
+            .visible_rows(db.snapshot_for_epoch(snapshot_epoch))
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(plan.database, "app");

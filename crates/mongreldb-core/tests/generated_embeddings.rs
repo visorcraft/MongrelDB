@@ -161,6 +161,11 @@ fn assert_generated(value: &Value, vector: &[f32], source: &str) {
     assert_eq!(metadata.status, EmbeddingGenerationStatus::Ready);
     assert_eq!(metadata.last_error_category, None);
     assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.semantic_identity.provider_id, "text-test");
+    assert_eq!(metadata.semantic_identity.model_id, "length-and-sum");
+    assert_eq!(metadata.semantic_identity.model_version, "1");
+    assert_eq!(metadata.semantic_identity.dimension, 2);
+    assert_eq!(metadata.provider_registry_generation, 1);
 }
 
 #[test]
@@ -438,3 +443,4 @@ fn replication_applies_committed_vectors_without_provider() {
     let row = follower.rows_for("documents", None).unwrap().remove(0);
     assert_generated(row.columns.get(&3).unwrap(), &[3.0, 312.0], "cat");
 }
+

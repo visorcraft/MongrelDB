@@ -1656,6 +1656,7 @@ mod tests {
 
     // -- node certificate naming -------------------------------------------
 
+    // ID: P1.3-X3 Node certificate binds node ID (CN/SAN scheme).
     #[test]
     fn node_cert_name_matches_the_fixture_scheme() {
         assert_eq!(
@@ -1670,6 +1671,8 @@ mod tests {
 
     // -- TlsConfig loading ---------------------------------------------------
 
+    // ID: P1.3-X3 Node certificate binds node ID.
+    // ID: P1.3-X4 Non-member peer rejected (allows_identity false).
     #[test]
     fn tls_config_loads_fixture_material() {
         let allowed = vec![node_id(1), node_id(2)];
@@ -1742,6 +1745,7 @@ mod tests {
             .to_vec()
     }
 
+    // ID: P1.3-X3 Node certificate DER carries bound node ID in CN and SAN.
     #[test]
     fn der_extracts_node_identity_from_cn_and_san() {
         let identities = der::certificate_identities(&pem_cert_der("node1.crt.pem")).unwrap();

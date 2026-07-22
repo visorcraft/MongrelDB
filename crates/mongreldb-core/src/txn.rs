@@ -474,7 +474,7 @@ impl<'db> Transaction<'db> {
     /// the fixed begin snapshot.
     fn statement_snapshot(&self) -> Snapshot {
         match self.isolation.canonical() {
-            IsolationLevel::ReadCommitted => Snapshot::at(self.db.visible_epoch()),
+            IsolationLevel::ReadCommitted => self.db.visible_snapshot(),
             _ => self.read,
         }
     }

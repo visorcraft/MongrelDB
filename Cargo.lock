@@ -3619,6 +3619,7 @@ dependencies = [
  "libc",
  "mongreldb-client",
  "mongreldb-cluster",
+ "mongreldb-consensus",
  "mongreldb-core",
  "mongreldb-log",
  "mongreldb-protocol",

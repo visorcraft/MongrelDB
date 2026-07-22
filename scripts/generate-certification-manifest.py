@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Create certification evidence only after every required CI log exists."""
+"""Create certification evidence only after every required CI log exists.
+
+Architecture task IDs follow the Stage 0–5 architecture specification
+(FND-*, S1*, S2*, S3*, S4*, S5*). Residual R1–R10 IDs are emitted as optional
+aliases for backward compatibility.
+
+Status rule (audit §2.4 / P0.9): Integrated ≠ Qualified. This generator marks
+every Stage task Integrated unless real multi-class evidence paths are
+configured for that task. It does NOT flip Integrated → Qualified without
+exact-SHA product evidence of the required classes.
+"""
 
 import argparse
 import hashlib
@@ -79,7 +89,176 @@ TESTS = {
     ),
 }
 
-ARCHITECTURE_TASKS = {
+# Mandatory Stage 0–5 architecture task IDs (must stay aligned with
+# crates/mongreldb-core/src/certification.rs::MANDATORY_ARCHITECTURE_TASK_IDS).
+MANDATORY_ARCHITECTURE_TASKS = [
+    # Stage 0
+    "FND-001",
+    "FND-002",
+    "FND-003",
+    "FND-004",
+    "FND-005",
+    "FND-006",
+    "FND-007",
+    # Stage 1
+    "S1A-001",
+    "S1A-002",
+    "S1A-003",
+    "S1A-004",
+    "S1B-001",
+    "S1B-002",
+    "S1B-003",
+    "S1B-004",
+    "S1B-005",
+    "S1C-001",
+    "S1C-002",
+    "S1C-003",
+    "S1C-004",
+    "S1D-001",
+    "S1D-002",
+    "S1D-003",
+    "S1D-004",
+    "S1D-005",
+    "S1D-006",
+    "S1D-007",
+    "S1E-001",
+    "S1E-002",
+    "S1E-003",
+    "S1E-004",
+    "S1F-001",
+    "S1F-002",
+    "S1F-003",
+    "S1G",
+    # Stage 2
+    "S2A-001",
+    "S2A-002",
+    "S2B-001",
+    "S2B-002",
+    "S2B-003",
+    "S2B-004",
+    "S2C",
+    "S2D",
+    "S2E",
+    "S2F",
+    "S2G",
+    "S2H",
+    # Stage 3
+    "S3A",
+    "S3B",
+    "S3C",
+    "S3D",
+    "S3E",
+    "S3F",
+    "S3G",
+    "S3H",
+    "S3I",
+    "S3J",
+    "S3K",
+    "S3L",
+    # Stage 4
+    "S4A",
+    "S4B",
+    "S4C",
+    "S4D",
+    "S4E",
+    "S4F",
+    "S4G",
+    # Stage 5
+    "S5A",
+    "S5B",
+    "S5C",
+    "S5D",
+    "S5E",
+    "S5F",
+]
+
+# Optional residual aliases (previous audit R1–R10). Never substitute for Stage IDs.
+RESIDUAL_ALIAS_TASKS = [f"R{index}" for index in range(1, 11)]
+
+# Related CI evidence for traceability only. Listing evidence here does NOT
+# promote a task to Qualified; status stays Integrated until a future gate
+# proves multi-class product evidence for an exact SHA.
+RELATED_EVIDENCE = {
+    "FND-001": ("workspace_tests",),
+    "FND-002": ("component_versions", "workspace_tests"),
+    "FND-003": ("workspace_tests",),
+    "FND-004": ("workspace_tests",),
+    "FND-005": ("workspace_tests",),
+    "FND-006": ("crash_matrix", "workspace_tests"),
+    "FND-007": ("workspace_tests", "client_tests"),
+    "S1A-001": ("workspace_tests",),
+    "S1A-002": ("workspace_tests",),
+    "S1A-003": ("workspace_tests",),
+    "S1A-004": ("workspace_tests", "server_tests"),
+    "S1B-001": ("workspace_tests",),
+    "S1B-002": ("workspace_tests",),
+    "S1B-003": ("workspace_tests",),
+    "S1B-004": ("workspace_tests", "crash_matrix"),
+    "S1B-005": ("workspace_tests",),
+    "S1C-001": ("workspace_tests",),
+    "S1C-002": ("workspace_tests",),
+    "S1C-003": ("workspace_tests", "ai_benchmark"),
+    "S1C-004": ("workspace_tests",),
+    "S1D-001": ("workspace_tests", "server_tests", "client_tests"),
+    "S1D-002": ("workspace_tests", "server_tests", "client_tests"),
+    "S1D-003": ("workspace_tests", "server_tests"),
+    "S1D-004": ("server_tests", "client_tests"),
+    "S1D-005": ("server_tests",),
+    "S1D-006": ("server_tests", "client_tests"),
+    "S1D-007": ("server_tests",),
+    "S1E-001": ("workspace_tests", "server_tests"),
+    "S1E-002": ("workspace_tests", "server_tests"),
+    "S1E-003": ("workspace_tests", "server_tests"),
+    "S1E-004": ("workspace_tests",),
+    "S1F-001": ("workspace_tests",),
+    "S1F-002": ("workspace_tests",),
+    "S1F-003": ("workspace_tests",),
+    "S1G": ("workspace_tests", "server_tests", "crash_matrix"),
+    "S2A-001": ("workspace_tests",),
+    "S2A-002": ("workspace_tests", "server_tests"),
+    "S2B-001": ("workspace_tests",),
+    "S2B-002": ("workspace_tests", "crash_matrix"),
+    "S2B-003": ("workspace_tests",),
+    "S2B-004": ("workspace_tests",),
+    "S2C": ("workspace_tests", "server_tests"),
+    "S2D": ("workspace_tests",),
+    "S2E": ("workspace_tests",),
+    "S2F": ("workspace_tests",),
+    "S2G": ("workspace_tests", "client_tests"),
+    "S2H": ("workspace_tests",),
+    "S3A": ("workspace_tests",),
+    "S3B": ("workspace_tests",),
+    "S3C": ("workspace_tests",),
+    "S3D": ("workspace_tests",),
+    "S3E": ("workspace_tests",),
+    "S3F": ("workspace_tests",),
+    "S3G": ("workspace_tests",),
+    "S3H": ("workspace_tests",),
+    "S3I": ("workspace_tests",),
+    "S3J": ("workspace_tests",),
+    "S3K": ("workspace_tests",),
+    "S3L": ("workspace_tests",),
+    "S4A": ("workspace_tests", "server_tests"),
+    "S4B": ("workspace_tests", "server_tests"),
+    "S4C": ("workspace_tests", "ai_benchmark"),
+    "S4D": ("workspace_tests", "ai_concurrency"),
+    "S4E": ("workspace_tests",),
+    "S4F": ("workspace_tests",),
+    "S4G": ("workspace_tests",),
+    "S5A": ("mysql_wire_client_compat", "mysql_snapshot_binlog"),
+    "S5B": (
+        "client_tests",
+        "node_tests",
+        "node_smoke",
+        "ffi_tests",
+        "kit_ffi_tests",
+        "jni_build",
+    ),
+    "S5C": ("workspace_tests", "server_tests"),
+    "S5D": ("workspace_tests", "server_tests"),
+    "S5E": ("workspace_tests", "server_tests"),
+    "S5F": tuple(TESTS),
+    # Residual aliases (traceability only; not Stage qualification).
     "R1": ("workspace_tests", "workspace_release_tests"),
     "R2": (
         "workspace_tests",
@@ -106,6 +285,14 @@ ARCHITECTURE_TASKS = {
     "R10": tuple(TESTS),
 }
 
+# Tasks that may be marked Qualified only when explicit multi-class product
+# evidence is configured here. Empty by default: no Integrated→Qualified flip
+# without exact-SHA product evidence (P0.9-X5).
+#
+# Shape: task_id -> {"evidence": [...test ids...], "evidence_classes": [...]}
+# evidence_classes use snake_case names matching EvidenceClass in certification.rs.
+QUALIFIED_TASK_EVIDENCE: dict[str, dict] = {}
+
 IMPLEMENTATION_STATUS = Path("docs/architecture/implementation-status.md")
 
 
@@ -129,7 +316,46 @@ def implementation_status_sha256() -> str:
     invalid = [f"{item}={status}" for item, status in rows.items() if status not in allowed]
     if invalid:
         raise SystemExit(f"invalid implementation status: {', '.join(invalid)}")
+    # Refuse to generate a manifest that would claim architecture Qualified
+    # via the residual matrix alone.
+    if any(status == "Qualified" for status in rows.values()):
+        raise SystemExit(
+            "implementation-status.md must not mark residual R1–R10 Qualified "
+            "without Stage 0–5 exact-SHA evidence (P0.9)"
+        )
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def architecture_task_entry(task_id: str) -> dict:
+    """Emit a task row. Default status is Integrated (never auto-Qualified)."""
+    qualified = QUALIFIED_TASK_EVIDENCE.get(task_id)
+    if qualified:
+        evidence = list(qualified["evidence"])
+        evidence_classes = list(qualified["evidence_classes"])
+        missing = [item for item in evidence if item not in TESTS]
+        if missing:
+            raise SystemExit(
+                f"qualified evidence for {task_id} references unknown tests: "
+                f"{', '.join(missing)}"
+            )
+        if not evidence or not evidence_classes:
+            raise SystemExit(
+                f"qualified evidence for {task_id} requires evidence and evidence_classes"
+            )
+        return {
+            "id": task_id,
+            "status": "qualified",
+            "evidence": evidence,
+            "evidence_classes": evidence_classes,
+        }
+    related = list(RELATED_EVIDENCE.get(task_id, ()))
+    # Related evidence is traceability only while status remains Integrated.
+    return {
+        "id": task_id,
+        "status": "integrated",
+        "evidence": related,
+        "evidence_classes": [],
+    }
 
 
 def main() -> None:
@@ -174,19 +400,25 @@ def main() -> None:
             raise SystemExit(f"non-positive duration evidence: {duration_path}")
         durations[test_id] = duration
 
+    architecture_tasks = [
+        architecture_task_entry(task_id) for task_id in MANDATORY_ARCHITECTURE_TASKS
+    ]
+    # Residual R1–R10 aliases for backward compatibility (optional extras).
+    architecture_tasks.extend(
+        architecture_task_entry(task_id) for task_id in RESIDUAL_ALIAS_TASKS
+    )
+
+    # Safety: never emit Qualified unless explicitly configured above.
+    if any(task["status"] == "qualified" for task in architecture_tasks):
+        if not QUALIFIED_TASK_EVIDENCE:
+            raise SystemExit("internal error: Qualified task without configured evidence")
+
     manifest = {
         "commit": commit,
         "artifact_sha256": hashlib.sha256(args.artifact.read_bytes()).hexdigest(),
         "implementation_status_sha256": implementation_status_sha256(),
         "rust_version": rust_version,
-        "architecture_tasks": [
-            {
-                "id": task_id,
-                "status": "qualified",
-                "evidence": list(evidence),
-            }
-            for task_id, evidence in ARCHITECTURE_TASKS.items()
-        ],
+        "architecture_tasks": architecture_tasks,
         "tests": [
             {
                 "id": test_id,

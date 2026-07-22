@@ -20,6 +20,7 @@ async fn session() -> (tempfile::TempDir, MongrelSession) {
     (dir, s)
 }
 
+// ID: P0.4-X8 Prepared statement PREPARE/EXECUTE reuses plan.
 #[tokio::test]
 async fn prepare_then_execute_reuses_plan() {
     let (_dir, s) = session().await;

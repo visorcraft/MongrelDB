@@ -13,9 +13,12 @@
 //! # Trust / transport
 //!
 //! Production builds load mTLS material from the node's persisted
-//! `cluster-meta/trust.json`. For loopback integration tests only,
-//! `MONGRELDB_CLUSTER_PLAINTEXT_TEST=1` selects
-//! [`TransportSecurity::PlaintextForTesting`] (non-production escape hatch).
+//! `cluster-meta/trust.json` and construct the runtime with
+//! [`NodeRuntimeConfig`]'s mTLS security mode. Plaintext cluster transport is
+//! refused on the production path. Under `cfg(test)` (and the
+//! `dangerous-test-transport` feature on `mongreldb-cluster`),
+//! `MONGRELDB_CLUSTER_PLAINTEXT_TEST=1` / `plaintext_test: true` remains a
+//! non-production escape hatch for loopback tests.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -306,6 +309,115 @@ impl ClusterRuntimeHandle {
         Ok(runtime.internal_rpc_client())
     }
 
+    /// Resolve the applied engine core for one locally hosted tablet.
+    ///
+    /// Uses `try_lock` so fragment/AI workers never block the async runtime
+    /// mutex; contention fails closed with `None` (caller retries / errors).
+    pub fn tablet_database_try(
+        &self,
+        tablet_id: TabletId,
+    ) -> Option<std::sync::Arc<mongreldb_core::Database>> {
+        let guard = self.inner.try_lock().ok()?;
+        let runtime = guard.as_ref()?;
+        let sink = runtime.tablet_sink(tablet_id)?;
+        let locked = sink.lock().ok()?;
+        locked.database()
+    }
+
+    /// Hosted tablet ids on this node (tablet-id order), for public data routing.
+    pub async fn tablet_ids(&self) -> Result<Vec<TabletId>, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.tablet_ids())
+    }
+
+    /// Current applied opaque tablet rows (local replica view) for a hosted tablet.
+    pub async fn tablet_rows(
+        &self,
+        tablet_id: TabletId,
+    ) -> Result<std::collections::BTreeMap<Key, Vec<u8>>, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.tablet_rows(tablet_id)?)
+    }
+
+    /// Typed user-table rows of a bound hosted tablet.
+    pub async fn tablet_typed_rows(
+        &self,
+        tablet_id: TabletId,
+    ) -> Result<mongreldb_consensus::engine_sink::TypedTabletRows, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.tablet_typed_rows(tablet_id)?)
+    }
+
+    /// Bind a hosted tablet to a typed user-table schema (P0.3).
+    pub async fn bind_tablet_user_table(
+        &self,
+        tablet_id: TabletId,
+        binding: mongreldb_consensus::engine_sink::TabletTableBinding,
+    ) -> Result<mongreldb_consensus::engine_sink::TabletTableBinding, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.bind_tablet_user_table(tablet_id, binding)?)
+    }
+
+    /// Current typed binding for a hosted tablet, if any.
+    pub async fn tablet_table_binding(
+        &self,
+        tablet_id: TabletId,
+    ) -> Result<Option<mongreldb_consensus::engine_sink::TabletTableBinding>, ClusterRuntimeError>
+    {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.tablet_table_binding(tablet_id))
+    }
+
+    /// Raft-propose upserts into a hosted tablet's opaque MVCC keyspace.
+    ///
+    /// The local replica must be the group leader; [`ConsensusError::NotLeader`]
+    /// surfaces through [`ClusterRuntimeError::Runtime`] with a leader hint.
+    pub async fn write_tablet_rows(
+        &self,
+        tablet_id: TabletId,
+        entries: &[(Key, Vec<u8>)],
+    ) -> Result<mongreldb_consensus::group::GroupCommitReceipt, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        let control = ExecutionControl::default();
+        Ok(runtime
+            .write_tablet_rows(tablet_id, entries, &control)
+            .await?)
+    }
+
+    /// Raft-propose typed user-table mutations (`COMMAND_TYPE_TABLET_WRITE`).
+    pub async fn write_tablet_ops(
+        &self,
+        tablet_id: TabletId,
+        operations: Vec<mongreldb_consensus::engine_sink::TabletWriteOperation>,
+    ) -> Result<mongreldb_consensus::group::GroupCommitReceipt, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        let control = ExecutionControl::default();
+        Ok(runtime
+            .write_tablet_ops(tablet_id, operations, &control)
+            .await?)
+    }
+
     /// Graceful shutdown: stop the runtime once. Additional calls are no-ops.
     pub async fn shutdown(&self) -> Result<(), ClusterRuntimeError> {
         let runtime = {
@@ -353,21 +465,26 @@ fn resolve_security(
     plaintext_test: bool,
 ) -> Result<TransportSecurity, ClusterRuntimeError> {
     if plaintext_test {
+        // Explicit `plaintext_test: true` is the library test API (integration
+        // tests + unit tests). Production entry points must not set it:
+        // - `NodeRuntimeConfig::production` rejects plaintext (P1.3-T1)
+        // - `mongreldb-server` main refuses env-based plaintext unless
+        //   `dangerous-test-transport` / cfg(test) (P1.3-T4; see main.rs)
+        // Integration tests compile this lib without `cfg(test)`, so the gate
+        // cannot rely on cfg alone for the explicit option.
         return Ok(TransportSecurity::PlaintextForTesting);
     }
     let trust = load_persisted_trust(node_data)?.ok_or_else(|| {
         ClusterRuntimeError::Config(
             "cluster trust material missing under cluster-meta/trust.json; \
-             run `mongreldb-server cluster init` first, or set \
-             MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 for non-production tests"
+             run `mongreldb-server cluster init` first (production requires mTLS)"
                 .into(),
         )
     })?;
     let tls = TlsConfig::from_trust(&trust).map_err(|error| {
         ClusterRuntimeError::Config(format!(
             "cluster trust PEMs are not usable for mTLS ({error}); \
-             supply real certificates or set MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 \
-             for non-production tests"
+             supply real certificates from `cluster init` (production requires mTLS)"
         ))
     })?;
     Ok(TransportSecurity::Mtls(tls))
@@ -530,6 +647,36 @@ pub fn cluster_node_data_from_env(cli_value: Option<String>) -> Option<PathBuf> 
         .map(PathBuf::from)
 }
 
+/// Whether plaintext cluster transport is admitted in this build.
+///
+/// Production binaries return `false` unless rebuilt with the
+/// `dangerous-test-transport` feature. Package unit tests return `true`.
+pub fn plaintext_cluster_transport_allowed() -> bool {
+    cfg!(any(test, feature = "dangerous-test-transport"))
+}
+
+/// Production gate for plaintext cluster transport (P1.3-T4 / P1.3-X2).
+///
+/// The daemon calls this with [`plaintext_cluster_transport_allowed`] before
+/// starting a runtime when `plaintext_test` was requested via env. The pure
+/// form takes an explicit `allowed` so product tests can exercise the refuse
+/// path without rebuilding under `cfg(test)`.
+pub fn admit_plaintext_cluster_transport(
+    plaintext_requested: bool,
+    allowed: bool,
+) -> Result<(), ClusterRuntimeError> {
+    if plaintext_requested && !allowed {
+        return Err(ClusterRuntimeError::Config(
+            "plaintext cluster transport is refused on the production path; \
+             configure mTLS via cluster-meta/trust.json (cluster init), or \
+             rebuild with the dangerous-test-transport feature for \
+             non-production tests only"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +790,60 @@ mod tests {
         assert_eq!(key.as_bytes(), &[0x0a, 0x1b]);
         assert!(parse_key_hex("zz").is_err());
         assert!(parse_key_hex("abc").is_err());
+    }
+
+    #[test]
+    fn plaintext_gate_open_under_package_tests() {
+        // Production binaries compile this false (without the feature).
+        // Package tests keep the loopback escape hatch open (P1.3-T4 / X2).
+        assert!(plaintext_cluster_transport_allowed());
+    }
+
+    /// P1.3-X2: production gate refuses plaintext when the build disallows it.
+    #[test]
+    fn p13_x2_production_gate_refuses_plaintext_when_disallowed() {
+        let err = admit_plaintext_cluster_transport(true, false).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("plaintext cluster transport is refused"),
+            "{err}"
+        );
+        // Allowed escape hatch (test builds / dangerous-test-transport).
+        admit_plaintext_cluster_transport(true, true).expect("allowed when admitted");
+        // Production mTLS path does not request plaintext.
+        admit_plaintext_cluster_transport(false, false).expect("mTLS path never needs escape hatch");
+    }
+
+    /// P1.3-X2: production start path (`plaintext_test: false`) requires usable mTLS.
+    #[tokio::test]
+    async fn p13_x2_non_plaintext_start_requires_usable_mtls() {
+        let dir = tempdir().unwrap();
+        bootstrap(dir.path());
+        let listen = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        // Dummy bootstrap PEMs are not real X.509; production mTLS path fails closed.
+        let err = match ClusterRuntimeHandle::start(ClusterRuntimeOptions {
+            node_data: dir.path().to_path_buf(),
+            rpc_listen: listen,
+            plaintext_test: false,
+            fast_timing: true,
+        })
+        .await
+        {
+            Ok(handle) => {
+                let _ = handle.shutdown().await;
+                panic!("dummy trust PEMs must fail mTLS construction");
+            }
+            Err(error) => error,
+        };
+        let message = err.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("mtls")
+                || message.contains("trust")
+                || message.contains("certificate")
+                || message.contains("pem"),
+            "expected mTLS/trust failure, got {err}"
+        );
     }
 }

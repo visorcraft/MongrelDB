@@ -419,8 +419,9 @@ impl NativeSession {
         }
     }
 
-    pub async fn cancel(&self, query_id: &[u8]) -> ClientResult<()> {
-        self.pool
+    pub async fn cancel(&self, query_id: &[u8]) -> ClientResult<NativeCancelResult> {
+        let response = self
+            .pool
             .client()
             .query()
             .cancel_query(native::CancelQueryRequest {
@@ -429,12 +430,18 @@ impl NativeSession {
                 session_id: self.session_id.clone(),
             })
             .await
+            .map(tonic::Response::into_inner)
             .map_err(native_error)?;
-        Ok(())
+        Ok(NativeCancelResult {
+            outcome: native::CancelOutcome::try_from(response.outcome)
+                .unwrap_or(native::CancelOutcome::Unspecified),
+            durable: response.durable.unwrap_or_default(),
+        })
     }
 
-    pub async fn query_status(&self, query_id: &[u8]) -> ClientResult<native::QueryStatusResponse> {
-        self.pool
+    pub async fn query_status(&self, query_id: &[u8]) -> ClientResult<NativeQueryStatus> {
+        let response = self
+            .pool
             .client()
             .query()
             .get_query_status(native::GetQueryStatusRequest {
@@ -444,7 +451,13 @@ impl NativeSession {
             })
             .await
             .map(tonic::Response::into_inner)
-            .map_err(native_error)
+            .map_err(native_error)?;
+        Ok(NativeQueryStatus {
+            query_id: response.query_id,
+            phase: response.phase,
+            error: response.error,
+            durable: response.durable.unwrap_or_default(),
+        })
     }
 
     pub async fn begin(&self, isolation: native::IsolationLevel) -> ClientResult<Vec<u8>> {
@@ -568,6 +581,23 @@ pub struct NativePrepared {
     pub schema_version: u64,
 }
 
+/// Structural durable write outcome from native RPC (P0.6). No string parsing.
+pub type NativeDurableOutcome = native::DurableOutcome;
+
+#[derive(Debug, Clone)]
+pub struct NativeCancelResult {
+    pub outcome: native::CancelOutcome,
+    pub durable: NativeDurableOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeQueryStatus {
+    pub query_id: Vec<u8>,
+    pub phase: i32,
+    pub error: Option<native::ErrorDetail>,
+    pub durable: NativeDurableOutcome,
+}
+
 pub struct NativeExecuteResult {
     pub query_id: Vec<u8>,
     pub batches: Vec<RecordBatch>,
@@ -576,6 +606,8 @@ pub struct NativeExecuteResult {
     pub commit_epoch: Option<u64>,
     pub idempotency_replayed: bool,
     pub original_query_id: Vec<u8>,
+    /// Prefer this over legacy `committed` / `commit_epoch` fields.
+    pub durable: NativeDurableOutcome,
 }
 
 pub struct NativeArrowStream {
@@ -619,14 +651,29 @@ fn decode_execute(response: native::ExecuteResponse) -> ClientResult<NativeExecu
     for frame in &response.frames {
         batches.extend(decode_ipc(&frame.ipc)?);
     }
+    let durable = response.durable.unwrap_or_else(|| native::DurableOutcome {
+        committed: response.committed,
+        committed_statements: 0,
+        last_commit_hlc: Vec::new(),
+        first_commit_statement_index: None,
+        last_commit_statement_index: None,
+        completed_statements: 0,
+        current_statement_index: 0,
+        terminal_state: String::new(),
+        serialization_state: String::new(),
+        last_commit_epoch: (response.commit_epoch != 0).then_some(response.commit_epoch),
+    });
     Ok(NativeExecuteResult {
         query_id: response.query_id,
         batches,
         rows_affected: response.rows_affected,
-        committed: response.committed,
-        commit_epoch: (response.commit_epoch != 0).then_some(response.commit_epoch),
+        committed: durable.committed || response.committed,
+        commit_epoch: durable
+            .last_commit_epoch
+            .or((response.commit_epoch != 0).then_some(response.commit_epoch)),
         idempotency_replayed: response.idempotency_replayed,
         original_query_id: response.original_query_id,
+        durable,
     })
 }
 

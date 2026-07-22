@@ -11,11 +11,13 @@
 //! one larger run (fewer runs ⇒ fewer reader merges ⇒ faster scans).
 //!
 //! MVCC semantics mirror [`crate::memtable::Memtable`]: every version is kept,
-//! keyed by `(RowId, Epoch)`; a snapshot read returns the newest version with
-//! `epoch <= snapshot`. The tier is purely in-memory and rebuilds from WAL
-//! replay on reopen, so it carries no on-disk state of its own.
+//! keyed by `(RowId, Epoch)`. Product visibility prefers HLC via
+//! [`crate::epoch::Snapshot::observes_row`] / [`crate::epoch::Snapshot::version_is_newer`]
+//! when versions carry `commit_ts` (P0.5-T3). Epoch-only APIs remain for
+//! legacy dual-model call sites. The tier is purely in-memory and rebuilds
+//! from WAL replay on reopen, so it carries no on-disk state of its own.
 
-use crate::epoch::Epoch;
+use crate::epoch::{Epoch, Snapshot};
 use crate::memtable::Row;
 use crate::pma::Pma;
 use crate::rowid::RowId;
@@ -95,34 +97,66 @@ impl MutableRun {
     }
 
     /// Newest version of `row_id` with `epoch <= snapshot` (including
-    /// tombstones), mirroring `Memtable::get_version`. Returns `None` if no
-    /// version is visible. Seeks straight to `row_id`'s versions via the
-    /// PMA's gappy binary search instead of scanning from the front.
+    /// tombstones). Legacy epoch-only entry point; prefer
+    /// [`Self::get_version_at`] when the caller holds a full [`Snapshot`].
     pub fn get_version(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<(Epoch, Row)> {
-        let mut best: Option<(Epoch, Row)> = None;
+        self.get_version_at(row_id, Snapshot::at(snapshot_epoch))
+    }
+
+    /// Newest version of `row_id` visible under `snapshot` (including
+    /// tombstones), using HLC authority when stamps are present (P0.5-T3).
+    /// Seeks to `row_id`'s versions via the PMA's gappy binary search.
+    pub fn get_version_at(&self, row_id: RowId, snapshot: Snapshot) -> Option<(Epoch, Row)> {
+        let mut best: Option<Row> = None;
         for pma in self
             .frozen
             .iter()
             .map(|segment| &segment.pma)
             .chain(std::iter::once(&self.active.pma))
         {
-            for ((rid, epoch), row) in pma.iter_from(&(row_id, Epoch::ZERO)) {
+            // Under HLC authority, stamped rows may be visible regardless of
+            // local epoch order — scan every version of this row_id.
+            let end_epoch = if snapshot.uses_hlc_authority() {
+                Epoch(u64::MAX)
+            } else {
+                snapshot.epoch
+            };
+            for ((rid, _epoch), row) in pma.iter_from(&(row_id, Epoch::ZERO)) {
                 if *rid != row_id {
                     break;
                 }
-                if *epoch <= snapshot_epoch
-                    && best.as_ref().is_none_or(|(current, _)| *epoch > *current)
-                {
-                    best = Some((*epoch, row.clone()));
+                // Stop early on pure-legacy scans once past the epoch pin.
+                if !snapshot.uses_hlc_authority() && row.committed_epoch > end_epoch {
+                    break;
+                }
+                if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|current| {
+                    Snapshot::version_is_newer(
+                        row.committed_epoch,
+                        row.commit_ts,
+                        current.committed_epoch,
+                        current.commit_ts,
+                    )
+                }) {
+                    best = Some(row.clone());
                 }
             }
         }
-        best
+        best.map(|row| (row.committed_epoch, row))
     }
 
     /// Newest visible version per `RowId` at `snapshot` (including tombstones),
-    /// ascending by `RowId` — mirroring `Memtable::visible_versions`.
+    /// ascending by `RowId`. Legacy epoch-only entry point; prefer
+    /// [`Self::visible_versions_at`].
     pub fn visible_versions(&self, snapshot_epoch: Epoch) -> Vec<Row> {
+        self.visible_versions_at(Snapshot::at(snapshot_epoch))
+    }
+
+    /// Newest visible version per `RowId` under a full [`Snapshot`], including
+    /// tombstones. HLC-stamped versions use HLC order (P0.5-T3).
+    pub fn visible_versions_at(&self, snapshot: Snapshot) -> Vec<Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
         for pma in self
             .frozen
@@ -130,14 +164,23 @@ impl MutableRun {
             .map(|segment| &segment.pma)
             .chain(std::iter::once(&self.active.pma))
         {
-            for ((rid, epoch), row) in pma.iter() {
-                if *epoch <= snapshot_epoch
-                    && by_row
-                        .get(rid)
-                        .is_none_or(|current| *epoch > current.committed_epoch)
-                {
-                    by_row.insert(*rid, row.clone());
+            for ((_rid, _epoch), row) in pma.iter() {
+                if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                    continue;
                 }
+                by_row
+                    .entry(row.row_id)
+                    .and_modify(|existing| {
+                        if Snapshot::version_is_newer(
+                            row.committed_epoch,
+                            row.commit_ts,
+                            existing.committed_epoch,
+                            existing.commit_ts,
+                        ) {
+                            *existing = row.clone();
+                        }
+                    })
+                    .or_insert_with(|| row.clone());
             }
         }
         by_row.into_values().collect()
@@ -217,6 +260,7 @@ mod tests {
         Row {
             row_id: RowId(id),
             committed_epoch: Epoch(epoch),
+            commit_ts: None,
             columns: std::collections::HashMap::new(),
             deleted: true,
         }
@@ -313,5 +357,80 @@ mod tests {
             );
         }
         assert!(mr.approx_bytes() > 0);
+    }
+
+    fn hlc(physical_micros: u64) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros,
+            logical: 0,
+            node_tiebreaker: 1,
+        }
+    }
+
+    fn hlc_row(id: u64, epoch: u64, ts: mongreldb_types::hlc::HlcTimestamp, v: i64) -> Row {
+        Row::new_with_hlc(RowId(id), Epoch(epoch), ts).with_column(1, Value::Int64(v))
+    }
+
+    #[test]
+    fn hlc_visibility_is_authoritative_when_stamped() {
+        let mut mr = MutableRun::new();
+        let early = hlc(100);
+        let late = hlc(200);
+        mr.insert_many(vec![
+            hlc_row(1, 1, early, 1),
+            hlc_row(1, 2, late, 2),
+        ]);
+        let snap = Snapshot::at_hlc(Epoch(99), early);
+        let versions = mr.visible_versions_at(snap);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(int_of(&versions[0]), 1);
+        assert_eq!(
+            int_of(&mr.get_version_at(RowId(1), snap).unwrap().1),
+            1
+        );
+        let snap2 = Snapshot::at_hlc(Epoch(1), late);
+        assert_eq!(int_of(&mr.visible_versions_at(snap2)[0]), 2);
+        assert_eq!(
+            int_of(&mr.get_version_at(RowId(1), snap2).unwrap().1),
+            2
+        );
+    }
+
+    #[test]
+    fn snapshot_hlc_hides_later_commit_ts_even_if_epoch_higher() {
+        let mut mr = MutableRun::new();
+        let early = hlc(100);
+        let late = hlc(200);
+        // Lower epoch, later HLC would win under epoch-only newest-of-visible;
+        // HLC authority must hide it under an early pin.
+        mr.insert_many(vec![
+            hlc_row(1, 1, late, 99),
+            hlc_row(1, 50, early, 1),
+        ]);
+        let snap = Snapshot::at_hlc(Epoch(99), early);
+        let versions = mr.visible_versions_at(snap);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(int_of(&versions[0]), 1);
+        assert_eq!(versions[0].commit_ts, Some(early));
+        assert_eq!(
+            int_of(&mr.get_version_at(RowId(1), snap).unwrap().1),
+            1
+        );
+    }
+
+    #[test]
+    fn epoch_only_snapshot_does_not_observe_hlc_stamped_rows() {
+        let mut mr = MutableRun::new();
+        mr.insert_many(vec![
+            hlc_row(1, 1, hlc(50), 1),
+            row(2, 1, 2),
+        ]);
+        let legacy = Snapshot::at(Epoch(99));
+        let versions = mr.visible_versions_at(legacy);
+        assert_eq!(versions.len(), 1, "only pure-legacy row is visible");
+        assert_eq!(versions[0].row_id, RowId(2));
+        assert!(versions[0].commit_ts.is_none());
+        assert!(mr.get_version_at(RowId(1), legacy).is_none());
+        assert!(mr.get_version_at(RowId(2), legacy).is_some());
     }
 }

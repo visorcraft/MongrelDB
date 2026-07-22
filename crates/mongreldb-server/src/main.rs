@@ -25,8 +25,8 @@ use mongreldb_server::remote_embedding::{
 };
 use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
-    build_app_with_sessions_control_and_cluster, cluster_admin, cluster_runtime,
-    spawn_auto_compactor, spawn_session_reaper, SessionStore,
+    build_app_with_storage, cluster_admin, cluster_runtime, fragment_rpc,
+    spawn_auto_compactor, spawn_session_reaper, ServerStorageRuntime, SessionStore,
 };
 use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
 use mongreldb_types::ids::{ClusterId, NodeId};
@@ -49,9 +49,12 @@ struct Args {
     max_sessions: usize,
     session_idle_timeout_secs: u64,
     native_port: Option<u16>,
+    native_listen: Option<String>,
+    native_advertise: Option<String>,
     tls_certificate: Option<String>,
     tls_private_key: Option<String>,
     tls_client_ca: Option<String>,
+    require_client_cert: bool,
     service_token_file: Option<String>,
     oidc_issuer: Option<String>,
     oidc_audience: Option<String>,
@@ -90,7 +93,9 @@ OPTIONS:
     --max-connections <n>       Max concurrent connections
     --max-sessions <n>          Max live sessions for cross-request txns (default 256)
     --session-idle-timeout <s>  Idle session reaping timeout in seconds (default 300)
-    --native-port <port>        Native gRPC listener port
+    --native-port <port>        Native gRPC listener port (binds 127.0.0.1:<port>)
+    --native-listen <host:port> Native gRPC bind address (default host 127.0.0.1)
+    --native-advertise <addr>   Advertised native endpoint (status / clients)
     --tls-cert <path>           Native listener PEM certificate
     --tls-key <path>            Native listener PEM private key
     --tls-client-ca <path>      Require native client certificates from this CA
@@ -128,7 +133,17 @@ ENVIRONMENT:
     MONGRELDB_CLUSTER_NODE_DATA Same as --cluster-node-data
     MONGRELDB_CLUSTER_RPC_LISTEN Same as --cluster-rpc-listen
     MONGRELDB_CLUSTER_PLAINTEXT_TEST=1
-                                Test-only: plaintext cluster transport (NON-PRODUCTION)
+                                Test-only: plaintext cluster transport (NON-PRODUCTION;
+                                refused in production builds without the
+                                dangerous-test-transport feature)
+    MONGRELDB_NATIVE_LISTEN     Native bind address (host:port); default host 127.0.0.1
+    MONGRELDB_NATIVE_ADVERTISE  Advertised native endpoint
+    MONGRELDB_NATIVE_PORT       Native port on 127.0.0.1 (legacy)
+    MONGRELDB_NATIVE_TLS_CERT   Native TLS certificate PEM path
+    MONGRELDB_NATIVE_TLS_KEY    Native TLS private key PEM path
+    MONGRELDB_NATIVE_TLS_CA     Native client CA PEM (require client certs)
+    MONGRELDB_NATIVE_REQUIRE_CLIENT_CERT=1
+                                Require native client certificates
 ";
 
 struct DatabaseCredentials {
@@ -295,9 +310,12 @@ fn parse_args() -> Result<Args, String> {
     let mut max_sessions: usize = 256;
     let mut session_idle_timeout_secs: u64 = 300;
     let mut native_port = None;
+    let mut native_listen = None;
+    let mut native_advertise = None;
     let mut tls_certificate = None;
     let mut tls_private_key = None;
     let mut tls_client_ca = None;
+    let mut require_client_cert = false;
     let mut service_token_file = None;
     let mut oidc_issuer = None;
     let mut oidc_audience = None;
@@ -372,6 +390,22 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            "--native-listen" => {
+                native_listen = Some(
+                    raw.get(i + 1)
+                        .ok_or("--native-listen requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--native-advertise" => {
+                native_advertise = Some(
+                    raw.get(i + 1)
+                        .ok_or("--native-advertise requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--tls-cert" => {
                 tls_certificate =
                     Some(raw.get(i + 1).ok_or("--tls-cert requires a value")?.clone());
@@ -387,7 +421,13 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or("--tls-client-ca requires a value")?
                         .clone(),
                 );
+                // Supplying a client CA implies client certificates are required.
+                require_client_cert = true;
                 i += 2;
+            }
+            "--require-client-cert" => {
+                require_client_cert = true;
+                i += 1;
             }
             "--service-tokens" => {
                 service_token_file = Some(
@@ -509,16 +549,23 @@ fn parse_args() -> Result<Args, String> {
 
     let db_dir = db_dir.ok_or_else(|| format!("a database directory is required\n\n{USAGE}"))?;
     let port = port.unwrap_or(DEFAULT_PORT);
-    if native_port.is_some() != (tls_certificate.is_some() && tls_private_key.is_some()) {
-        return Err("--native-port, --tls-cert, and --tls-key must be configured together".into());
-    }
-    if tls_client_ca.is_some() && native_port.is_none() {
-        return Err("--tls-client-ca requires --native-port".into());
-    }
+    // Full native listen validation (loopback default, remote TLS requirement)
+    // runs later via NativeListenInput so env knobs are included.
+    let native_requested = native_port.is_some()
+        || native_listen.is_some()
+        || tls_certificate.is_some()
+        || tls_private_key.is_some()
+        || tls_client_ca.is_some()
+        || require_client_cert
+        || native_advertise.is_some();
     if (service_token_file.is_some() || oidc_issuer.is_some() || oidc_audience.is_some())
-        && native_port.is_none()
+        && !native_requested
     {
-        return Err("native authentication options require --native-port".into());
+        return Err(
+            "native authentication options require --native-port / --native-listen \
+             (or MONGRELDB_NATIVE_LISTEN)"
+                .into(),
+        );
     }
     if oidc_issuer.is_some() != oidc_audience.is_some() {
         return Err("--oidc-issuer and --oidc-audience must be configured together".into());
@@ -548,9 +595,12 @@ fn parse_args() -> Result<Args, String> {
         max_sessions,
         session_idle_timeout_secs,
         native_port,
+        native_listen,
+        native_advertise,
         tls_certificate,
         tls_private_key,
         tls_client_ca,
+        require_client_cert,
         service_token_file,
         oidc_issuer,
         oidc_audience,
@@ -794,38 +844,64 @@ fn main() {
         )
     });
 
-    // Credential ownership is moved into this call. Its password is zeroized
-    // immediately after open/create returns, before any worker thread starts.
-    let db = Arc::new(
-        open_or_create_database(
-            &args.db_dir,
-            args.passphrase.as_deref(),
-            kms,
-            database_credentials,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("failed to open or create {}: {e}", args.db_dir);
+    // P0.2: cluster mode must not open a peer standalone user database.
+    // NodeRuntime owns tablet roots; public data is consensus-owned.
+    let cluster_configured =
+        cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone()).is_some();
+
+    let standalone_db = if cluster_configured {
+        None
+    } else {
+        // Credential ownership is moved into this call. Its password is
+        // zeroized immediately after open/create returns, before workers start.
+        let db = Arc::new(
+            open_or_create_database(
+                &args.db_dir,
+                args.passphrase.as_deref(),
+                kms,
+                database_credentials,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("failed to open or create {}: {e}", args.db_dir);
+                std::process::exit(1);
+            }),
+        );
+        if let Err(error) =
+            validate_http_auth_configuration(&db, args.auth_token.as_deref(), args.user_auth)
+        {
+            eprintln!("failed to start: {error}");
             std::process::exit(1);
-        }),
-    );
-    if let Err(error) =
-        validate_http_auth_configuration(&db, args.auth_token.as_deref(), args.user_auth)
-    {
-        eprintln!("failed to start: {error}");
-        std::process::exit(1);
+        }
+        Some(db)
+    };
+    if cluster_configured {
+        if args.user_auth && args.auth_token.is_none() {
+            eprintln!(
+                "cluster mode: --auth-users requires a standalone catalog which is not opened; \
+                 configure --auth-token for control-plane admin, or omit user auth"
+            );
+            std::process::exit(1);
+        }
+        eprintln!(
+            "cluster mode: not opening standalone user database at {} \
+             (public data plane is NodeRuntime/tablet owned)",
+            args.db_dir
+        );
     }
 
-    // Build Tokio only after the credential environment is cleared and the
+    // Build Tokio only after the credential environment is cleared and any
     // password-owning `Zeroizing<String>` has been dropped by database open.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap_or_else(|error| {
             eprintln!("failed to start async runtime: {error}");
-            let _ = db.close();
+            if let Some(db) = &standalone_db {
+                let _ = db.close();
+            }
             std::process::exit(1);
         });
-    runtime.block_on(run_server(args, pidfile, db));
+    runtime.block_on(run_server(args, pidfile, standalone_db));
 }
 
 fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, String> {
@@ -883,16 +959,7 @@ fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, 
     Ok(Some(auth))
 }
 
-async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
-    if let Err(error) =
-        load_embedding_providers(&args.embedding_provider_files, db.embedding_providers())
-    {
-        eprintln!("failed to configure embedding providers: {error}");
-        std::process::exit(1);
-    }
-    // §5.9: background cost-aware compaction (run-count trigger).
-    spawn_auto_compactor(Arc::clone(&db));
-
+async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Database>>) {
     // Cross-request session store for interactive transactions. The reaper
     // shares this Arc so it sweeps the same map the handlers use.
     let sessions = Arc::new(SessionStore::new(
@@ -905,87 +972,158 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
         std::process::exit(1);
     });
 
-    // Optional Stage 2/3 product path: host a live NodeRuntime when the
-    // operator supplied cluster node data (CLI and/or env). Fail closed on
-    // start if the directory is not provisioned.
-    let cluster_handle =
-        match cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone()) {
-            Some(node_data) => {
-                let options = cluster_runtime::ClusterRuntimeOptions::resolve(
-                    node_data,
-                    args.cluster_rpc_listen.clone(),
-                );
+    // Build the single authoritative storage runtime (P0.2).
+    let storage = match cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone())
+    {
+        Some(node_data) => {
+            if standalone_db.is_some() {
+                // Defensive: main must not pass a standalone open in cluster mode.
                 eprintln!(
-                    "cluster mode: starting NodeRuntime from {} (rpc listen {})",
-                    options.node_data.display(),
-                    options.rpc_listen
+                    "internal error: cluster mode refused dual-root standalone database open"
                 );
-                if options.plaintext_test {
-                    eprintln!(
-                        "WARNING: MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 — plaintext \
+                std::process::exit(1);
+            }
+            let options = cluster_runtime::ClusterRuntimeOptions::resolve(
+                node_data,
+                args.cluster_rpc_listen.clone(),
+            );
+            eprintln!(
+                "cluster mode: starting NodeRuntime from {} (rpc listen {})",
+                options.node_data.display(),
+                options.rpc_listen
+            );
+            if let Err(error) = cluster_runtime::admit_plaintext_cluster_transport(
+                options.plaintext_test,
+                cluster_runtime::plaintext_cluster_transport_allowed(),
+            ) {
+                // P1.3-T4 / P1.3-X2: production binary refuses plaintext unless
+                // this build explicitly admits the test escape hatch.
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            if options.plaintext_test {
+                eprintln!(
+                    "WARNING: MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 — plaintext \
                      cluster transport is for tests only (NON-PRODUCTION)"
-                    );
+                );
+            }
+            let handle = match cluster_runtime::ClusterRuntimeHandle::start(options).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    eprintln!("failed to start cluster NodeRuntime: {error}");
+                    std::process::exit(1);
                 }
-                match cluster_runtime::ClusterRuntimeHandle::start(options).await {
-                    Ok(handle) => {
-                        match handle.runtime_status_json().await {
-                            Ok(status) => eprintln!(
-                                "cluster runtime live: node_id={} rpc={} meta={} tablets={}",
-                                status["node_id"],
-                                status["rpc_address"],
-                                status["meta_present"],
-                                status["tablet_count"]
-                            ),
-                            Err(error) => {
-                                eprintln!("cluster runtime started but status failed: {error}")
-                            }
-                        }
-                        Some(handle)
-                    }
-                    Err(error) => {
-                        eprintln!("failed to start cluster NodeRuntime: {error}");
-                        std::process::exit(1);
-                    }
+            };
+            match handle.runtime_status_json().await {
+                Ok(status) => eprintln!(
+                    "cluster runtime live: node_id={} rpc={} meta={} tablets={}",
+                    status["node_id"],
+                    status["rpc_address"],
+                    status["meta_present"],
+                    status["tablet_count"]
+                ),
+                Err(error) => {
+                    eprintln!("cluster runtime started but status failed: {error}")
                 }
             }
-            None => None,
-        };
+            // P0.2 residual #9: install fragment + AI workers on the product path.
+            let (fragment_endpoint, ai_endpoint) =
+                match fragment_rpc::install_production_cluster_workers(&handle).await {
+                    Ok(endpoints) => endpoints,
+                    Err(error) => {
+                        eprintln!("failed to install cluster fragment/AI workers: {error}");
+                        let _ = handle.shutdown().await;
+                        std::process::exit(1);
+                    }
+                };
+            eprintln!(
+                "cluster workers installed: fragment service + AI service on internal RPC"
+            );
+            ServerStorageRuntime::cluster_with_workers(handle, fragment_endpoint, ai_endpoint)
+        }
+        None => {
+            let db = standalone_db.expect("standalone mode opens a local database");
+            if let Err(error) =
+                load_embedding_providers(&args.embedding_provider_files, db.embedding_providers())
+            {
+                eprintln!("failed to configure embedding providers: {error}");
+                std::process::exit(1);
+            }
+            // §5.9: background cost-aware compaction (run-count trigger).
+            spawn_auto_compactor(Arc::clone(&db));
+            ServerStorageRuntime::standalone(db)
+        }
+    };
 
-    let (app, server_control) = build_app_with_sessions_control_and_cluster(
-        db.clone(),
+    let standalone_for_native = storage.standalone_db().cloned();
+    let (app, server_control) = build_app_with_storage(
+        storage,
         std::iter::empty(),
         args.auth_token.clone(),
         args.max_connections,
         args.user_auth,
         Arc::clone(&sessions),
-        cluster_handle,
     );
     let (native_result_tx, mut native_result_rx) = tokio::sync::mpsc::channel(1);
     let mut native_result_guard = Some(native_result_tx);
     let mut native_shutdown = None;
     let mut native_task = None;
-    if let Some(port) = args.native_port {
-        let certificate_path = args.tls_certificate.as_deref().expect("validated above");
-        let private_key_path = args.tls_private_key.as_deref().expect("validated above");
-        let read_pem = |path: &str| {
+    let native_listen = mongreldb_server::NativeListenInput::from_cli_and_env(
+        mongreldb_server::NativeListenInput {
+            listen: args.native_listen.clone(),
+            native_port: args.native_port,
+            advertise: args.native_advertise.clone(),
+            tls_cert: args.tls_certificate.clone(),
+            tls_key: args.tls_private_key.clone(),
+            tls_ca: args.tls_client_ca.clone(),
+            require_client_cert: args.require_client_cert || args.tls_client_ca.is_some(),
+        },
+    )
+    .resolve()
+    .unwrap_or_else(|error| {
+        eprintln!("native listener configuration error: {error}");
+        std::process::exit(1);
+    });
+    if let Some(native_cfg) = native_listen {
+        let Some(db) = standalone_for_native.clone() else {
+            eprintln!(
+                "native RPC requires standalone storage; cluster mode does not open a \
+                 peer user database (configure native RPC only in standalone mode)"
+            );
+            std::process::exit(1);
+        };
+        let read_pem = |path: &std::path::Path| {
             std::fs::read(path).unwrap_or_else(|error| {
-                eprintln!("failed to read native TLS file {path}: {error}");
+                eprintln!(
+                    "failed to read native TLS file {}: {error}",
+                    path.display()
+                );
                 std::process::exit(1);
             })
         };
-        let mut runtime = server_control.native_runtime(Arc::clone(&db), Arc::clone(&sessions));
+        let mut runtime = server_control.native_runtime(db, Arc::clone(&sessions));
         if let Some(auth) = native_external_auth {
             runtime = runtime.with_external_auth(auth);
         }
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         native_shutdown = Some(shutdown_tx);
         let result_tx = native_result_guard.take().expect("native result sender");
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let address = native_cfg.listen;
+        let client_ca_pem = if native_cfg.require_client_cert || native_cfg.tls_ca.is_some() {
+            Some(read_pem(
+                native_cfg
+                    .tls_ca
+                    .as_deref()
+                    .expect("require_client_cert validated with CA"),
+            ))
+        } else {
+            None
+        };
         let server = NativeRpcServer::new(NativeRpcServerConfig {
             address,
-            certificate_pem: read_pem(certificate_path),
-            private_key_pem: read_pem(private_key_path),
-            client_ca_pem: args.tls_client_ca.as_deref().map(read_pem),
+            certificate_pem: read_pem(&native_cfg.tls_cert),
+            private_key_pem: read_pem(&native_cfg.tls_key),
+            client_ca_pem,
             max_connections: args.max_connections.unwrap_or(1_024),
             max_concurrent_streams: 1_024,
             max_in_flight_per_connection: 1_024,
@@ -1016,6 +1154,15 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
                 .await;
         }));
         eprintln!("mongreldb native RPC listening on https://{address}");
+        if let Some(advertise) = &native_cfg.advertise {
+            eprintln!("mongreldb native RPC advertise: {advertise}");
+        }
+        if !mongreldb_server::is_loopback_addr(address.ip()) {
+            eprintln!(
+                "native RPC bound on non-loopback address {address} (TLS required; \
+                 certificate reload requires process restart)"
+            );
+        }
     }
 
     if args.auth_token.is_some() {
@@ -1069,7 +1216,7 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
             result = axum::serve(listener, app) => {
                 if let Err(e) = result {
                     eprintln!("server error: {e}");
-                    shutdown(&db, &pidfile, args.daemon);
+                    shutdown_storage(standalone_for_native.as_ref(), &pidfile, args.daemon);
                     std::process::exit(1);
                 }
             }
@@ -1091,7 +1238,7 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
             result = axum::serve(listener, app) => {
                 if let Err(e) = result {
                     eprintln!("server error: {e}");
-                    shutdown(&db, &pidfile, args.daemon);
+                    shutdown_storage(standalone_for_native.as_ref(), &pidfile, args.daemon);
                     std::process::exit(1);
                 }
             }
@@ -1114,7 +1261,7 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
     if stuck_queries > 0 {
         eprintln!("[shutdown] {stuck_queries} SQL query(s) exceeded cancellation grace");
     }
-    shutdown(&db, &pidfile, args.daemon);
+    shutdown_storage(standalone_for_native.as_ref(), &pidfile, args.daemon);
 }
 
 fn native_result_message(result: Option<Result<(), String>>) -> String {
@@ -1129,17 +1276,23 @@ fn native_result_message(result: Option<Result<(), String>>) -> String {
 /// pidfile (if we wrote one). The checkpoint ensures the database directory
 /// is deterministic after shutdown — no stale WAL segments, no fragmented
 /// runs — so `git status` shows clean when the directory is tracked.
-fn shutdown(db: &Arc<Database>, pidfile: &str, daemon: bool) {
-    // Checkpoint: flush + compact + reap WAL segments + rotate active segment.
-    // This normalizes the on-disk state to a deterministic form.
-    match db.checkpoint() {
-        Ok(()) => eprintln!("checkpoint complete"),
-        Err(e) => {
-            // Checkpoint failure is non-fatal during shutdown — fall back to
-            // a best-effort close so the process can still exit cleanly.
-            eprintln!("checkpoint failed (falling back to close): {e}");
-            let _ = db.close();
+///
+/// Cluster mode has no peer standalone database; only the pidfile is cleaned.
+fn shutdown_storage(db: Option<&Arc<Database>>, pidfile: &str, daemon: bool) {
+    if let Some(db) = db {
+        // Checkpoint: flush + compact + reap WAL segments + rotate active segment.
+        // This normalizes the on-disk state to a deterministic form.
+        match db.checkpoint() {
+            Ok(()) => eprintln!("checkpoint complete"),
+            Err(e) => {
+                // Checkpoint failure is non-fatal during shutdown — fall back to
+                // a best-effort close so the process can still exit cleanly.
+                eprintln!("checkpoint failed (falling back to close): {e}");
+                let _ = db.close();
+            }
         }
+    } else {
+        eprintln!("cluster mode: no standalone database checkpoint (NodeRuntime drained)");
     }
     eprintln!("shutdown complete");
     if daemon {

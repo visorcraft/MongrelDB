@@ -5,7 +5,7 @@ use std::sync::Arc;
 use mongreldb_cluster::network::{InternalRpcFuture, InternalRpcHandler};
 use mongreldb_cluster::runtime::NodeInternalRpcClient;
 use mongreldb_core::auth::Principal;
-use mongreldb_core::query::AiExecutionContext;
+use mongreldb_core::query::{AiExecutionContext, RetrieverScore};
 use mongreldb_core::Database;
 use mongreldb_query::ai_retrieval::{
     AiRetrievalError, AiRpcClient, AiTabletExecutor, RemoteAiEndpoint, RemoteAiTransport,
@@ -86,6 +86,12 @@ impl AiTabletExecutor for DatabaseAiTabletExecutor {
                 request.budget.max_local_candidates,
                 request.budget.candidate_ceiling,
             );
+            let weight_by_name: std::collections::HashMap<String, f64> = request
+                .search
+                .retrievers
+                .iter()
+                .map(|named| (named.name.clone(), named.weight))
+                .collect();
             database
                 .search_for_principal_with_context(
                     &request.table,
@@ -102,6 +108,31 @@ impl AiTabletExecutor for DatabaseAiTabletExecutor {
                             hit.final_rank
                         ))
                     })?;
+                    // Emit per-retriever contributions so the coordinator can
+                    // run global hybrid fusion (P0.8) instead of single-rank RRF.
+                    let contributions = hit
+                        .components
+                        .iter()
+                        .map(|component| {
+                            let weight = weight_by_name
+                                .get(component.retriever_name.as_ref())
+                                .copied()
+                                .unwrap_or(1.0);
+                            let component_rank =
+                                u32::try_from(component.rank).unwrap_or(u32::MAX).max(1);
+                            mongreldb_query::LocalRetrieverContribution {
+                                tablet_id: request.tablet_id,
+                                row_id: hit.row_id,
+                                retriever_id: component.retriever_name.to_string(),
+                                retriever_kind: None,
+                                local_rank: component_rank,
+                                raw_score: retriever_score_higher_better(component.raw_score),
+                                upper_bound_after: None,
+                                rls_visible: true,
+                                weight,
+                            }
+                        })
+                        .collect();
                     Ok(mongreldb_query::AiTabletHit {
                         candidate: mongreldb_query::LocalCandidate {
                             tablet_id: request.tablet_id,
@@ -113,12 +144,25 @@ impl AiTabletExecutor for DatabaseAiTabletExecutor {
                         cells: hit.cells,
                         exact_rerank_score: hit.exact_rerank_score,
                         consistency: None,
+                        contributions,
+                        metadata: mongreldb_query::TabletAiResponseMetadata::default(),
                     })
                 })
                 .collect()
         })
         .await
         .map_err(|error| AiRetrievalError::Transport(format!("AI worker task failed: {error}")))?
+    }
+}
+
+/// Convert core retriever scores to higher-is-better raw scores for hybrid merge.
+fn retriever_score_higher_better(score: RetrieverScore) -> f64 {
+    match score {
+        // ANN distances are lower-is-better; invert so MaxScore fusion works.
+        RetrieverScore::AnnHammingDistance(distance) => -(f64::from(distance)),
+        RetrieverScore::AnnCosineDistance(distance) => -f64::from(distance),
+        RetrieverScore::SparseDotProduct(score) => score,
+        RetrieverScore::MinHashEstimatedJaccard(jaccard) => f64::from(jaccard),
     }
 }
 
@@ -202,6 +246,98 @@ pub async fn install_ai_worker(
         )
         .await?;
     Ok(endpoint)
+}
+
+/// Runtime-backed tablet database lookup for production fragment/AI workers.
+///
+/// Resolves applied `ClusterReplica` cores only for tablets this node hosts;
+/// never opens a peer standalone user database (P0.2 dual-root refusal).
+struct RuntimeTabletDatabases {
+    runtime: ClusterRuntimeHandle,
+}
+
+impl FragmentDatabaseProvider for RuntimeTabletDatabases {
+    fn database(&self, tablet: TabletId) -> Option<Arc<Database>> {
+        self.runtime.tablet_database_try(tablet)
+    }
+}
+
+impl TabletDatabaseProvider for RuntimeTabletDatabases {
+    fn database(&self, tablet_id: TabletId) -> Option<Arc<Database>> {
+        self.runtime.tablet_database_try(tablet_id)
+    }
+}
+
+/// Authorization envelope for tablet workers: empty context is credentialless;
+/// non-empty contexts must match a catalog principal username (UTF-8).
+struct RuntimeAuthorizationResolver;
+
+impl FragmentAuthorizationResolver for RuntimeAuthorizationResolver {
+    fn resolve(
+        &self,
+        database: &Database,
+        context: &[u8],
+    ) -> DistributedResult<Option<Principal>> {
+        resolve_worker_principal(database, context)
+            .map_err(|error| DistributedError::RemoteProtocol(error))
+    }
+}
+
+impl AiAuthorizationResolver for RuntimeAuthorizationResolver {
+    fn resolve(
+        &self,
+        database: &Database,
+        context: &[u8],
+    ) -> Result<Option<Principal>, AiRetrievalError> {
+        resolve_worker_principal(database, context).map_err(AiRetrievalError::Transport)
+    }
+}
+
+fn resolve_worker_principal(
+    database: &Database,
+    context: &[u8],
+) -> Result<Option<Principal>, String> {
+    if context.is_empty() {
+        if database.require_auth_enabled() {
+            return Err("authorization context required for credentialed tablet core".into());
+        }
+        return Ok(None);
+    }
+    let username = std::str::from_utf8(context)
+        .map_err(|_| "authorization context is not valid UTF-8".to_owned())?;
+    database
+        .resolve_principal(username)
+        .map(Some)
+        .ok_or_else(|| format!("authorization context principal `{username}` is unknown"))
+}
+
+/// Production cluster start: install fragment + AI workers on the authenticated
+/// internal RPC transport (P0.2 residual #9 / audit §1 item 9).
+///
+/// Workers resolve hosted tablet engines through [`ClusterRuntimeHandle`];
+/// they never open a standalone user-database root alongside the node runtime.
+pub async fn install_production_cluster_workers(
+    runtime: &ClusterRuntimeHandle,
+) -> Result<(Arc<RemoteFragmentEndpoint>, Arc<RemoteAiEndpoint>), ClusterRuntimeError> {
+    let databases = Arc::new(RuntimeTabletDatabases {
+        runtime: runtime.clone(),
+    });
+    let authorization = Arc::new(RuntimeAuthorizationResolver);
+    let fragment = install_database_fragment_worker(
+        runtime,
+        Arc::clone(&databases) as Arc<dyn FragmentDatabaseProvider>,
+        Arc::clone(&authorization) as Arc<dyn FragmentAuthorizationResolver>,
+    )
+    .await?;
+    let ai = install_ai_worker(
+        runtime,
+        Arc::new(DatabaseAiTabletExecutor::new(
+            databases as Arc<dyn TabletDatabaseProvider>,
+            authorization as Arc<dyn AiAuthorizationResolver>,
+        )),
+    )
+    .await?;
+    Ok((fragment, ai))
 }
 
 /// Builds a fail-closed fragment transport from an already bound gateway
@@ -416,6 +552,8 @@ mod tests {
                 cells: vec![(1, Value::Int64(44))],
                 exact_rerank_score: Some(0.95),
                 consistency: None,
+                contributions: Vec::new(),
+                metadata: Default::default(),
             }])
         }
     }

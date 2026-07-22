@@ -289,11 +289,16 @@ impl IdempotencyIntegrity {
         Ok((root, Arc::new(Self { key })))
     }
 
+    /// Integrity key for a durable root that is not a standalone database
+    /// (cluster node-data process-local receipts).
+    pub(crate) fn for_root(root: &Arc<DurableRoot>) -> io::Result<Arc<Self>> {
+        let key = load_or_create_plaintext_integrity_key(root)?;
+        Ok(Arc::new(Self { key }))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_root(root: &Arc<DurableRoot>) -> Option<Arc<Self>> {
-        load_or_create_plaintext_integrity_key(root)
-            .ok()
-            .map(|key| Arc::new(Self { key }))
+        Self::for_root(root).ok()
     }
 
     pub(crate) fn authenticate(&self, domain: &[u8], bytes: &[u8]) -> [u8; 32] {

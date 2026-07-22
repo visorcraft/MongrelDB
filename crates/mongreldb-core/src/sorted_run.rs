@@ -5,6 +5,15 @@
 //! drained memtable rows into encoded columns
 //! (system columns `_row_id` / `_epoch` / `_deleted` plus user columns), and
 //! [`RunReader`] decodes them back, answering MVCC point lookups and scans.
+//!
+//! # HLC stamps (P0.5-T3)
+//!
+//! Sorted runs may carry an optional [`SYS_COMMIT_TS`] system column (16-byte
+//! little-endian HLC encoding). Writers emit it whenever any flushed row has a
+//! `commit_ts`; readers restore stamps when the column is present and treat a
+//! missing column as legacy (`commit_ts: None`). Epoch remains the always-on
+//! system column so pre-stamp runs stay readable without a format bump.
+//! Full PITR-at-HLC still depends on archive targets (P0.5-X10).
 
 use crate::columnar;
 use crate::encryption::{setup_run_encryption, Cipher, Kek, RunEncryption};
@@ -16,6 +25,7 @@ use crate::page::{Encoding, PageStat};
 use crate::row_id_set::RowIdSet;
 use crate::rowid::RowId;
 use crate::schema::{Schema, TypeId};
+use mongreldb_types::hlc::HlcTimestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -94,6 +104,54 @@ pub const SORT_KEY_ROW_ID: u16 = 0xFFFF;
 pub const SYS_ROW_ID: u16 = 0xFFFE;
 pub const SYS_EPOCH: u16 = 0xFFFD;
 pub const SYS_DELETED: u16 = 0xFFFC;
+/// Optional HLC commit stamp (P0.5-T3). Absent on legacy runs → `commit_ts: None`.
+///
+/// Encoding: 16 little-endian bytes
+/// `(physical_micros:u64, logical:u32, node_tiebreaker:u32)`, or `Null` when
+/// a particular row version was not stamped.
+pub const SYS_COMMIT_TS: u16 = 0xFFFB;
+
+/// Bytes length of the on-disk HLC encoding for [`SYS_COMMIT_TS`].
+const COMMIT_TS_BYTES: usize = 16;
+
+/// Encode an optional HLC stamp for the optional [`SYS_COMMIT_TS`] column.
+fn encode_commit_ts_value(ts: Option<HlcTimestamp>) -> Value {
+    match ts {
+        None => Value::Null,
+        Some(ts) => {
+            let mut buf = [0u8; COMMIT_TS_BYTES];
+            buf[0..8].copy_from_slice(&ts.physical_micros.to_le_bytes());
+            buf[8..12].copy_from_slice(&ts.logical.to_le_bytes());
+            buf[12..16].copy_from_slice(&ts.node_tiebreaker.to_le_bytes());
+            Value::Bytes(buf.to_vec())
+        }
+    }
+}
+
+/// Decode a [`SYS_COMMIT_TS`] cell. Malformed/null/absent → `None` (legacy).
+fn decode_commit_ts_value(value: Option<&Value>) -> Option<HlcTimestamp> {
+    match value {
+        Some(Value::Bytes(bytes)) if bytes.len() == COMMIT_TS_BYTES => {
+            let physical_micros = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+            let logical = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+            let node_tiebreaker = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+            Some(HlcTimestamp {
+                physical_micros,
+                logical,
+                node_tiebreaker,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// True when `column_id` is a reserved system column (including optional HLC).
+fn is_system_column_id(column_id: u16) -> bool {
+    matches!(
+        column_id,
+        SYS_ROW_ID | SYS_EPOCH | SYS_DELETED | SYS_COMMIT_TS
+    )
+}
 
 /// Guaranteed positional error of the stored PGM model (the predicted offset is
 /// within `± LEARNED_EPSILON` of the true position; a tiny final scan corrects).
@@ -1568,17 +1626,24 @@ impl<'a> RunWriter<'a> {
         let mut row_ids = Vec::with_capacity(n);
         let mut epochs = Vec::with_capacity(n);
         let mut deleted = Vec::with_capacity(n);
+        let mut commit_ts_vals = Vec::with_capacity(n);
+        // Emit SYS_COMMIT_TS when any version is HLC-stamped (P0.5-T3).
+        let has_commit_ts = rows.iter().any(|r| r.commit_ts.is_some());
         for r in rows {
             row_ids.push(Value::Int64(r.row_id.0 as i64));
             epochs.push(Value::Int64(r.committed_epoch.0 as i64));
             deleted.push(Value::Bool(r.deleted));
+            if has_commit_ts {
+                commit_ts_vals.push(encode_commit_ts_value(r.commit_ts));
+            }
         }
         let learned_trailer = build_learned_trailer(&row_ids);
         let (min_rid, max_rid) = row_id_bounds(rows);
         let row_id_i64: Vec<i64> = rows.iter().map(|r| r.row_id.0 as i64).collect();
         let bounds = page_bounds(&row_id_i64);
 
-        let mut columns: Vec<ColumnPayload> = Vec::with_capacity(3 + self.schema.columns.len());
+        let mut columns: Vec<ColumnPayload> =
+            Vec::with_capacity(3 + usize::from(has_commit_ts) + self.schema.columns.len());
         let (pages, stats, enc) = value_column_pages(TypeId::Int64, &row_ids, &bounds)?;
         columns.push(ColumnPayload {
             column_id: SYS_ROW_ID,
@@ -1603,6 +1668,17 @@ impl<'a> RunWriter<'a> {
             pages,
             page_stats: stats,
         });
+        if has_commit_ts {
+            let (pages, stats, enc) =
+                value_column_pages(TypeId::Bytes, &commit_ts_vals, &bounds)?;
+            columns.push(ColumnPayload {
+                column_id: SYS_COMMIT_TS,
+                type_id_tag: type_tag(&TypeId::Bytes),
+                encoding: enc,
+                pages,
+                page_stats: stats,
+            });
+        }
         // User columns — choose an encoding per column from run-time stats.
         for cdef in &self.schema.columns {
             let vals: Vec<Value> = rows
@@ -2044,9 +2120,22 @@ impl RunVisibleVersionCursor {
                 )
             })
             .collect();
+        // Optional HLC stamp (P0.5-T3): load from SYS_COMMIT_TS when present.
+        let commit_ts = if self.reader.has_column(SYS_COMMIT_TS) {
+            let page = self.reader.read_page(SYS_COMMIT_TS, version.page_seq)?;
+            let native = columnar::decode_page_native(
+                TypeId::Bytes,
+                &page,
+                self.page_row_counts[version.page_seq],
+            )?;
+            decode_commit_ts_value(native.value_at(version.within_page).as_ref())
+        } else {
+            None
+        };
         Ok(Row {
             row_id: version.row_id,
             committed_epoch: version.committed_epoch,
+            commit_ts,
             columns,
             deleted: version.deleted,
         })
@@ -2275,7 +2364,7 @@ impl RunReader {
             let ty = self.resolve_type(column.column_id);
             if column.type_id_tag != type_tag(&ty)
                 || column.encoding > Encoding::Zstd as u8
-                || (!matches!(column.column_id, SYS_ROW_ID | SYS_EPOCH | SYS_DELETED)
+                || (!is_system_column_id(column.column_id)
                     && self
                         .schema
                         .columns
@@ -2469,6 +2558,7 @@ impl RunReader {
         match column_id {
             SYS_ROW_ID | SYS_EPOCH => TypeId::Int64,
             SYS_DELETED => TypeId::Bool,
+            SYS_COMMIT_TS => TypeId::Bytes,
             _ => self
                 .schema
                 .columns
@@ -2477,6 +2567,14 @@ impl RunReader {
                 .map(|c| c.ty.clone())
                 .unwrap_or(TypeId::Bytes),
         }
+    }
+
+    /// Optional HLC stamp at row `index` (P0.5-T3). Missing column → `None`.
+    fn commit_ts_at(&mut self, index: usize) -> Result<Option<HlcTimestamp>> {
+        if !self.has_column(SYS_COMMIT_TS) {
+            return Ok(None);
+        }
+        Ok(decode_commit_ts_value(self.column(SYS_COMMIT_TS)?.get(index)))
     }
 
     fn find_header(&self, column_id: u16) -> Result<&ColumnPageHeader> {
@@ -2896,6 +2994,11 @@ impl RunReader {
             _ => 0,
         });
         let deleted = matches!(native_at(self, SYS_DELETED)?, Some(Value::Bool(true)));
+        let commit_ts = if self.has_column(SYS_COMMIT_TS) {
+            decode_commit_ts_value(native_at(self, SYS_COMMIT_TS)?.as_ref())
+        } else {
+            None
+        };
         let col_ids: Vec<u16> = self.schema.columns.iter().map(|c| c.id).collect();
         let mut columns = HashMap::new();
         for id in col_ids {
@@ -2904,6 +3007,7 @@ impl RunReader {
         Ok(Row {
             row_id,
             committed_epoch,
+            commit_ts,
             columns,
             deleted,
         })
@@ -3755,6 +3859,11 @@ impl RunReader {
     /// Newest visible version per `RowId` at `snapshot`, **including
     /// tombstones** (as `Row`s with `deleted=true`). Ascending `RowId`. Used by
     /// the engine to merge versions across runs and the memtable.
+    ///
+    /// HLC stamps are restored when [`SYS_COMMIT_TS`] is present (P0.5-T3);
+    /// legacy runs without the column materialise `commit_ts: None`. Callers
+    /// that hold a full [`crate::epoch::Snapshot`] still apply
+    /// [`crate::epoch::Snapshot::observes_row`].
     pub fn visible_versions(&mut self, snapshot: Epoch) -> Result<Vec<Row>> {
         let n = self.row_count();
         if n == 0 {
@@ -3799,6 +3908,7 @@ impl RunReader {
         let row_id = RowId(int_at(self.column(SYS_ROW_ID)?, index));
         let epoch = Epoch(int_at(self.column(SYS_EPOCH)?, index));
         let deleted = bool_at(self.column(SYS_DELETED)?, index);
+        let commit_ts = self.commit_ts_at(index)?;
         let col_ids: Vec<u16> = self.schema.columns.iter().map(|c| c.id).collect();
         let mut columns = HashMap::new();
         for id in col_ids {
@@ -3813,6 +3923,7 @@ impl RunReader {
         Ok(Row {
             row_id,
             committed_epoch: epoch,
+            commit_ts,
             columns,
             deleted,
         })
@@ -3834,6 +3945,11 @@ impl RunReader {
         let rid_col = self.column_native_shared(SYS_ROW_ID)?;
         let epoch_col = self.column_native_shared(SYS_EPOCH)?;
         let del_col = self.column_native_shared(SYS_DELETED)?;
+        let commit_ts_col = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column_native_shared(SYS_COMMIT_TS)?)
+        } else {
+            None
+        };
         let mut user: HashMap<u16, columnar::NativeColumn> = HashMap::new();
         let present: Vec<u16> = self
             .schema
@@ -3864,6 +3980,9 @@ impl RunReader {
             let row_id = RowId(i64_at(&rid_col, idx) as u64);
             let epoch = Epoch(i64_at(&epoch_col, idx) as u64);
             let deleted = bool_at_native(&del_col, idx);
+            let commit_ts = commit_ts_col
+                .as_ref()
+                .and_then(|col| decode_commit_ts_value(col.value_at(idx).as_ref()));
             let mut columns = HashMap::with_capacity(self.schema.columns.len());
             for cdef in self.schema.columns.iter() {
                 let val = match user.get(&cdef.id) {
@@ -3875,6 +3994,7 @@ impl RunReader {
             rows.push(Row {
                 row_id,
                 committed_epoch: epoch,
+                commit_ts,
                 columns,
                 deleted,
             });
@@ -3965,6 +4085,67 @@ mod tests {
         // Scan.
         let all = r.visible_rows(Epoch(20)).unwrap();
         assert_eq!(all.len(), 3);
+        // Unstamped flush omits SYS_COMMIT_TS (legacy path).
+        assert!(!r.has_column(SYS_COMMIT_TS));
+        assert!(all.iter().all(|row| row.commit_ts.is_none()));
+    }
+
+    /// ID: P0.5-T3 — flush preserves HLC stamps via optional SYS_COMMIT_TS;
+    /// legacy runs without the column materialise commit_ts as None.
+    #[test]
+    fn p05_t3_sys_commit_ts_preserved_on_flush_and_legacy_is_none() {
+        let dir = tempdir().unwrap();
+        let stamped_path = dir.path().join("r-hlc.sr");
+        let stamp = HlcTimestamp {
+            physical_micros: 42_000_000,
+            logical: 7,
+            node_tiebreaker: 3,
+        };
+        let stamped = vec![
+            Row::new_with_hlc(RowId(1), Epoch(10), stamp)
+                .with_column(1, Value::Int64(1))
+                .with_column(2, Value::Bytes(b"alice".to_vec())),
+            Row::new(RowId(2), Epoch(11)) // mixed: unstamped sibling
+                .with_column(1, Value::Int64(2))
+                .with_column(2, Value::Bytes(b"bob".to_vec())),
+        ];
+        RunWriter::new(&schema(), 9, Epoch(11), 0)
+            .write(&stamped_path, &stamped)
+            .unwrap();
+        let mut reader = RunReader::open(&stamped_path, schema(), None).unwrap();
+        assert!(
+            reader.has_column(SYS_COMMIT_TS),
+            "stamped flush must emit optional SYS_COMMIT_TS"
+        );
+        let (_, row1) = reader
+            .get_version(RowId(1), Epoch(20))
+            .unwrap()
+            .expect("row 1");
+        assert_eq!(row1.commit_ts, Some(stamp));
+        let (_, row2) = reader
+            .get_version(RowId(2), Epoch(20))
+            .unwrap()
+            .expect("row 2");
+        assert_eq!(row2.commit_ts, None, "Null stamp cell stays None");
+        let versions = reader.visible_versions(Epoch(20)).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions
+                .iter()
+                .find(|r| r.row_id == RowId(1))
+                .and_then(|r| r.commit_ts),
+            Some(stamp)
+        );
+
+        // Legacy run (no stamps on write) lacks the column → always None.
+        let legacy_path = dir.path().join("r-legacy.sr");
+        RunWriter::new(&schema(), 10, Epoch(10), 0)
+            .write(&legacy_path, &rows())
+            .unwrap();
+        let mut legacy = RunReader::open(&legacy_path, schema(), None).unwrap();
+        assert!(!legacy.has_column(SYS_COMMIT_TS));
+        let all = legacy.visible_versions(Epoch(20)).unwrap();
+        assert!(all.iter().all(|r| r.commit_ts.is_none()));
     }
 
     #[test]

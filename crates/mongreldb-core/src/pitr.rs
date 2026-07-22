@@ -1,5 +1,14 @@
 //! Point-in-time recovery archives built from an online base backup plus
 //! checksummed, transaction-complete logical WAL chunks.
+//!
+//! # HLC restore target (P0.5-X10)
+//!
+//! [`PitrTarget::Hlc`] selects the newest archived commit whose stamped HLC is
+//! `<=` the requested timestamp (or derived from `unix_nanos` when older
+//! archives omit HLC fields). Restore still applies WAL through that commit's
+//! epoch boundary; row versions recovered from WAL rehydrate the
+//! [`crate::Database`] `commit_ts` ledger. Exact-SHA packaging qualification
+//! remains a separate P0.9 concern.
 
 use crate::backup::verify_backup_durable_with_manifest_sha256;
 use crate::durable_file::DurableRoot;
@@ -43,6 +52,10 @@ pub enum PitrTarget {
     /// epoch. An archive whose ledger records no sequences at all (written
     /// before Stage 1G) fails closed.
     LogPosition(u64),
+    /// Restore through the newest archived commit stamped at or before this
+    /// HLC (P0.5-X10). Commit points carry optional HLC fields; when absent,
+    /// `unix_nanos` is treated as `physical_micros * 1000` for ordering.
+    Hlc(mongreldb_types::hlc::HlcTimestamp),
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +84,38 @@ pub struct PitrCommitPoint {
     pub unix_nanos: u64,
 }
 
+impl PitrCommitPoint {
+    /// Derived HLC when manifest has no explicit [`PitrCommitHlc`] (P0.5-X10).
+    pub fn commit_hlc(&self) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: self.unix_nanos / 1_000,
+            logical: 0,
+            node_tiebreaker: 0,
+        }
+    }
+}
+
+/// Optional HLC stamp parallel to [`PitrCommitPoint`] in the JSON manifest only
+/// (not inside bincode chunk bodies — keeps chunk wire stable).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PitrCommitHlc {
+    pub physical_micros: u64,
+    pub logical: u32,
+    #[serde(default)]
+    pub node_tiebreaker: u32,
+}
+
+impl PitrCommitHlc {
+    pub fn to_hlc(self) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: self.physical_micros,
+            logical: self.logical,
+            node_tiebreaker: self.node_tiebreaker,
+        }
+    }
+}
+
 /// Stage 1G commit-ledger entry: the committing transaction id and the WAL
 /// record sequence (log position) of one commit. Stored parallel to
 /// [`PitrChunkRef::commits`] in the JSON manifest only — never inside the
@@ -97,6 +142,11 @@ pub struct PitrChunkRef {
     /// before Stage 1G); when present it has exactly `commits.len()` entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commit_ledger: Vec<PitrCommitLedgerEntry>,
+    /// Optional HLC stamps parallel to `commits` (JSON manifest only, P0.5-X10).
+    /// When present, length must match `commits`; when empty, HLC is derived
+    /// from `unix_nanos`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_hlcs: Vec<PitrCommitHlc>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub first_sequence: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -411,6 +461,14 @@ impl Database {
         before_publish()?;
         self.with_exact_principal_current(operation_principal.as_ref(), &admin, || {
             publish_chunk(&archive, Path::new(&file), &bytes, &chunk_sha256)?;
+            let commit_hlcs: Vec<PitrCommitHlc> = commits
+                .iter()
+                .map(|c| PitrCommitHlc {
+                    physical_micros: c.unix_nanos / 1_000,
+                    logical: 0,
+                    node_tiebreaker: 0,
+                })
+                .collect();
             manifest.chunks.push(PitrChunkRef {
                 file,
                 from_epoch,
@@ -420,6 +478,7 @@ impl Database {
                 sha256: chunk_sha256,
                 commits,
                 commit_ledger,
+                commit_hlcs,
                 first_sequence,
                 last_sequence,
                 previous_chain_sha256,
@@ -1471,6 +1530,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -1658,6 +1718,40 @@ fn resolve_target_epoch(manifest: &PitrArchiveManifest, target: PitrTarget) -> R
             // A position below the first archived commit lies inside the base
             // backup; commits are atomic, so the base boundary is the answer.
             Ok(epoch.unwrap_or(manifest.base_epoch))
+        }
+        PitrTarget::Hlc(target_hlc) => {
+            if target_hlc == mongreldb_types::hlc::HlcTimestamp::ZERO {
+                return Err(MongrelError::InvalidArgument(
+                    "PITR HLC target must be non-zero".into(),
+                ));
+            }
+            let mut epoch = manifest.base_epoch;
+            let mut found = false;
+            let mut first_hlc = None;
+            for chunk in &manifest.chunks {
+                for (idx, commit) in chunk.commits.iter().enumerate() {
+                    let hlc = chunk
+                        .commit_hlcs
+                        .get(idx)
+                        .copied()
+                        .map(PitrCommitHlc::to_hlc)
+                        .unwrap_or_else(|| commit.commit_hlc());
+                    if first_hlc.is_none() {
+                        first_hlc = Some(hlc);
+                    }
+                    if hlc > target_hlc {
+                        if !found {
+                            return Err(MongrelError::InvalidArgument(
+                                "PITR HLC target predates first archived commit".into(),
+                            ));
+                        }
+                        return Ok(epoch);
+                    }
+                    epoch = commit.epoch;
+                    found = true;
+                }
+            }
+            Ok(epoch)
         }
     }
 }
@@ -2000,16 +2094,11 @@ mod tests {
                     bytes: 100,
                     sha256: first_sha,
                     commits: vec![
-                        PitrCommitPoint {
-                            epoch: 11,
-                            unix_nanos: 110,
-                        },
-                        PitrCommitPoint {
-                            epoch: 12,
-                            unix_nanos: 120,
-                        },
+                        PitrCommitPoint { epoch: 11, unix_nanos: 110 },
+                        PitrCommitPoint { epoch: 12, unix_nanos: 120 },
                     ],
                     commit_ledger: Vec::new(),
+                    commit_hlcs: Vec::new(),
                     first_sequence: 20,
                     last_sequence: 23,
                     previous_chain_sha256: genesis,
@@ -2022,11 +2111,9 @@ mod tests {
                     records: 2,
                     bytes: 100,
                     sha256: second_sha,
-                    commits: vec![PitrCommitPoint {
-                        epoch: 13,
-                        unix_nanos: 130,
-                    }],
+                    commits: vec![PitrCommitPoint { epoch: 13, unix_nanos: 130 }],
                     commit_ledger: Vec::new(),
+                    commit_hlcs: Vec::new(),
                     first_sequence: 30,
                     last_sequence: 31,
                     previous_chain_sha256: first_chain,
@@ -2055,10 +2142,7 @@ mod tests {
                     },
                 ),
             ],
-            commits: vec![PitrCommitPoint {
-                epoch: 11,
-                unix_nanos: 110,
-            }],
+            commits: vec![PitrCommitPoint { epoch: 11, unix_nanos: 110 }],
             first_sequence: 20,
             last_sequence: 21,
             previous_chain_sha256: "11".repeat(32),
@@ -2745,6 +2829,66 @@ mod tests {
         assert!(!serde_json::to_string(&reference)
             .unwrap()
             .contains("commit_ledger"));
+    }
+
+    // P0.5-X10: HLC target selects the newest commit with commit_hlc <= target.
+    #[test]
+    fn hlc_target_restores_through_matching_commit_epoch() {
+        let mut manifest = sample_manifest();
+        // Stamp explicit HLCs parallel to commits (epoch 11/12/13).
+        manifest.chunks[0].commit_hlcs = vec![
+            PitrCommitHlc {
+                physical_micros: 1_000,
+                logical: 1,
+                node_tiebreaker: 0,
+            },
+            PitrCommitHlc {
+                physical_micros: 2_000,
+                logical: 0,
+                node_tiebreaker: 0,
+            },
+        ];
+        manifest.chunks[1].commit_hlcs = vec![PitrCommitHlc {
+            physical_micros: 3_000,
+            logical: 0,
+            node_tiebreaker: 0,
+        }];
+
+        let mid = mongreldb_types::hlc::HlcTimestamp { physical_micros: 2_000, logical: 0, node_tiebreaker: 0 };
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::Hlc(mid)).unwrap(),
+            12,
+            "HLC at second commit must land on epoch 12"
+        );
+        let before_second = mongreldb_types::hlc::HlcTimestamp { physical_micros: 1_500, logical: 0, node_tiebreaker: 0 };
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::Hlc(before_second)).unwrap(),
+            11
+        );
+        let latest = mongreldb_types::hlc::HlcTimestamp { physical_micros: 9_999, logical: 0, node_tiebreaker: 0 };
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::Hlc(latest)).unwrap(),
+            13
+        );
+        // Legacy (physical=0) still derives from unix_nanos/1000.
+        let mut legacy = sample_manifest();
+        legacy.chunks[0].commits[0].unix_nanos = 1_100_000;
+        legacy.chunks[0].commits[1].unix_nanos = 2_200_000;
+        legacy.chunks[1].commits[0].unix_nanos = 3_300_000;
+        let mid_legacy = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 2_200,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
+        assert_eq!(
+            resolve_target_epoch(&legacy, PitrTarget::Hlc(mid_legacy)).unwrap(),
+            12
+        );
+        assert!(resolve_target_epoch(
+            &manifest,
+            PitrTarget::Hlc(mongreldb_types::hlc::HlcTimestamp::ZERO)
+        )
+        .is_err());
     }
 
     #[test]

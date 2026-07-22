@@ -35,13 +35,14 @@
 //!
 //! # Integration point with DataFusion
 //!
-//! `LogicalPlanLite` is intentionally minimal. The DataFusion integration wave
-//! lowers `datafusion::logical_expr::LogicalPlan` (produced by
+//! [`DataFusionDistributedPlanner::lower`] converts a real
+//! `datafusion::logical_expr::LogicalPlan` (produced by
 //! [`MongrelSession`](crate::MongrelSession) after catalog/schema resolution)
-//! onto `LogicalPlanLite` — scans of `MongrelScanExec`-backed tables become
-//! [`LogicalPlanLite::Scan`], aggregates/joins/sorts/limits map one-to-one —
-//! and hands the tree to [`distribute`]. Full DataFusion plan conversion is
-//! explicitly out of scope for this wave.
+//! onto [`LogicalPlanLite`] and hands the tree to [`distribute`]. Supported
+//! operators: TableScan, Projection (column pushdown), Filter (pushdown onto
+//! scans as typed predicate text for worker evaluation), Aggregate, Sort,
+//! Limit, equi-Join, and Union. Every other DataFusion node is rejected with
+//! [`DistributedError::Unsupported`].
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
@@ -331,6 +332,11 @@ pub enum LogicalPlanLite {
         input: Box<LogicalPlanLite>,
         /// Row limit.
         limit: usize,
+    },
+    /// Concatenate inputs with identical schemas (`UNION ALL` shape).
+    Union {
+        /// Input subtrees (at least two).
+        inputs: Vec<LogicalPlanLite>,
     },
 }
 
@@ -682,6 +688,16 @@ fn validate_lite(node: &LogicalPlanLite) -> DistributedResult<()> {
             validate_lite(input)?;
         }
         LogicalPlanLite::Limit { input, .. } => validate_lite(input)?,
+        LogicalPlanLite::Union { inputs } => {
+            if inputs.len() < 2 {
+                return Err(DistributedError::InvalidPlan(
+                    "union needs at least two inputs".to_owned(),
+                ));
+            }
+            for input in inputs {
+                validate_lite(input)?;
+            }
+        }
     }
     Ok(())
 }
@@ -785,6 +801,7 @@ impl Planner<'_> {
             LogicalPlanLite::Join { left, right, on } => self.plan_join(left, right, on),
             LogicalPlanLite::Sort { input, keys, limit } => self.plan_sort(input, keys, *limit),
             LogicalPlanLite::Limit { input, limit } => self.plan_limit(input, *limit),
+            LogicalPlanLite::Union { inputs } => self.plan_union(inputs),
         }
     }
 
@@ -1211,6 +1228,695 @@ impl Planner<'_> {
             tablets: Vec::new(),
         })
     }
+
+    fn plan_union(&mut self, inputs: &[LogicalPlanLite]) -> DistributedResult<Stage> {
+        let mut producers = Vec::new();
+        let mut estimated_rows = 0u64;
+        let mut estimated_bytes = 0u64;
+        for input in inputs {
+            let stage = self.plan_node(input)?;
+            producers.extend(stage.producers);
+            estimated_rows = estimated_rows.saturating_add(stage.estimated_rows);
+            estimated_bytes = estimated_bytes.saturating_add(stage.estimated_bytes);
+        }
+        if producers.is_empty() {
+            return Err(DistributedError::InvalidPlan(
+                "union produced no fragments".to_owned(),
+            ));
+        }
+        // All inputs already coordinator-local and single-producer: keep them
+        // as-is (no extra gather hop).
+        if producers.len() == 1 {
+            return Ok(Stage {
+                producers,
+                estimated_rows,
+                estimated_bytes,
+                partitioning: None,
+                tablets: Vec::new(),
+            });
+        }
+        let consumer = self.push_fragment(
+            FragmentAssignment::Coordinator,
+            Vec::new(),
+            estimated_rows,
+            estimated_bytes,
+        );
+        self.wire(&producers, &[consumer], ExchangeKind::Merge);
+        Ok(Stage {
+            producers: vec![consumer],
+            estimated_rows,
+            estimated_bytes,
+            partitioning: None,
+            tablets: Vec::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataFusion → DistributedPlan lowering (P0.4)
+// ---------------------------------------------------------------------------
+
+/// Lowers a DataFusion [`datafusion::logical_expr::LogicalPlan`] onto tablets.
+///
+/// Conversion is two-phase: the DataFusion tree is reduced to
+/// [`LogicalPlanLite`], then [`distribute`] places fragments. Filters and
+/// projections are pushed onto base scans; residual filters that cannot be
+/// pushed are rejected rather than stringified without worker evaluation.
+#[derive(Clone, Debug)]
+pub struct DataFusionDistributedPlanner {
+    query_id: QueryId,
+    options: PlannerOptions,
+}
+
+impl DataFusionDistributedPlanner {
+    /// Planner pinned to one query id with default options.
+    pub fn new(query_id: QueryId) -> Self {
+        Self {
+            query_id,
+            options: PlannerOptions::default(),
+        }
+    }
+
+    /// Planner with explicit fragment/join tuning.
+    pub fn with_options(query_id: QueryId, options: PlannerOptions) -> Self {
+        Self { query_id, options }
+    }
+
+    /// Query id this planner stamps onto every plan.
+    pub fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    /// Lowers `plan` into a [`DistributedPlan`] against the given locator and
+    /// control-plane metadata.
+    pub fn lower(
+        &self,
+        plan: &datafusion::logical_expr::LogicalPlan,
+        locator: &dyn TabletLocator,
+        metadata: &dyn ClusterMetadata,
+    ) -> DistributedResult<DistributedPlan> {
+        let root = self.to_lite(plan)?;
+        distribute(
+            &PlanDescription {
+                query_id: self.query_id,
+                root,
+                options: self.options,
+            },
+            locator,
+            metadata,
+        )
+    }
+
+    /// Converts a DataFusion logical plan into the distributed IR without
+    /// tablet placement. Useful for unit tests and diagnostics.
+    pub fn to_lite(
+        &self,
+        plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> DistributedResult<LogicalPlanLite> {
+        lower_datafusion_plan(plan)
+    }
+}
+
+fn lower_datafusion_plan(
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> DistributedResult<LogicalPlanLite> {
+    use datafusion::logical_expr::LogicalPlan;
+
+    match plan {
+        LogicalPlan::TableScan(scan) => lower_table_scan(scan),
+        LogicalPlan::Projection(projection) => lower_projection(projection),
+        LogicalPlan::Filter(filter) => lower_filter(filter),
+        LogicalPlan::Aggregate(aggregate) => lower_aggregate(aggregate),
+        LogicalPlan::Sort(sort) => lower_sort(sort),
+        LogicalPlan::Limit(limit) => lower_limit(limit),
+        LogicalPlan::Join(join) => lower_join(join),
+        LogicalPlan::Union(union) => lower_union(union),
+        LogicalPlan::SubqueryAlias(alias) => lower_datafusion_plan(alias.input.as_ref()),
+        other => Err(DistributedError::Unsupported(format!(
+            "DataFusion operator not supported for distributed planning: {}",
+            other.display()
+        ))),
+    }
+}
+
+fn lower_table_scan(
+    scan: &datafusion::logical_expr::TableScan,
+) -> DistributedResult<LogicalPlanLite> {
+    let table = scan.table_name.table().to_owned();
+    if table.is_empty() {
+        return Err(DistributedError::InvalidPlan(
+            "table scan needs a table name".to_owned(),
+        ));
+    }
+    let projection = if let Some(indices) = &scan.projection {
+        let schema = scan.source.schema();
+        let mut columns = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            if idx >= schema.fields().len() {
+                return Err(DistributedError::InvalidPlan(format!(
+                    "table scan projection index {idx} out of range"
+                )));
+            }
+            columns.push(schema.field(idx).name().clone());
+        }
+        columns
+    } else {
+        // projected_schema already reflects provider projection when present.
+        scan.projected_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    };
+    let predicate = combine_filter_predicates(&scan.filters)?;
+    let mut root = LogicalPlanLite::Scan {
+        table,
+        predicate,
+        projection,
+    };
+    if let Some(fetch) = scan.fetch {
+        root = LogicalPlanLite::Limit {
+            input: Box::new(root),
+            limit: fetch,
+        };
+    }
+    Ok(root)
+}
+
+fn lower_projection(
+    projection: &datafusion::logical_expr::Projection,
+) -> DistributedResult<LogicalPlanLite> {
+    let mut input = lower_datafusion_plan(projection.input.as_ref())?;
+    let columns = projection_column_names(&projection.expr)?;
+    // Pure column projections fold into the base scan when possible.
+    if let Some((predicate, projection_cols)) = scan_fields_mut(&mut input) {
+        let _ = predicate; // projection does not touch the predicate
+        if !columns.is_empty() {
+            if projection_cols.is_empty() {
+                *projection_cols = columns;
+            } else {
+                // Intersect/reorder existing projection by requested names.
+                let map: HashMap<String, String> = projection_cols
+                    .iter()
+                    .map(|name| (name.clone(), name.clone()))
+                    .collect();
+                let mut next = Vec::with_capacity(columns.len());
+                for column in &columns {
+                    let Some(existing) = map.get(column.as_str()) else {
+                        return Err(DistributedError::InvalidPlan(format!(
+                            "projection column `{column}` is not in the scan projection"
+                        )));
+                    };
+                    next.push(existing.clone());
+                }
+                *projection_cols = next;
+            }
+        }
+        return Ok(input);
+    }
+    // Non-scan inputs (Aggregate / Sort / Limit / Join / Union): treat pure
+    // column renames as identity. The fragment model has no free-standing
+    // Projection operator; final output naming is coordinator-side.
+    if columns.is_empty() || matches!(
+        input,
+        LogicalPlanLite::Aggregate { .. }
+            | LogicalPlanLite::Sort { .. }
+            | LogicalPlanLite::Limit { .. }
+            | LogicalPlanLite::Join { .. }
+            | LogicalPlanLite::Union { .. }
+    ) {
+        return Ok(input);
+    }
+    Err(DistributedError::Unsupported(
+        "projection over a non-scan plan is not supported; push the projection onto the base table"
+            .to_owned(),
+    ))
+}
+
+fn lower_filter(
+    filter: &datafusion::logical_expr::Filter,
+) -> DistributedResult<LogicalPlanLite> {
+    // Require a worker-evaluable predicate shape before accepting it.
+    assert_filter_evaluable(&filter.predicate)?;
+    let mut input = lower_datafusion_plan(filter.input.as_ref())?;
+    let text = filter.predicate.to_string();
+    if let Some((predicate, _)) = scan_fields_mut(&mut input) {
+        *predicate = match predicate.take() {
+            Some(existing) => Some(format!("({existing}) AND ({text})")),
+            None => Some(text),
+        };
+        return Ok(input);
+    }
+    Err(DistributedError::Unsupported(
+        "filter must push down onto a table scan for distributed execution".to_owned(),
+    ))
+}
+
+fn lower_aggregate(
+    aggregate: &datafusion::logical_expr::Aggregate,
+) -> DistributedResult<LogicalPlanLite> {
+    let input = lower_datafusion_plan(aggregate.input.as_ref())?;
+    let mut group_by = Vec::with_capacity(aggregate.group_expr.len());
+    for expr in &aggregate.group_expr {
+        group_by.push(column_name(expr).ok_or_else(|| {
+            DistributedError::Unsupported(format!(
+                "aggregate group-by expression must be a column, got {expr}"
+            ))
+        })?);
+    }
+    let mut aggregates = Vec::with_capacity(aggregate.aggr_expr.len());
+    for expr in &aggregate.aggr_expr {
+        aggregates.push(aggregate_expr_from_df(expr)?);
+    }
+    if aggregates.is_empty() {
+        return Err(DistributedError::InvalidPlan(
+            "aggregate needs at least one aggregate expression".to_owned(),
+        ));
+    }
+    Ok(LogicalPlanLite::Aggregate {
+        input: Box::new(input),
+        group_by,
+        aggregates,
+    })
+}
+
+fn lower_sort(sort: &datafusion::logical_expr::Sort) -> DistributedResult<LogicalPlanLite> {
+    let input = lower_datafusion_plan(sort.input.as_ref())?;
+    if sort.expr.is_empty() {
+        return Err(DistributedError::InvalidPlan(
+            "sort needs at least one key".to_owned(),
+        ));
+    }
+    let mut keys = Vec::with_capacity(sort.expr.len());
+    for sort_expr in &sort.expr {
+        let column = column_name(&sort_expr.expr).ok_or_else(|| {
+            DistributedError::Unsupported(format!(
+                "sort key must be a column, got {}",
+                sort_expr.expr
+            ))
+        })?;
+        keys.push(SortKey {
+            column,
+            descending: !sort_expr.asc,
+        });
+    }
+    Ok(LogicalPlanLite::Sort {
+        input: Box::new(input),
+        keys,
+        limit: sort.fetch,
+    })
+}
+
+fn lower_limit(
+    limit: &datafusion::logical_expr::Limit,
+) -> DistributedResult<LogicalPlanLite> {
+    use datafusion::logical_expr::{FetchType, SkipType};
+
+    match limit.get_skip_type() {
+        Ok(SkipType::Literal(0)) => {}
+        Ok(SkipType::Literal(skip)) => {
+            return Err(DistributedError::Unsupported(format!(
+                "OFFSET {skip} is not supported in distributed planning"
+            )));
+        }
+        Ok(SkipType::UnsupportedExpr) => {
+            return Err(DistributedError::Unsupported(
+                "non-literal OFFSET is not supported in distributed planning".to_owned(),
+            ));
+        }
+        Err(error) => {
+            return Err(DistributedError::InvalidPlan(error.to_string()));
+        }
+    }
+    let fetch = match limit.get_fetch_type() {
+        Ok(FetchType::Literal(Some(n))) => n,
+        Ok(FetchType::Literal(None)) => {
+            // LIMIT with no fetch is a no-op.
+            return lower_datafusion_plan(limit.input.as_ref());
+        }
+        Ok(FetchType::UnsupportedExpr) => {
+            return Err(DistributedError::Unsupported(
+                "non-literal LIMIT is not supported in distributed planning".to_owned(),
+            ));
+        }
+        Err(error) => return Err(DistributedError::InvalidPlan(error.to_string())),
+    };
+    let input = lower_datafusion_plan(limit.input.as_ref())?;
+    Ok(LogicalPlanLite::Limit {
+        input: Box::new(input),
+        limit: fetch,
+    })
+}
+
+fn lower_join(join: &datafusion::logical_expr::Join) -> DistributedResult<LogicalPlanLite> {
+    use datafusion::logical_expr::{JoinConstraint, JoinType};
+
+    if join.join_type != JoinType::Inner {
+        return Err(DistributedError::Unsupported(format!(
+            "only Inner joins are supported for distributed planning, got {:?}",
+            join.join_type
+        )));
+    }
+    if join.filter.is_some() {
+        return Err(DistributedError::Unsupported(
+            "non-equi join filters are not supported for distributed planning".to_owned(),
+        ));
+    }
+    if !matches!(
+        join.join_constraint,
+        JoinConstraint::On | JoinConstraint::Using
+    ) {
+        return Err(DistributedError::Unsupported(format!(
+            "unsupported join constraint {:?}",
+            join.join_constraint
+        )));
+    }
+    if join.on.is_empty() {
+        return Err(DistributedError::InvalidPlan(
+            "join needs at least one key".to_owned(),
+        ));
+    }
+    let left = lower_datafusion_plan(join.left.as_ref())?;
+    let right = lower_datafusion_plan(join.right.as_ref())?;
+    let mut on = Vec::with_capacity(join.on.len());
+    for (left_expr, right_expr) in &join.on {
+        let left_col = column_name(left_expr).ok_or_else(|| {
+            DistributedError::Unsupported(format!(
+                "join key must be a column, got left={left_expr}"
+            ))
+        })?;
+        let right_col = column_name(right_expr).ok_or_else(|| {
+            DistributedError::Unsupported(format!(
+                "join key must be a column, got right={right_expr}"
+            ))
+        })?;
+        on.push(JoinKey {
+            left: left_col,
+            right: right_col,
+        });
+    }
+    Ok(LogicalPlanLite::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        on,
+    })
+}
+
+fn lower_union(union: &datafusion::logical_expr::Union) -> DistributedResult<LogicalPlanLite> {
+    if union.inputs.len() < 2 {
+        return Err(DistributedError::InvalidPlan(
+            "union needs at least two inputs".to_owned(),
+        ));
+    }
+    let mut inputs = Vec::with_capacity(union.inputs.len());
+    for input in &union.inputs {
+        inputs.push(lower_datafusion_plan(input.as_ref())?);
+    }
+    Ok(LogicalPlanLite::Union { inputs })
+}
+
+/// Mutable access to a base-scan's predicate and projection, including when the
+/// scan is wrapped by a table-scan `fetch` limit.
+fn scan_fields_mut(
+    node: &mut LogicalPlanLite,
+) -> Option<(&mut Option<String>, &mut Vec<String>)> {
+    match node {
+        LogicalPlanLite::Scan {
+            predicate,
+            projection,
+            ..
+        } => Some((predicate, projection)),
+        LogicalPlanLite::Limit { input, .. } => match input.as_mut() {
+            LogicalPlanLite::Scan {
+                predicate,
+                projection,
+                ..
+            } => Some((predicate, projection)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn projection_column_names(
+    exprs: &[datafusion::logical_expr::Expr],
+) -> DistributedResult<Vec<String>> {
+    let mut columns = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        if let Some(name) = column_name(expr) {
+            columns.push(name);
+            continue;
+        }
+        // Unresolved wildcards (or other non-column exprs) are rejected —
+        // DataFusion should expand them before distributed lowering.
+        return Err(DistributedError::Unsupported(format!(
+            "projection expression must be a column (or alias of a column), got {expr}"
+        )));
+    }
+    Ok(columns)
+}
+
+fn column_name(expr: &datafusion::logical_expr::Expr) -> Option<String> {
+    use datafusion::logical_expr::Expr;
+    match expr {
+        Expr::Column(column) => Some(column.name.clone()),
+        Expr::Alias(alias) => column_name(alias.expr.as_ref()),
+        _ => None,
+    }
+}
+
+fn combine_filter_predicates(
+    filters: &[datafusion::logical_expr::Expr],
+) -> DistributedResult<Option<String>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(filters.len());
+    for filter in filters {
+        assert_filter_evaluable(filter)?;
+        parts.push(format!("({filter})"));
+    }
+    Ok(Some(parts.join(" AND ")))
+}
+
+/// Accept only predicates the distributed worker can evaluate without an
+/// opaque, untyped blob. Column comparisons against literals (and boolean
+/// combinations of those) are allowed; everything else is rejected.
+fn assert_filter_evaluable(expr: &datafusion::logical_expr::Expr) -> DistributedResult<()> {
+    use datafusion::logical_expr::{Expr, Operator};
+
+    match expr {
+        Expr::Column(_) | Expr::Literal(_, _) | Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(()),
+        Expr::Alias(alias) => assert_filter_evaluable(alias.expr.as_ref()),
+        Expr::Not(inner) => assert_filter_evaluable(inner.as_ref()),
+        Expr::BinaryExpr(binary) => {
+            match binary.op {
+                Operator::And
+                | Operator::Or
+                | Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq => {
+                    assert_filter_evaluable(binary.left.as_ref())?;
+                    assert_filter_evaluable(binary.right.as_ref())
+                }
+                other => Err(DistributedError::Unsupported(format!(
+                    "filter operator {other:?} is not supported for distributed planning"
+                ))),
+            }
+        }
+        Expr::Between(between) => {
+            assert_filter_evaluable(between.expr.as_ref())?;
+            assert_filter_evaluable(between.low.as_ref())?;
+            assert_filter_evaluable(between.high.as_ref())
+        }
+        Expr::InList(list) => {
+            assert_filter_evaluable(list.expr.as_ref())?;
+            for value in &list.list {
+                assert_filter_evaluable(value)?;
+            }
+            Ok(())
+        }
+        Expr::Like(like) => {
+            assert_filter_evaluable(like.expr.as_ref())?;
+            assert_filter_evaluable(like.pattern.as_ref())
+        }
+        other => Err(DistributedError::Unsupported(format!(
+            "filter expression is not supported for distributed planning: {other}"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public SQL → DistributedPlan entry (P0.4 gateway seam)
+// ---------------------------------------------------------------------------
+
+/// Arrow schemas for tables that DataFusion must resolve while planning SQL
+/// for distributed placement. Schemas are planning-only (no row data).
+#[derive(Clone, Debug, Default)]
+pub struct PlanningTableCatalog {
+    tables: HashMap<String, SchemaRef>,
+}
+
+impl PlanningTableCatalog {
+    /// Empty catalog.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers (or replaces) one table's schema for SQL planning.
+    pub fn insert(&mut self, table: impl Into<String>, schema: SchemaRef) {
+        self.tables.insert(table.into(), schema);
+    }
+
+    /// Builder-style registration.
+    pub fn with_table(mut self, table: impl Into<String>, schema: SchemaRef) -> Self {
+        self.insert(table, schema);
+        self
+    }
+
+    /// Registered table names (sorted for stable diagnostics).
+    pub fn table_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tables.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Look up one table schema.
+    pub fn schema(&self, table: &str) -> Option<&SchemaRef> {
+        self.tables.get(table)
+    }
+}
+
+/// Lowers an already-parsed DataFusion logical plan onto tablets.
+///
+/// Prefer [`plan_sql_distributed`] when the caller only has SQL text. This
+/// entry is useful when [`crate::MongrelSession`] (or another frontend) has
+/// already produced a resolved `LogicalPlan`.
+pub fn plan_logical_distributed(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    locator: &dyn TabletLocator,
+    metadata: &dyn ClusterMetadata,
+) -> DistributedResult<DistributedPlan> {
+    plan_logical_distributed_with_id(plan, QueryId::new_random(), locator, metadata)
+}
+
+/// Same as [`plan_logical_distributed`] but stamps a caller-chosen query id.
+pub fn plan_logical_distributed_with_id(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    query_id: QueryId,
+    locator: &dyn TabletLocator,
+    metadata: &dyn ClusterMetadata,
+) -> DistributedResult<DistributedPlan> {
+    DataFusionDistributedPlanner::new(query_id).lower(plan, locator, metadata)
+}
+
+/// Public gateway entry: parse `sql` with DataFusion against `catalog`, then
+/// lower via [`DataFusionDistributedPlanner`] onto `locator`/`metadata`.
+///
+/// This is the product seam for cluster SQL planning (P0.4). Callers supply
+/// planning schemas (column names/types) for every table the SQL references;
+/// placement uses [`TabletLocator`] / [`ClusterMetadata`], not a standalone
+/// local catalog scan.
+pub async fn plan_sql_distributed(
+    sql: &str,
+    catalog: &PlanningTableCatalog,
+    locator: &dyn TabletLocator,
+    metadata: &dyn ClusterMetadata,
+) -> DistributedResult<DistributedPlan> {
+    plan_sql_distributed_with_id(sql, catalog, QueryId::new_random(), locator, metadata).await
+}
+
+/// Same as [`plan_sql_distributed`] but stamps a caller-chosen query id.
+pub async fn plan_sql_distributed_with_id(
+    sql: &str,
+    catalog: &PlanningTableCatalog,
+    query_id: QueryId,
+    locator: &dyn TabletLocator,
+    metadata: &dyn ClusterMetadata,
+) -> DistributedResult<DistributedPlan> {
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Err(DistributedError::InvalidPlan(
+            "SQL statement is empty".to_owned(),
+        ));
+    }
+    let ctx = datafusion::prelude::SessionContext::new();
+    for (name, schema) in &catalog.tables {
+        // Empty MemTable: planning needs schema only; workers scan real tablets.
+        let provider = datafusion::datasource::MemTable::try_new(
+            Arc::clone(schema),
+            vec![vec![RecordBatch::new_empty(Arc::clone(schema))]],
+        )
+        .map_err(|error| {
+            DistributedError::InvalidPlan(format!(
+                "failed to register planning table `{name}`: {error}"
+            ))
+        })?;
+        ctx.register_table(name.as_str(), Arc::new(provider))
+            .map_err(|error| {
+                DistributedError::InvalidPlan(format!(
+                    "failed to register planning table `{name}`: {error}"
+                ))
+            })?;
+    }
+    let df = ctx.sql(sql).await.map_err(|error| {
+        DistributedError::InvalidPlan(format!("DataFusion failed to plan SQL: {error}"))
+    })?;
+    plan_logical_distributed_with_id(df.logical_plan(), query_id, locator, metadata)
+}
+
+fn aggregate_expr_from_df(
+    expr: &datafusion::logical_expr::Expr,
+) -> DistributedResult<AggregateExpr> {
+    use datafusion::logical_expr::Expr;
+
+    let expr = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(agg) = expr else {
+        return Err(DistributedError::Unsupported(format!(
+            "aggregate expression must be an aggregate function, got {expr}"
+        )));
+    };
+    let name = agg.func.name().to_ascii_lowercase();
+    let function = match name.as_str() {
+        "count" => AggregateFunction::Count,
+        "sum" => AggregateFunction::Sum,
+        "min" => AggregateFunction::Min,
+        "max" => AggregateFunction::Max,
+        "avg" | "mean" => AggregateFunction::Avg,
+        other => {
+            return Err(DistributedError::Unsupported(format!(
+                "aggregate function `{other}` is not supported for distributed planning"
+            )));
+        }
+    };
+    let column = match agg.params.args.as_slice() {
+        [] => None,
+        // COUNT(*) / COUNT(1) have no column; COUNT(col) keeps the column.
+        [arg] if function == AggregateFunction::Count => column_name(arg),
+        [arg] => Some(column_name(arg).ok_or_else(|| {
+            DistributedError::Unsupported(format!(
+                "aggregate argument must be a column, got {arg}"
+            ))
+        })?),
+        _ => {
+            return Err(DistributedError::Unsupported(
+                "multi-argument aggregates are not supported for distributed planning".to_owned(),
+            ));
+        }
+    };
+    if function != AggregateFunction::Count && column.is_none() {
+        return Err(DistributedError::InvalidPlan(format!(
+            "{} needs a column",
+            function.name()
+        )));
+    }
+    Ok(AggregateExpr { function, column })
 }
 
 /// Scales a byte estimate to a new row estimate.
@@ -1797,6 +2503,51 @@ struct RemoteExecution {
     control: ExecutionControl,
 }
 
+/// Lifecycle counters for remote fragment workers (P0.4-T6).
+#[derive(Debug, Default)]
+pub struct FragmentLifecycleMetrics {
+    /// Fragment start requests accepted.
+    pub starts: std::sync::atomic::AtomicU64,
+    /// Pull frames returned (including end-of-stream).
+    pub pulls: std::sync::atomic::AtomicU64,
+    /// Explicit cancel requests that reclaimed a cursor.
+    pub cancels: std::sync::atomic::AtomicU64,
+    /// Streams that completed (end-of-stream pull).
+    pub completes: std::sync::atomic::AtomicU64,
+    /// Request body bytes handled.
+    pub bytes_in: std::sync::atomic::AtomicU64,
+    /// Response body bytes emitted.
+    pub bytes_out: std::sync::atomic::AtomicU64,
+}
+
+impl FragmentLifecycleMetrics {
+    /// Snapshot of counters for tests / admin surfaces.
+    pub fn snapshot(&self) -> FragmentLifecycleSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        FragmentLifecycleSnapshot {
+            starts: self.starts.load(Relaxed),
+            pulls: self.pulls.load(Relaxed),
+            cancels: self.cancels.load(Relaxed),
+            completes: self.completes.load(Relaxed),
+            bytes_in: self.bytes_in.load(Relaxed),
+            bytes_out: self.bytes_out.load(Relaxed),
+            active_executions: 0,
+        }
+    }
+}
+
+/// Point-in-time fragment lifecycle view (P0.4-T6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FragmentLifecycleSnapshot {
+    pub starts: u64,
+    pub pulls: u64,
+    pub cancels: u64,
+    pub completes: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub active_executions: usize,
+}
+
 /// Worker-side endpoint for the internal fragment protocol.
 ///
 /// The cluster transport supplies authenticated node-to-node delivery. This
@@ -1808,6 +2559,7 @@ pub struct RemoteFragmentEndpoint {
     executions: parking_lot::Mutex<HashMap<RemoteExecutionKey, Arc<RemoteExecution>>>,
     max_executions: usize,
     max_message_bytes: usize,
+    metrics: FragmentLifecycleMetrics,
 }
 
 impl RemoteFragmentEndpoint {
@@ -1831,6 +2583,7 @@ impl RemoteFragmentEndpoint {
             executions: parking_lot::Mutex::new(HashMap::new()),
             max_executions: max_executions.max(1),
             max_message_bytes: max_message_bytes.max(1),
+            metrics: FragmentLifecycleMetrics::default(),
         }
     }
 
@@ -1839,8 +2592,19 @@ impl RemoteFragmentEndpoint {
         self.executions.lock().len()
     }
 
+    /// Fragment lifecycle metrics including active cursor count (P0.4-T6).
+    pub fn lifecycle_metrics(&self) -> FragmentLifecycleSnapshot {
+        let mut snap = self.metrics.snapshot();
+        snap.active_executions = self.active_executions();
+        snap
+    }
+
     /// Handles one authenticated internal RPC body.
     pub async fn handle(&self, bytes: &[u8]) -> DistributedResult<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.metrics
+            .bytes_in
+            .fetch_add(bytes.len() as u64, Relaxed);
         if bytes.len() > self.max_message_bytes {
             return Err(DistributedError::RemoteProtocol(format!(
                 "fragment request is {} bytes; limit is {}",
@@ -1859,13 +2623,17 @@ impl RemoteFragmentEndpoint {
             Ok(response) => response,
             Err(error) => RemoteFragmentResponse::Error(error.to_string()),
         };
-        encode_remote_wire(
+        let encoded = encode_remote_wire(
             &RemoteFragmentResponseEnvelope {
                 version: REMOTE_FRAGMENT_PROTOCOL_VERSION,
                 response,
             },
             self.max_message_bytes,
-        )
+        )?;
+        self.metrics
+            .bytes_out
+            .fetch_add(encoded.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(encoded)
     }
 
     async fn handle_request(
@@ -1975,6 +2743,9 @@ impl RemoteFragmentEndpoint {
                     return Err(error);
                 }
                 *execution.stream.lock().await = Some(stream);
+                self.metrics
+                    .starts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(RemoteFragmentResponse::Started)
             }
             RemoteFragmentRequest::Pull {
@@ -1997,6 +2768,9 @@ impl RemoteFragmentEndpoint {
                     })?;
                     stream.next().await.transpose()?
                 };
+                self.metrics
+                    .pulls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match next {
                     Some(frame) => Ok(RemoteFragmentResponse::Frame(Some(encode_remote_frame(
                         &frame,
@@ -2004,6 +2778,9 @@ impl RemoteFragmentEndpoint {
                     )?))),
                     None => {
                         self.executions.lock().remove(&key);
+                        self.metrics
+                            .completes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Ok(RemoteFragmentResponse::Frame(None))
                     }
                 }
@@ -2014,6 +2791,9 @@ impl RemoteFragmentEndpoint {
             } => {
                 if let Some(execution) = self.executions.lock().remove(&(query_id, fragment_id)) {
                     execution.control.cancel(CancellationReason::ClientRequest);
+                    self.metrics
+                        .cancels
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(RemoteFragmentResponse::Cancelled)
             }
@@ -5828,6 +6608,14 @@ mod tests {
             0,
             "terminal pulls release every worker cursor"
         );
+        // P0.4-T6: fragment lifecycle metrics observe starts/pulls/completes and bytes.
+        let metrics = endpoint.lifecycle_metrics();
+        assert!(metrics.starts >= 1, "starts={}", metrics.starts);
+        assert!(metrics.pulls >= 1, "pulls={}", metrics.pulls);
+        assert!(metrics.completes >= 1, "completes={}", metrics.completes);
+        assert!(metrics.bytes_in > 0, "bytes_in={}", metrics.bytes_in);
+        assert!(metrics.bytes_out > 0, "bytes_out={}", metrics.bytes_out);
+        assert_eq!(metrics.active_executions, 0);
     }
 
     #[tokio::test]
@@ -6326,5 +7114,298 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted, "float64 mapping is order-preserving");
+    }
+
+    // -----------------------------------------------------------------------
+    // DataFusionDistributedPlanner (P0.4)
+    // -----------------------------------------------------------------------
+
+    fn df_table_source(columns: &[(&str, DataType)]) -> Arc<dyn datafusion::logical_expr::TableSource> {
+        use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
+        let fields = columns
+            .iter()
+            .map(|(name, dtype)| Field::new(*name, dtype.clone(), true))
+            .collect::<Vec<_>>();
+        Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields))))
+    }
+
+    fn df_scan(table: &str, columns: &[(&str, DataType)]) -> datafusion::logical_expr::LogicalPlan {
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        LogicalPlanBuilder::scan(table, df_table_source(columns), None)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn datafusion_planner_lowers_scan_filter_agg_sort_limit() {
+        use datafusion::functions_aggregate::expr_fn::sum;
+        use datafusion::logical_expr::{col, lit, LogicalPlanBuilder};
+
+        let plan = LogicalPlanBuilder::from(df_scan(
+            "orders",
+            &[("region", DataType::Utf8), ("amount", DataType::Int64)],
+        ))
+        .filter(col("amount").gt(lit(10i64)))
+        .unwrap()
+        .aggregate(vec![col("region")], vec![sum(col("amount"))])
+        .unwrap()
+        .sort(vec![col("region").sort(true, true)])
+        .unwrap()
+        .limit(0, Some(5))
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let planner = DataFusionDistributedPlanner::new(QueryId::new_random());
+        let lite = planner.to_lite(&plan).unwrap();
+        match &lite {
+            LogicalPlanLite::Limit { limit, input } => {
+                assert_eq!(*limit, 5);
+                match input.as_ref() {
+                    LogicalPlanLite::Sort { keys, input, .. } => {
+                        assert_eq!(keys.len(), 1);
+                        assert!(!keys[0].descending);
+                        match input.as_ref() {
+                            LogicalPlanLite::Aggregate {
+                                group_by,
+                                aggregates,
+                                input,
+                            } => {
+                                assert_eq!(group_by, &vec!["region".to_owned()]);
+                                assert_eq!(aggregates.len(), 1);
+                                assert_eq!(aggregates[0].function, AggregateFunction::Sum);
+                                match input.as_ref() {
+                                    LogicalPlanLite::Scan {
+                                        table,
+                                        predicate,
+                                        ..
+                                    } => {
+                                        assert_eq!(table, "orders");
+                                        assert!(
+                                            predicate
+                                                .as_ref()
+                                                .is_some_and(|p| p.contains("amount")),
+                                            "predicate={predicate:?}"
+                                        );
+                                    }
+                                    other => panic!("expected scan under aggregate, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected aggregate under sort, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected sort under limit, got {other:?}"),
+                }
+            }
+            other => panic!("expected limit root, got {other:?}"),
+        }
+
+        let t1 = TabletId::from_bytes([1; 16]);
+        let t2 = TabletId::from_bytes([2; 16]);
+        let (locator, metadata) = world(&[(
+            "orders",
+            &[t1, t2],
+            hash_spec("region"),
+            stats(1_000, 64_000),
+        )]);
+        let distributed = planner.lower(&plan, &locator, &metadata).unwrap();
+        assert!(!distributed.fragments.is_empty());
+        assert!(distributed.root_fragment_id().is_some());
+        assert!(distributed
+            .fragments
+            .iter()
+            .any(|fragment| fragment
+                .operators
+                .iter()
+                .any(|op| matches!(op, FragmentOperator::TabletScan { .. }))));
+    }
+
+    #[test]
+    fn datafusion_planner_lowers_join_and_union() {
+        use datafusion::logical_expr::{JoinType, LogicalPlanBuilder};
+
+        let left = df_scan("orders", &[("id", DataType::Int64), ("uid", DataType::Int64)]);
+        let right = df_scan("users", &[("id", DataType::Int64), ("name", DataType::Utf8)]);
+        let join = LogicalPlanBuilder::from(left)
+            .join(
+                LogicalPlanBuilder::from(right).build().unwrap(),
+                JoinType::Inner,
+                (vec!["uid"], vec!["id"]),
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let planner = DataFusionDistributedPlanner::new(QueryId::new_random());
+        let lite = planner.to_lite(&join).unwrap();
+        match lite {
+            LogicalPlanLite::Join { on, left, right } => {
+                assert_eq!(on.len(), 1);
+                assert_eq!(on[0].left, "uid");
+                assert_eq!(on[0].right, "id");
+                assert!(matches!(left.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "orders"));
+                assert!(matches!(right.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "users"));
+            }
+            other => panic!("expected join, got {other:?}"),
+        }
+
+        let a = df_scan("a", &[("x", DataType::Int64)]);
+        let b = df_scan("b", &[("x", DataType::Int64)]);
+        let union = LogicalPlanBuilder::from(a)
+            .union(LogicalPlanBuilder::from(b).build().unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let lite = planner.to_lite(&union).unwrap();
+        match lite {
+            LogicalPlanLite::Union { inputs } => {
+                assert_eq!(inputs.len(), 2);
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+
+        let t = TabletId::from_bytes([9; 16]);
+        let (locator, metadata) = world(&[
+            ("a", &[t], PartitionSpec::Unpartitioned, stats(10, 100)),
+            ("b", &[t], PartitionSpec::Unpartitioned, stats(10, 100)),
+            ("orders", &[t], hash_spec("uid"), stats(100, 1_000)),
+            ("users", &[t], hash_spec("id"), stats(100, 1_000)),
+        ]);
+        planner.lower(&join, &locator, &metadata).unwrap();
+        planner.lower(&union, &locator, &metadata).unwrap();
+    }
+
+    #[test]
+    fn datafusion_planner_rejects_unsupported_operators() {
+        use datafusion::logical_expr::{col, lit, LogicalPlanBuilder};
+
+        let plan = LogicalPlanBuilder::from(df_scan("t", &[("v", DataType::Int64)]))
+            .filter(col("v").gt(lit(1i64)))
+            .unwrap()
+            .distinct()
+            .unwrap()
+            .build()
+            .unwrap();
+        let planner = DataFusionDistributedPlanner::new(QueryId::new_random());
+        let err = planner.to_lite(&plan).unwrap_err();
+        assert!(
+            matches!(err, DistributedError::Unsupported(_)),
+            "distinct must be rejected: {err:?}"
+        );
+
+        // VALUES is not a tablet scan and must be rejected.
+        let values = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+            .unwrap()
+            .build()
+            .unwrap();
+        let err = planner.to_lite(&values).unwrap_err();
+        assert!(
+            matches!(err, DistributedError::Unsupported(_)),
+            "values must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn logical_plan_lite_union_plans_to_coordinator_gather() {
+        let t1 = TabletId::from_bytes([1; 16]);
+        let t2 = TabletId::from_bytes([2; 16]);
+        let (locator, metadata) = world(&[
+            ("a", &[t1], PartitionSpec::Unpartitioned, stats(10, 100)),
+            ("b", &[t2], PartitionSpec::Unpartitioned, stats(20, 200)),
+        ]);
+        let plan = distribute(
+            &desc(LogicalPlanLite::Union {
+                inputs: vec![scan("a"), scan("b")],
+            }),
+            &locator,
+            &metadata,
+        )
+        .unwrap();
+        assert!(plan.root_fragment_id().is_some());
+        assert!(plan
+            .fragments
+            .iter()
+            .any(|f| f.assignment == FragmentAssignment::Coordinator));
+        assert_eq!(
+            plan.fragments
+                .iter()
+                .filter(|f| matches!(f.assignment, FragmentAssignment::Tablet(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_sql_distributed_public_entry_lowers_real_sql() {
+        // Public entry must exist and perform real DataFusion parse + lower.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let catalog = PlanningTableCatalog::new().with_table("orders", schema);
+        let t1 = TabletId::from_bytes([1; 16]);
+        let t2 = TabletId::from_bytes([2; 16]);
+        let (locator, metadata) = world(&[(
+            "orders",
+            &[t1, t2],
+            hash_spec("region"),
+            stats(1_000, 64_000),
+        )]);
+
+        // Keep the SQL shape within the supported lower surface (scan+filter+
+        // limit). Aggregate/join paths are covered by DataFusion plan unit tests.
+        let plan = plan_sql_distributed(
+            "SELECT region, amount FROM orders WHERE amount > 10 LIMIT 5",
+            &catalog,
+            &locator,
+            &metadata,
+        )
+        .await
+        .expect("plan_sql_distributed must lower real SQL");
+
+        assert!(!plan.fragments.is_empty());
+        assert!(plan.root_fragment_id().is_some());
+        assert!(
+            plan.fragments.iter().any(|fragment| fragment
+                .operators
+                .iter()
+                .any(|op| matches!(op, FragmentOperator::TabletScan { table, .. } if table == "orders"))),
+            "expected tablet scan of orders: {plan:?}"
+        );
+        assert_eq!(plan.metadata_version, metadata.metadata_version());
+
+        // plan_logical_distributed is the same seam when a DF plan is already
+        // available (e.g. from MongrelSession).
+        let ctx = datafusion::prelude::SessionContext::new();
+        let provider = datafusion::datasource::MemTable::try_new(
+            Arc::clone(catalog.schema("orders").unwrap()),
+            vec![vec![RecordBatch::new_empty(Arc::clone(
+                catalog.schema("orders").unwrap(),
+            ))]],
+        )
+        .unwrap();
+        ctx.register_table("orders", Arc::new(provider)).unwrap();
+        let df = ctx
+            .sql("SELECT region FROM orders WHERE amount > 0")
+            .await
+            .unwrap();
+        let from_logical =
+            plan_logical_distributed(df.logical_plan(), &locator, &metadata).unwrap();
+        assert!(!from_logical.fragments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_sql_distributed_rejects_unknown_table() {
+        let catalog = PlanningTableCatalog::new();
+        let (locator, metadata) = world(&[]);
+        let err = plan_sql_distributed("SELECT 1 FROM missing", &catalog, &locator, &metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DistributedError::InvalidPlan(_)),
+            "unknown table must fail planning: {err:?}"
+        );
     }
 }

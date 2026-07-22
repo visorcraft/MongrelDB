@@ -50,6 +50,7 @@ impl Message {
                 Row {
                     row_id: *row_id,
                     committed_epoch: *epoch,
+                    commit_ts: None,
                     columns: HashMap::new(),
                     deleted: true,
                 },
@@ -227,6 +228,7 @@ impl BeTree {
             Message::Tombstone { row_id, epoch } => Row {
                 row_id,
                 committed_epoch: epoch,
+                commit_ts: None,
                 columns: HashMap::new(),
                 deleted: true,
             },

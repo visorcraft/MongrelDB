@@ -3,9 +3,19 @@
 //! Merges all sorted runs into one, dropping superseded versions and tombstones
 //! — but preserving the version each pinned read snapshot still needs. Identical
 //! re-encoded pages reuse their content hash, so the page cache keeps hitting.
+//!
+//! # HLC visibility (P0.5-T3)
+//!
+//! When versions carry `commit_ts`, newest-version selection uses
+//! [`crate::epoch::Snapshot::version_is_newer`] so HLC order wins over local
+//! epoch order. Physical reclamation still consults the epoch GC floor
+//! ([`Table::min_active_snapshot`]) until every pin source projects a durable
+//! HLC (`GcFloor` is diagnostic until that cutover). Sorted-run materialisation
+//! currently drops `commit_ts` (no system column yet), so run-resident versions
+//! are retained under epoch rules only after spill.
 
 use crate::engine::Table;
-use crate::epoch::{Epoch, MaintenanceReceipt};
+use crate::epoch::{Epoch, MaintenanceReceipt, Snapshot};
 use crate::manifest::RunRef;
 use crate::memtable::Row;
 use crate::sorted_run::RunWriter;
@@ -150,17 +160,24 @@ impl Table {
             if row_index % 256 == 0 {
                 control.checkpoint()?;
             }
+            // Epoch-ascending for the floor partition in select_keep (physical
+            // reclamation is still epoch-gated). Newest-live selection uses HLC
+            // via version_is_newer when stamps are present (P0.5-T3).
             versions.sort_by_key(|row| row.committed_epoch);
-            let Some(newest) = versions.last() else {
+            let Some(newest) = versions
+                .iter()
+                .max_by(|a, b| cmp_version_order(a, b))
+                .cloned()
+            else {
                 continue;
             };
             let newest_epoch = newest.committed_epoch;
-            if !newest.deleted && !self.row_expired_at(newest, now_nanos) {
+            if !newest.deleted && !self.row_expired_at(&newest, now_nanos) {
                 current_live_count += 1;
             }
             for row in select_keep(&versions, min_active) {
                 if self.row_expired_at(&row, now_nanos) {
-                    if row.committed_epoch == newest_epoch
+                    if is_same_version(&row, &newest)
                         && min_active.is_some_and(|epoch| newest_epoch > epoch)
                     {
                         let mut tombstone = row;
@@ -295,11 +312,39 @@ impl Table {
     }
 }
 
+/// Compare two versions for recency: HLC when both stamped, else local epoch.
+fn cmp_version_order(a: &Row, b: &Row) -> std::cmp::Ordering {
+    if Snapshot::version_is_newer(a.committed_epoch, a.commit_ts, b.committed_epoch, b.commit_ts) {
+        std::cmp::Ordering::Greater
+    } else if Snapshot::version_is_newer(
+        b.committed_epoch,
+        b.commit_ts,
+        a.committed_epoch,
+        a.commit_ts,
+    ) {
+        std::cmp::Ordering::Less
+    } else {
+        a.committed_epoch
+            .cmp(&b.committed_epoch)
+            .then_with(|| a.commit_ts.cmp(&b.commit_ts))
+    }
+}
+
+fn is_same_version(a: &Row, b: &Row) -> bool {
+    a.committed_epoch == b.committed_epoch && a.commit_ts == b.commit_ts
+}
+
 /// Versions to keep for one `RowId` given the oldest queryable snapshot. Every
 /// transition at or after the floor is retained, plus the boundary version
-/// visible at the floor. With no floor, only the current live version remains.
+/// visible at the floor. With no floor, only the current live version remains
+/// (chosen by HLC when stamps are present — P0.5-T3 / P0.5-X8).
+///
+/// `vers` must be sorted ascending by `committed_epoch` (the floor partition
+/// is still epoch-based; see module residual). HLC-only pins without epoch
+/// projection still report ZERO on [`crate::epoch::GcFloor`] and do not lower
+/// this floor.
 fn select_keep(vers: &[Row], min_active: Option<Epoch>) -> Vec<Row> {
-    let Some(newest) = vers.last().cloned() else {
+    let Some(newest) = vers.iter().max_by(|a, b| cmp_version_order(a, b)).cloned() else {
         return Vec::new();
     };
     match min_active {
@@ -519,5 +564,71 @@ mod tests {
     #[test]
     fn _snapshot_import_used() {
         let _ = Snapshot::at(Epoch(0));
+    }
+
+    fn hlc(physical_micros: u64) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros,
+            logical: 0,
+            node_tiebreaker: 1,
+        }
+    }
+
+    fn stamped(id: u64, epoch: u64, ts: mongreldb_types::hlc::HlcTimestamp, v: i64) -> Row {
+        crate::memtable::Row::new_with_hlc(crate::rowid::RowId(id), Epoch(epoch), ts)
+            .with_column(1, Value::Int64(v))
+    }
+
+    /// P0.5-X8 (HLC): when versions carry commit_ts, select_keep retains the
+    /// HLC-newest live version under no pin — even if that version has a lower
+    /// local epoch than an older-HLC rewrite.
+    #[test]
+    fn select_keep_preserves_hlc_visibility_under_inverted_epoch_order() {
+        let early = hlc(100);
+        let mid = hlc(150);
+        let late = hlc(200);
+        // Must be epoch-ascending for the floor partition.
+        let mut versions = vec![
+            stamped(1, 1, late, 99),  // high HLC, low epoch
+            stamped(1, 2, mid, 50),   // mid HLC
+            stamped(1, 50, early, 1), // low HLC, high epoch
+        ];
+        versions.sort_by_key(|row| row.committed_epoch);
+        // No pin: only the HLC-newest live version remains (late, epoch 1).
+        let kept = select_keep(&versions, None);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].commit_ts, Some(late));
+        assert_eq!(kept[0].committed_epoch, Epoch(1));
+        assert_eq!(kept[0].columns.get(&1), Some(&Value::Int64(99)));
+
+        // Epoch floor at 2: retain epoch >= 2. Physical floor is still
+        // epoch-gated (P0.5-T6 residual); HLC-newest at epoch 1 is not kept
+        // when a version exists exactly at the floor.
+        let kept = select_keep(&versions, Some(Epoch(2)));
+        assert!(kept.iter().any(|r| r.commit_ts == Some(mid)));
+        assert!(kept.iter().any(|r| r.commit_ts == Some(early)));
+        assert!(!kept.iter().any(|r| r.commit_ts == Some(late)));
+
+        // Floor between versions (epoch 10): recent starts at epoch 50, so the
+        // boundary version just below the floor (epoch 2, mid) is retained.
+        let kept = select_keep(&versions, Some(Epoch(10)));
+        assert!(kept.iter().any(|r| r.commit_ts == Some(early)));
+        assert!(
+            kept.iter().any(|r| r.commit_ts == Some(mid)),
+            "boundary version below floor must be retained"
+        );
+        assert!(!kept.iter().any(|r| r.commit_ts == Some(late)));
+    }
+
+    #[test]
+    fn cmp_version_order_prefers_hlc_when_both_stamped() {
+        let early = stamped(1, 99, hlc(100), 1);
+        let late = stamped(1, 1, hlc(200), 2);
+        assert_eq!(cmp_version_order(&early, &late), std::cmp::Ordering::Less);
+        assert_eq!(cmp_version_order(&late, &early), std::cmp::Ordering::Greater);
+        // Unstamped falls back to epoch.
+        let a = crate::memtable::Row::new(crate::rowid::RowId(1), Epoch(1));
+        let b = crate::memtable::Row::new(crate::rowid::RowId(1), Epoch(3));
+        assert_eq!(cmp_version_order(&a, &b), std::cmp::Ordering::Less);
     }
 }

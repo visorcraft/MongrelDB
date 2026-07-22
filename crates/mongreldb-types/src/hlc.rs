@@ -43,6 +43,13 @@ impl HlcTimestamp {
         logical: 0,
         node_tiebreaker: 0,
     };
+
+    /// The largest possible timestamp (unbounded HLC visibility).
+    pub const MAX: Self = Self {
+        physical_micros: u64::MAX,
+        logical: u32::MAX,
+        node_tiebreaker: u32::MAX,
+    };
 }
 
 impl fmt::Display for HlcTimestamp {
@@ -419,6 +426,7 @@ mod tests {
         assert!(HlcTimestamp::ZERO < ts(0, 0, 1));
     }
 
+    /// ID: P0.5-X4 — physical wall clock moves backward without violating HLC order.
     #[test]
     fn now_never_moves_backward_when_physical_time_regresses() {
         let wall = ManualWall::new(1_000_000);
@@ -441,6 +449,15 @@ mod tests {
         let fourth = clock.now().unwrap();
         assert!(fourth > third);
         assert_eq!(fourth, ts(2_000_000, 0, 7));
+
+        // observe + next_after also stay strictly ordered under regression.
+        wall.set(1); // extreme regression
+        let observed = clock
+            .observe(ts(2_000_000, 0, 99))
+            .expect("skew within bound");
+        assert!(observed > fourth);
+        let after = clock.next_after(observed);
+        assert!(after > observed);
     }
 
     #[test]

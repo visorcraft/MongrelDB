@@ -38,10 +38,18 @@ mod shadow;
 mod udf;
 
 pub use ai_retrieval::{
-    adaptive_local_k, merge_candidates, AiConsistencyAudit, AiFanoutRequest, AiRetrievalError,
-    AiRpcClient, AiTabletExecutor, AiTabletHit, AiTabletQuery, AiWorkBudget, DistributedAiResult,
-    FusionMethod, LocalCandidate, LoopbackAiRpcClient, MergedCandidate, RemoteAiEndpoint,
-    RemoteAiTransport, REMOTE_AI_SERVICE_ID,
+    adaptive_local_k, exact_hybrid_merge, fuse_distributed_hits, hybrid_refill_targets,
+    merge_candidates, merge_hybrid_contributions, AiConsistencyAudit, AiFanoutRequest,
+    AiRetrievalError, AiRpcClient, AiTabletExecutor, AiTabletHit, AiTabletQuery, AiWorkBudget,
+    DistributedAiResult, FusionMethod, HybridComponentScore, HybridMergeResult,
+    HybridMergedCandidate, LocalCandidate, LocalRetrieverContribution, LoopbackAiRpcClient,
+    MergedCandidate, RemoteAiEndpoint, RemoteAiTransport, RetrieverTabletBound,
+    TabletAiResponseMetadata, REMOTE_AI_SERVICE_ID,
+};
+pub use distributed::{
+    plan_logical_distributed, plan_logical_distributed_with_id, plan_sql_distributed,
+    plan_sql_distributed_with_id, DataFusionDistributedPlanner, FragmentLifecycleMetrics,
+    FragmentLifecycleSnapshot, PlanningTableCatalog, RemoteFragmentEndpoint,
 };
 pub use error::{MongrelQueryError, Result};
 pub use external_modules::{

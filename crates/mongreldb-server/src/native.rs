@@ -18,7 +18,7 @@ use mongreldb_protocol::request::AuthenticatedIdentity;
 use mongreldb_protocol::validate_native_context;
 use mongreldb_query::{
     CancelOutcome, ManagedQueryBatches, MongrelQueryError, MongrelSession, QueryId,
-    SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+    SerializationOutcome, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
 };
 use mongreldb_types::errors::{ErrorCategory, RetryClass};
 use mongreldb_types::ids::TransactionId;
@@ -102,6 +102,8 @@ pub struct NativeRuntime {
     external_auth: Option<NativeExternalAuth>,
     sql_semaphore: Arc<tokio::sync::Semaphore>,
     scheduler: crate::admission::SchedulerAdmission,
+    /// P1.1 universal node admission (parent budgets on native SQL).
+    node_admission: crate::admission::NodeAdmissionController,
     sql_priority: u8,
 }
 
@@ -112,6 +114,13 @@ impl NativeRuntime {
         query_registry: Arc<SqlQueryRegistry>,
     ) -> Self {
         let groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
+        let memory = mongreldb_core::MemoryGovernor::new(
+            mongreldb_core::GovernorConfig::new(512 * 1024 * 1024),
+        )
+        .expect("default native node memory governor");
+        let node_admission =
+            crate::admission::NodeAdmissionController::new(&groups, memory);
+        let scheduler = node_admission.scheduler().clone();
         Self {
             db,
             sessions,
@@ -123,7 +132,8 @@ impl NativeRuntime {
             sql_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 crate::default_sql_max_concurrent(),
             )),
-            scheduler: crate::admission::SchedulerAdmission::from_resource_groups(&groups),
+            scheduler,
+            node_admission,
             sql_priority: crate::admission::priority_for_class(
                 &groups,
                 WorkloadClass::InteractiveSql,
@@ -140,6 +150,16 @@ impl NativeRuntime {
         self.sql_semaphore = semaphore;
         self.scheduler = scheduler;
         self.sql_priority = priority;
+        self
+    }
+
+    /// Wire the process-wide [`NodeAdmissionController`] (P1.1 product path).
+    pub(crate) fn with_node_admission(
+        mut self,
+        node_admission: crate::admission::NodeAdmissionController,
+    ) -> Self {
+        self.scheduler = node_admission.scheduler().clone();
+        self.node_admission = node_admission;
         self
     }
 
@@ -305,9 +325,11 @@ impl NativeRuntime {
             }
         };
         let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
-        let work = match self
-            .scheduler
-            .submit_and_wait(
+        // P1.1: native SQL admits via NodeAdmissionController::admit_parent.
+        const NATIVE_SQL_PARENT_BUDGET: u64 = 16 * 1024 * 1024;
+        let parent = match self
+            .node_admission
+            .admit_parent(
                 crate::admission::AdmitRequest {
                     tenant: &entry.owner,
                     class: WorkloadClass::InteractiveSql,
@@ -316,17 +338,19 @@ impl NativeRuntime {
                     query_id: Some(types_query_id),
                     tag: "native-sql",
                 },
+                mongreldb_core::MemoryClass::QueryExecution,
+                NATIVE_SQL_PARENT_BUDGET,
                 query.control().cancelled(),
             )
             .await
         {
-            Ok(work) => work,
+            Ok(parent) => parent,
             Err(error) => {
                 query.fail();
                 return Err(query_status(crate::admission::admit_error_to_query(error)));
             }
         };
-        let _admission = crate::admission::SqlAdmissionGuard::new(permit, work);
+        let _admission = crate::admission::SqlAdmissionGuard::new(permit, parent);
         let batches = session
             .run_with_query_for_serialization(&sql, query)
             .await
@@ -850,19 +874,24 @@ impl native::query_service_server::QueryService for NativeRuntime {
         if let Some(execution) = execution {
             self.finish_idempotency(execution, id);
         }
+        let durable = status
+            .as_ref()
+            .map(|status| {
+                proto_durable(
+                    &status.durable_outcome,
+                    status.serialization_outcome,
+                )
+            })
+            .unwrap_or_default();
         Ok(Response::new(native::ExecuteResponse {
             query_id,
             rows_affected: 0,
             frames,
             idempotency_replayed: false,
-            committed: status
-                .as_ref()
-                .is_some_and(|status| status.durable_outcome.committed),
-            commit_epoch: status
-                .as_ref()
-                .and_then(|status| status.durable_outcome.last_commit_epoch)
-                .unwrap_or(0),
+            committed: durable.committed,
+            commit_epoch: durable.last_commit_epoch.unwrap_or(0),
             original_query_id: id.as_bytes().to_vec(),
+            durable: Some(durable),
         }))
     }
 
@@ -927,7 +956,7 @@ impl native::query_service_server::QueryService for NativeRuntime {
     async fn cancel_query(
         &self,
         request: Request<native::CancelQueryRequest>,
-    ) -> Result<Response<native::Empty>, Status> {
+    ) -> Result<Response<native::CancelQueryResponse>, Status> {
         let request = request.into_inner();
         validate_native_context(request.context.as_ref())?;
         let (session_id, _) = self.session(&request.session_id, "query")?;
@@ -939,15 +968,24 @@ impl native::query_service_server::QueryService for NativeRuntime {
         if status.session_id.as_deref() != Some(&session_id) {
             return Err(Status::not_found("query not found"));
         }
-        match self.query_registry.cancel(query_id) {
-            CancelOutcome::Accepted | CancelOutcome::AlreadyCancelling => {
-                Ok(Response::new(native::Empty {}))
-            }
-            CancelOutcome::TooLate | CancelOutcome::AlreadyFinished => {
-                Err(Status::failed_precondition("query already finished"))
-            }
-            CancelOutcome::NotFound => Err(Status::not_found("query not found")),
-        }
+        let durable = proto_durable(&status.durable_outcome, status.serialization_outcome);
+        let outcome = match self.query_registry.cancel(query_id) {
+            CancelOutcome::Accepted => native::CancelOutcome::Accepted,
+            CancelOutcome::AlreadyCancelling => native::CancelOutcome::AlreadyCancelling,
+            CancelOutcome::TooLate => native::CancelOutcome::TooLate,
+            CancelOutcome::AlreadyFinished => native::CancelOutcome::AlreadyFinished,
+            CancelOutcome::NotFound => native::CancelOutcome::NotFound,
+        };
+        // Re-read durable after cancel so terminal state is current.
+        let durable = self
+            .query_registry
+            .status(query_id)
+            .map(|status| proto_durable(&status.durable_outcome, status.serialization_outcome))
+            .unwrap_or(durable);
+        Ok(Response::new(native::CancelQueryResponse {
+            outcome: outcome as i32,
+            durable: Some(durable),
+        }))
     }
 
     async fn get_query_status(
@@ -975,7 +1013,85 @@ impl native::query_service_server::QueryService for NativeRuntime {
                 retryable: false,
                 metadata: HashMap::new(),
             }),
+            durable: Some(proto_durable(
+                &status.durable_outcome,
+                status.serialization_outcome,
+            )),
         }))
+    }
+}
+
+fn proto_durable(
+    outcome: &mongreldb_query::DurableOutcome,
+    serialization: SerializationOutcome,
+) -> native::DurableOutcome {
+    let last_commit_hlc = outcome
+        .commit_ts
+        .map(|ts| {
+            let mut bytes = Vec::with_capacity(16);
+            bytes.extend_from_slice(&ts.physical_micros.to_be_bytes());
+            bytes.extend_from_slice(&ts.logical.to_be_bytes());
+            bytes.extend_from_slice(&ts.node_tiebreaker.to_be_bytes());
+            bytes
+        })
+        .unwrap_or_default();
+    native::DurableOutcome {
+        committed: outcome.committed,
+        committed_statements: outcome.committed_statements as u64,
+        last_commit_hlc,
+        first_commit_statement_index: outcome
+            .first_commit_statement_index
+            .map(|index| index as u64),
+        last_commit_statement_index: outcome
+            .last_commit_statement_index
+            .map(|index| index as u64),
+        completed_statements: outcome.committed_statements as u64,
+        current_statement_index: outcome
+            .last_commit_statement_index
+            .map(|index| index as u64)
+            .unwrap_or(0),
+        terminal_state: if outcome.committed {
+            "committed".into()
+        } else {
+            String::new()
+        },
+        serialization_state: serialization_state_name(serialization).into(),
+        last_commit_epoch: outcome.last_commit_epoch,
+    }
+}
+
+fn serialization_state_name(outcome: SerializationOutcome) -> &'static str {
+    match outcome {
+        SerializationOutcome::NotStarted => "not_started",
+        SerializationOutcome::InProgress => "in_progress",
+        SerializationOutcome::Succeeded => "succeeded",
+        SerializationOutcome::Failed => "failed",
+    }
+}
+
+fn receipt_durable(receipt: &crate::sql_idempotency::SqlDurableReceipt) -> native::DurableOutcome {
+    native::DurableOutcome {
+        committed: receipt.outcome.committed,
+        committed_statements: receipt.outcome.committed_statements as u64,
+        last_commit_hlc: Vec::new(),
+        first_commit_statement_index: receipt
+            .outcome
+            .first_commit_statement_index
+            .map(|index| index as u64),
+        last_commit_statement_index: receipt
+            .outcome
+            .last_commit_statement_index
+            .map(|index| index as u64),
+        completed_statements: receipt.outcome.committed_statements as u64,
+        current_statement_index: 0,
+        terminal_state: if receipt.outcome.committed {
+            "committed".into()
+        } else {
+            String::new()
+        },
+        // Idempotent replay of a successful write: serialization already completed.
+        serialization_state: "succeeded".into(),
+        last_commit_epoch: receipt.outcome.last_commit_epoch,
     }
 }
 
@@ -983,14 +1099,16 @@ fn replayed_response(
     current_query_id: &[u8],
     receipt: crate::sql_idempotency::SqlDurableReceipt,
 ) -> native::ExecuteResponse {
+    let durable = receipt_durable(&receipt);
     native::ExecuteResponse {
         query_id: current_query_id.to_vec(),
         rows_affected: 0,
         frames: Vec::new(),
         idempotency_replayed: true,
-        committed: receipt.outcome.committed,
-        commit_epoch: receipt.outcome.last_commit_epoch.unwrap_or(0),
+        committed: durable.committed,
+        commit_epoch: durable.last_commit_epoch.unwrap_or(0),
         original_query_id: hex_id(&receipt.original_query_id).unwrap_or_default(),
+        durable: Some(durable),
     }
 }
 

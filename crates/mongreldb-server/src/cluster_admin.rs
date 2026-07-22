@@ -109,6 +109,51 @@ pub(crate) fn status_for_cluster_error(error: &ClusterError) -> StatusCode {
 }
 
 /// Map a cluster workflow error onto an HTTP status + JSON error body.
+fn accept_ops_job(
+    state: &AppState,
+    owner: &str,
+    command: &str,
+    kind: mongreldb_core::OpsJobKind,
+    params: std::collections::BTreeMap<String, String>,
+    extra: Option<Value>,
+) -> Response {
+    let idempotency_key = params.get("idempotency_key").cloned();
+    let metadata_version = params
+        .get("metadata_version")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let result = state.ops_jobs.lock().map(|mut store| {
+        store.submit_with(kind, params, idempotency_key, metadata_version)
+    });
+    match result {
+        Ok(Ok(job)) => {
+            state.audit.record(
+                owner.to_string(),
+                "admin.sql.job.accepted",
+                format!("command={command} job_id={} kind={} state={}", job.job_id, job.kind.name(), job.state.name()),
+            );
+            let mut body = mongreldb_core::OpsJobStore::accepted_response(&job);
+            if let Some(object) = body.as_object_mut() {
+                object.insert("command".into(), json!(command));
+                if let Some(Value::Object(extra_map)) = extra {
+                    for (k, v) in extra_map {
+                        object.entry(k).or_insert(v);
+                    }
+                }
+            }
+            Json(body).into_response()
+        }
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string(), "command": command, "status": "error"})),
+        ).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "ops job store lock poisoned", "command": command, "status": "error"})),
+        ).into_response(),
+    }
+}
+
 fn cluster_error_response(error: &ClusterError) -> Response {
     (
         status_for_cluster_error(error),
@@ -132,7 +177,7 @@ fn resolve_target_node(state: &AppState, requested: Option<&str>) -> Result<Node
                     .into_response(),
             )
         }),
-        None => match NodeIdentity::load(state.db.root()) {
+        None => match NodeIdentity::load(cluster_status_root(state)) {
             Ok(Some(identity)) => Ok(identity.node_id),
             Ok(None) => Err(Box::new(
                 (
@@ -164,7 +209,7 @@ pub(crate) async fn status(
     let root = cluster_status_root(&state);
     match status_report(root) {
         Ok(mut report) => {
-            if let Some(runtime) = &state.cluster_runtime {
+            if let Some(runtime) = state.cluster_runtime() {
                 match runtime.runtime_status_json().await {
                     Ok(runtime_status) => {
                         if let Some(object) = report.as_object_mut() {
@@ -197,11 +242,10 @@ pub(crate) async fn status(
 /// Prefer the live runtime's node-data directory when cluster mode is on;
 /// otherwise the database root (historical co-located layout).
 fn cluster_status_root(state: &AppState) -> &std::path::Path {
-    state
-        .cluster_runtime
-        .as_ref()
-        .map(|runtime| runtime.node_data())
-        .unwrap_or_else(|| state.db.root())
+    match state.storage() {
+        crate::ServerStorageRuntime::Cluster(rt) => rt.node_data(),
+        crate::ServerStorageRuntime::Standalone(rt) => rt.root(),
+    }
 }
 
 /// Fail-closed response when transfer/split/merge is issued without a live
@@ -270,7 +314,7 @@ pub(crate) async fn drain(
         "admin.cluster.drain",
         format!("initiated node_id={node_id}"),
     );
-    match bootstrap::node_drain(state.db.root(), node_id) {
+    match bootstrap::node_drain(cluster_status_root(&state), node_id) {
         Ok(descriptor) => {
             state.audit.record(
                 owner,
@@ -326,7 +370,7 @@ pub(crate) async fn remove(
         "admin.cluster.remove",
         format!("initiated node_id={node_id}"),
     );
-    match bootstrap::node_remove(state.db.root(), node_id, &confirm_token) {
+    match bootstrap::node_remove(cluster_status_root(&state), node_id, &confirm_token) {
         Ok(descriptor) => {
             state.audit.record(
                 owner,
@@ -415,7 +459,7 @@ pub(crate) async fn try_admin_sql(
                         })
                     })
                     .unwrap_or_else(|_| json!({ "error": "multi_region lock poisoned" }));
-                if let Some(runtime) = &state.cluster_runtime {
+                if let Some(runtime) = state.cluster_runtime() {
                     match runtime.runtime_status_json().await {
                         Ok(runtime_status) => {
                             if let Some(object) = report.as_object_mut() {
@@ -547,8 +591,7 @@ pub(crate) async fn try_admin_sql(
             .into_response()
         }
         AdminCommand::ShowJobs => {
-            let engine_jobs: Vec<Value> = state
-                .db
+            let engine_jobs: Vec<Value> = state.db()
                 .job_registry()
                 .list()
                 .into_iter()
@@ -590,7 +633,13 @@ pub(crate) async fn try_admin_sql(
             let stats = Some(state.scheduler.stats());
             // Drive node governor with live inputs and apply actions (S4B).
             let governor = state.node_governor.lock().ok().map(|mut gov| {
-                let db_gov = state.db.memory_governor();
+                let (db_reserved, db_max, db_gov) = match state.try_db() {
+                    Ok(db) => {
+                        let g = db.memory_governor();
+                        (g.total_used(), g.max_bytes(), Some(g))
+                    }
+                    Err(_) => (0, gov.governor.max_bytes(), None),
+                };
                 let ai_capacity = std::env::var("MONGRELDB_AI_MAX_CONCURRENT")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -598,8 +647,8 @@ pub(crate) async fn try_admin_sql(
                     .unwrap_or(4);
                 let inputs = crate::admission::build_pressure_inputs(
                     &crate::admission::PressureInputSources {
-                        db_reserved_bytes: db_gov.total_used(),
-                        db_max_bytes: db_gov.max_bytes(),
+                        db_reserved_bytes: db_reserved,
+                        db_max_bytes: db_max,
                         node_configured_max_bytes: gov.governor.max_bytes(),
                         tablet_reserved_bytes: gov.tablet_reserved_bytes(),
                         ai_capacity,
@@ -611,7 +660,7 @@ pub(crate) async fn try_admin_sql(
                     &mut gov,
                     &inputs,
                     &state.scheduler,
-                    Some(db_gov),
+                    db_gov,
                 );
                 let pressure = state.scheduler.pressure().snapshot();
                 json!({
@@ -735,18 +784,11 @@ pub(crate) async fn try_admin_sql(
                 }
             }
         }
-        AdminCommand::TransferLeader { tablet_id, to } => match &state.cluster_runtime {
-            None => runtime_not_running_response(
-                "TRANSFER LEADER",
-                json!({
-                    "tablet_id": tablet_id.to_string(),
-                    "to": to.to_string(),
-                }),
-            ),
-            Some(runtime) => match runtime.transfer_leader(tablet_id, to).await {
-                Ok(body) => Json(body).into_response(),
-                Err(error) => runtime_op_error_response("TRANSFER LEADER", error.to_string()),
-            },
+        AdminCommand::TransferLeader { tablet_id, to } => {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("tablet_id".into(), tablet_id.to_string());
+            params.insert("to".into(), to.to_string());
+            accept_ops_job(state, &owner, "TRANSFER LEADER", mongreldb_core::OpsJobKind::TransferLeader, params, None)
         },
         AdminCommand::MoveReplica {
             tablet_id,
@@ -756,7 +798,7 @@ pub(crate) async fn try_admin_sql(
             // No direct placement call on NodeRuntime yet; fail closed with a
             // clear status whether or not the runtime is live so operators are
             // never told the move was accepted.
-            let detail = if state.cluster_runtime.is_some() {
+            let detail = if state.cluster_runtime().is_some() {
                 "move replica is not yet live on the product path"
             } else {
                 "cluster runtime not running"
@@ -778,20 +820,23 @@ pub(crate) async fn try_admin_sql(
         AdminCommand::SplitTablet {
             tablet_id,
             at_key_hex,
-        } => match &state.cluster_runtime {
-            None => runtime_not_running_response(
+        } => {
+            // P1.6: long ops accept immediately with a durable ops_jobs entry.
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("tablet_id".into(), tablet_id.to_string());
+            if let Some(hex) = at_key_hex {
+                params.insert("at_key_hex".into(), hex);
+            }
+            accept_ops_job(
+                state,
+                &owner,
                 "SPLIT TABLET",
-                json!({
-                    "tablet_id": tablet_id.to_string(),
-                    "at_key_hex": at_key_hex,
-                }),
-            ),
-            Some(runtime) => match runtime.split_tablet(tablet_id, at_key_hex).await {
-                Ok(body) => Json(body).into_response(),
-                Err(error) => runtime_op_error_response("SPLIT TABLET", error.to_string()),
-            },
+                mongreldb_core::OpsJobKind::SplitTablet,
+                params,
+                None,
+            )
         },
-        AdminCommand::MergeTablets { left, right } => match &state.cluster_runtime {
+        AdminCommand::MergeTablets { left, right } => match state.cluster_runtime() {
             None => runtime_not_running_response(
                 "MERGE TABLETS",
                 json!({
@@ -810,58 +855,54 @@ pub(crate) async fn try_admin_sql(
                 JobAction::Resume => "RESUME",
                 JobAction::Cancel => "CANCEL",
             };
-            // Fail closed: never report accepted unless the ops store applied
-            // the transition (review finding: silent accepted stubs).
-            match action {
-                JobAction::Cancel => {
-                    return Some(
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(json!({
-                                "error": "cancel job is not yet live on the product path",
-                                "command": format!("{verb} JOB"),
-                                "job_id": job_id,
-                                "category": "resource exhausted",
-                                "category_code": 18,
-                            })),
-                        )
-                            .into_response(),
+            let result = state.ops_jobs.lock().map(|mut store| match action {
+                JobAction::Pause => store.pause(&job_id).map(|j| j.state),
+                JobAction::Resume => store.start(&job_id).map(|j| j.state),
+                JobAction::Cancel => store.cancel(&job_id).map(|j| j.state),
+            });
+            match result {
+                Ok(Ok(job_state)) => {
+                    state.audit.record(
+                        owner,
+                        "admin.sql.job_control.ok",
+                        format!("action={verb} job_id={job_id} state={}", job_state.name()),
                     );
+                    Json(json!({
+                        "command": format!("{verb} JOB"),
+                        "job_id": job_id,
+                        "status": "ok",
+                        "state": job_state.name(),
+                    }))
+                    .into_response()
                 }
-                JobAction::Pause | JobAction::Resume => {
-                    let result = state.ops_jobs.lock().map(|mut store| match action {
-                        JobAction::Pause => store.pause(&job_id).map(|j| j.state),
-                        JobAction::Resume => store.start(&job_id).map(|j| j.state),
-                        JobAction::Cancel => unreachable!(),
-                    });
-                    match result {
-                        Ok(Ok(job_state)) => Json(json!({
-                            "command": format!("{verb} JOB"),
-                            "job_id": job_id,
-                            "status": "ok",
-                            "state": format!("{job_state:?}"),
-                        }))
-                        .into_response(),
-                        Ok(Err(error)) => (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "error": error.to_string(),
-                                "command": format!("{verb} JOB"),
-                                "job_id": job_id,
-                            })),
-                        )
-                            .into_response(),
-                        Err(_) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({
-                                "error": "ops job store lock poisoned",
-                                "command": format!("{verb} JOB"),
-                                "job_id": job_id,
-                            })),
-                        )
-                            .into_response(),
-                    }
-                }
+                Ok(Err(mongreldb_core::OpsJobError::TooLate { job_id: id })) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "cancel too late: publish fence already crossed",
+                        "command": format!("{verb} JOB"),
+                        "job_id": id,
+                        "category": "failed_precondition",
+                    })),
+                )
+                    .into_response(),
+                Ok(Err(error)) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": error.to_string(),
+                        "command": format!("{verb} JOB"),
+                        "job_id": job_id,
+                    })),
+                )
+                    .into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "ops job store lock poisoned",
+                        "command": format!("{verb} JOB"),
+                        "job_id": job_id,
+                    })),
+                )
+                    .into_response(),
             }
         }
         AdminCommand::BackupDatabase { destination } => {
@@ -872,8 +913,7 @@ pub(crate) async fn try_admin_sql(
             let job = state
                 .ops_jobs
                 .lock()
-                .map(|mut store| store.submit(mongreldb_core::OpsJobKind::Backup, params))
-                .ok();
+                .ok().and_then(|mut store| store.submit(mongreldb_core::OpsJobKind::Backup, params).ok());
             // Do not fire-and-forget HierarchicalScheduler::submit here: orphan
             // Backup work items steal fairness slots until a later poll/complete
             // (review finding). Ops store owns the job lifecycle.
@@ -901,8 +941,8 @@ pub(crate) async fn try_admin_sql(
             let mut params = std::collections::BTreeMap::new();
             params.insert("source".into(), source.clone());
             params.insert("disaster_recovery".into(), disaster_recovery.to_string());
-            let job = state.ops_jobs.lock().ok().map(|mut store| {
-                store.submit(mongreldb_core::OpsJobKind::RestoreVerification, params)
+            let job = state.ops_jobs.lock().ok().and_then(|mut store| {
+                store.submit(mongreldb_core::OpsJobKind::Restore, params).ok()
             });
 
             // Live plan from a published backup when the path exists; otherwise

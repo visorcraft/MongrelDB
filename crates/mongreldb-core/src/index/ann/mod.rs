@@ -105,6 +105,8 @@ pub struct AnnIndex {
     frozen: Arc<Vec<Arc<dyn AnnBackend>>>,
     /// Small mutable delta writers insert into.
     active: Box<dyn AnnBackend>,
+    /// Cryptographic semantic identity bound to this ANN generation, if any.
+    semantic_identity: Option<crate::embedding::EmbeddingProviderRef>,
 }
 
 impl Clone for AnnIndex {
@@ -118,6 +120,7 @@ impl Clone for AnnIndex {
             options: self.options.clone(),
             frozen: Arc::clone(&self.frozen),
             active: self.active.clone_box(),
+            semantic_identity: self.semantic_identity.clone(),
         }
     }
 }
@@ -180,6 +183,7 @@ impl AnnIndex {
             options,
             frozen: Arc::new(Vec::new()),
             active,
+            semantic_identity: None,
         }
     }
 
@@ -229,6 +233,29 @@ impl AnnIndex {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn semantic_identity(&self) -> Option<&crate::embedding::EmbeddingProviderRef> {
+        self.semantic_identity.as_ref()
+    }
+
+    /// Bind the generation to `identity` on first use, or verify an exact match.
+    pub fn bind_or_check_semantic_identity(
+        &mut self,
+        identity: &crate::embedding::EmbeddingProviderRef,
+    ) -> std::result::Result<bool, crate::embedding::EmbeddingError> {
+        match &self.semantic_identity {
+            None => {
+                self.semantic_identity = Some(identity.clone());
+                Ok(true)
+            }
+            Some(existing) if existing == identity => Ok(false),
+            Some(existing) => Err(crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
+                column_id: 0,
+                expected: existing.fingerprint_sha256(),
+                got: identity.fingerprint_sha256(),
+            }),
+        }
     }
 
     pub fn ef_search(&self) -> usize {
@@ -617,6 +644,7 @@ impl AnnIndex {
                     options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
+                    semantic_identity: None,
                 })
             }
             (AnnQuantization::Dense, AnnCheckpointPayload::Dense { graph }) => {
@@ -642,6 +670,7 @@ impl AnnIndex {
                     options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
+                    semantic_identity: None,
                 })
             }
             (
@@ -697,6 +726,7 @@ impl AnnIndex {
                     options,
                     frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
                     active,
+                    semantic_identity: None,
                 })
             }
             (
@@ -732,6 +762,7 @@ impl AnnIndex {
                     options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
+                    semantic_identity: None,
                 })
             }
             (
@@ -774,6 +805,7 @@ impl AnnIndex {
                     options,
                     frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
                     active,
+                    semantic_identity: None,
                 })
             }
             _ => Err("ANN checkpoint quantization/payload tag mismatch".into()),

@@ -39,11 +39,14 @@ use zeroize::Zeroizing;
 mod admission;
 mod audit;
 pub mod cluster_admin;
+mod cluster_data_plane;
+mod cluster_sql;
 pub mod cluster_runtime;
 pub mod fragment_rpc;
 mod kit;
 mod metrics;
 pub mod native;
+pub mod native_listen;
 pub mod oidc;
 mod pre_cancel;
 mod prepared;
@@ -52,7 +55,12 @@ pub mod remote_embedding;
 mod sessions;
 mod sql_idempotency;
 mod sql_pages;
+pub mod storage_runtime;
 pub mod vault_kms;
+
+pub use storage_runtime::{
+    ClusterGatewayRuntime, ServerStorageRuntime, StandaloneRuntime, StorageRuntimeError,
+};
 
 /// Parser-only entry point used by the release fuzz harness.
 #[doc(hidden)]
@@ -61,6 +69,7 @@ pub fn fuzz_validate_sql_cursor(value: &str, owner: &str, key: &[u8; 32]) {
 }
 mod trigger;
 
+pub use native_listen::{is_loopback_addr, NativeListenConfig, NativeListenInput};
 pub use sessions::{spawn_session_reaper, SessionStore};
 
 fn client_closed_request_status() -> StatusCode {
@@ -210,7 +219,9 @@ where
 }
 
 struct AppState {
-    db: Arc<Database>,
+    /// Single authoritative storage runtime (P0.2). Exactly one of standalone
+    /// local engine or cluster gateway — never both as peer data planes.
+    storage: ServerStorageRuntime,
     idem: kit::IdempotencyStore,
     external_modules: Vec<Arc<dyn ExternalTableModule>>,
     auth_token: Option<String>,
@@ -255,7 +266,11 @@ struct AppState {
     drain: Arc<DrainControl>,
     /// Stage 4 hierarchical scheduler bridge (class/tenant admission; S1E-002).
     /// Outer bound remains `sql_semaphore`; this enforces fairness inside it.
+    /// Shared with [`Self::node_admission`] (same `Arc` inner).
     scheduler: admission::SchedulerAdmission,
+    /// P1.1 universal node admission: hierarchical scheduler + memory governor
+    /// reference, Control/Replication reserves, fragment/AI child budgets.
+    node_admission: admission::NodeAdmissionController,
     /// Stage 4 node memory governor (cross-tablet pressure actions).
     node_governor: std::sync::Mutex<mongreldb_core::NodeMemoryGovernor>,
     /// Stage 4 AI index generation registry (readiness/routing metadata).
@@ -271,11 +286,86 @@ struct AppState {
     /// Empty by default — application-supplied vectors and sparse retrieval
     /// need no vendor.
     embedding_providers: mongreldb_core::EmbeddingProviderRegistry,
-    /// Live cluster node runtime when the operator enabled cluster mode
-    /// (`--cluster-node-data` / `MONGRELDB_CLUSTER_NODE_DATA`). Standalone
-    /// servers leave this `None`; admin SQL that needs live groups then
-    /// fails closed.
-    cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
+}
+
+impl AppState {
+    /// Authoritative storage runtime (standalone or cluster).
+    pub(crate) fn storage(&self) -> &ServerStorageRuntime {
+        &self.storage
+    }
+
+    /// P1.1 universal node admission controller (product paths admit here).
+    pub(crate) fn node_admission(&self) -> &admission::NodeAdmissionController {
+        &self.node_admission
+    }
+
+    /// Workload resource groups used for class priority / admission.
+    pub(crate) fn resource_groups(&self) -> &mongreldb_core::ResourceGroupRegistry {
+        &self.resource_groups
+    }
+
+    /// Standalone local engine.
+    ///
+    /// Cluster mode must fail closed **before** calling this (see
+    /// [`refuse_cluster_standalone_data_plane`] / `require_writes_open`). A
+    /// direct call in cluster mode panics so ordinary public writes cannot
+    /// silently bypass Raft through a peer standalone core (P0.2 AC).
+    fn db(&self) -> &Arc<Database> {
+        self.storage.standalone_db().unwrap_or_else(|| {
+            panic!(
+                "{}",
+                StorageRuntimeError::cluster_refuses_standalone_bypass()
+            )
+        })
+    }
+
+    /// Fallible standalone engine accessor (no panic).
+    fn try_db(&self) -> Result<&Arc<Database>, mongreldb_core::MongrelError> {
+        self.storage
+            .require_standalone_db()
+            .map_err(mongreldb_core::MongrelError::from)
+    }
+
+    /// Clone of the standalone engine handle.
+    fn db_arc(&self) -> Arc<Database> {
+        Arc::clone(self.db())
+    }
+
+    /// Live cluster runtime when this process is in cluster mode.
+    pub(crate) fn cluster_runtime(&self) -> Option<&cluster_runtime::ClusterRuntimeHandle> {
+        self.storage.cluster_handle()
+    }
+
+    /// `true` when public data is owned by consensus/tablet state.
+    pub(crate) fn is_cluster_mode(&self) -> bool {
+        self.storage.is_cluster()
+    }
+}
+
+/// Fail-closed HTTP response when cluster mode is asked to use the standalone
+/// data plane (ordinary SQL/Kit/native user writes).
+fn cluster_data_plane_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": StorageRuntimeError::cluster_refuses_standalone_bypass().to_string(),
+            "status": "error",
+            "category": "unavailable",
+            "storage_mode": "cluster",
+        })),
+    )
+        .into_response()
+}
+
+/// Returns a 503 when this process is in cluster mode and the caller is about
+/// to touch the standalone data plane. Control-plane admin SQL must run
+/// **before** this check (see `sql` / `try_admin_sql`).
+pub(crate) fn refuse_cluster_standalone_data_plane(state: &AppState) -> Option<Response> {
+    if state.is_cluster_mode() {
+        Some(cluster_data_plane_unavailable_response())
+    } else {
+        None
+    }
 }
 
 /// A `Duration` config value (millisecond granularity) that
@@ -540,14 +630,15 @@ pub struct ServerControl {
     cancel_grace: std::time::Duration,
     metrics: Arc<metrics::Metrics>,
     reloadable: Arc<ReloadableConfig>,
-    db: Arc<Database>,
+    /// Authoritative storage (same as `AppState.storage`).
+    storage: ServerStorageRuntime,
     audit: Arc<audit::AuditLog>,
     sql_idempotency: Arc<sql_idempotency::SqlIdempotencyStore>,
     sql_semaphore: Arc<tokio::sync::Semaphore>,
     scheduler: admission::SchedulerAdmission,
+    /// Shared with AppState for P1.1 parent admission on native SQL.
+    node_admission: admission::NodeAdmissionController,
     sql_priority: u8,
-    /// Live cluster runtime (same handle as `AppState`); shut down after SQL.
-    cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
 }
 
 impl ServerControl {
@@ -556,7 +647,15 @@ impl ServerControl {
         Arc::clone(&self.query_registry)
     }
 
+    /// Authoritative storage runtime.
+    pub fn storage(&self) -> &ServerStorageRuntime {
+        &self.storage
+    }
+
     /// Native adapters share HTTP's durable SQL idempotency authority.
+    ///
+    /// Cluster mode has no standalone user database; callers must not invoke
+    /// this without a local engine (native RPC is standalone-only today).
     pub fn native_runtime(
         &self,
         db: Arc<Database>,
@@ -569,6 +668,7 @@ impl ServerControl {
                 self.scheduler.clone(),
                 self.sql_priority,
             )
+            .with_node_admission(self.node_admission.clone())
     }
 
     pub async fn shutdown(&self) -> usize {
@@ -590,7 +690,7 @@ impl ServerControl {
         }
         let stuck = stuck_queries.len();
         self.metrics.add_sql_stuck_after_cancel(stuck);
-        if let Some(runtime) = &self.cluster_runtime {
+        if let Some(runtime) = self.storage.cluster_handle() {
             if let Err(error) = runtime.shutdown().await {
                 eprintln!("[cluster-runtime] shutdown error: {error}");
             } else {
@@ -602,7 +702,7 @@ impl ServerControl {
 
     /// Live cluster runtime handle when the daemon started in cluster mode.
     pub fn cluster_runtime(&self) -> Option<&cluster_runtime::ClusterRuntimeHandle> {
-        self.cluster_runtime.as_ref()
+        self.storage.cluster_handle()
     }
 
     /// Re-read the environment-driven mutable subset of server configuration
@@ -612,7 +712,19 @@ impl ServerControl {
     /// untouched and stays restart-only.
     pub fn reload_config(&self) -> Result<ReloadReport, String> {
         let values = mutable_config_from_env();
-        let report = apply_mutable_config(&self.reloadable, &self.db, &values)
+        let Some(db) = self.storage.standalone_db() else {
+            // Cluster mode has no standalone history-retention surface.
+            return Ok(ReloadReport {
+                slow_query_ms: self.reloadable.slow_query_threshold.as_millis(),
+                sql_default_timeout_ms: self.reloadable.sql_default_timeout.as_millis(),
+                sql_max_timeout_ms: self.reloadable.sql_max_timeout.as_millis(),
+                sql_cancel_grace_ms: self.reloadable.sql_cancel_grace.as_millis(),
+                sql_max_output_rows: self.reloadable.sql_max_output_rows.get() as u64,
+                sql_max_output_bytes: self.reloadable.sql_max_output_bytes.get() as u64,
+                history_retention_epochs: values.history_retention_epochs,
+            });
+        };
+        let report = apply_mutable_config(&self.reloadable, db, &values)
             .map_err(|error| error.to_string())?;
         self.audit.record(
             "system",
@@ -719,6 +831,12 @@ pub fn build_app_with_sessions_and_control(
 /// Used by the product cluster path (`--cluster-node-data`) and by tests that
 /// assert admin SQL against a started `NodeRuntime`. Standalone callers pass
 /// `None` (or use [`build_app_with_sessions_and_control`]).
+///
+/// **P0.2 dual-root refusal:** when `cluster_runtime` is `Some`, the provided
+/// `db` is **not** installed as a peer data plane. Callers in cluster mode
+/// should pass a throwaway or drop their standalone open; production start
+/// uses [`build_app_with_storage`] with [`ServerStorageRuntime::Cluster`] and
+/// never opens a user database as standalone.
 pub fn build_app_with_sessions_control_and_cluster(
     db: Arc<Database>,
     external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
@@ -728,9 +846,43 @@ pub fn build_app_with_sessions_control_and_cluster(
     sessions: Arc<sessions::SessionStore>,
     cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
 ) -> (axum::Router, ServerControl) {
-    db.set_replication_wal_retention_segments(default_replication_wal_segments());
-    if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
-        eprintln!("[history] failed to configure retention: {error}");
+    let storage = match cluster_runtime {
+        Some(handle) => {
+            // Refuse dual-root: cluster mode owns public data via NodeRuntime.
+            // Dropping this Arc releases any accidental standalone open the
+            // caller still held solely for API compatibility.
+            drop(db);
+            ServerStorageRuntime::cluster(handle)
+        }
+        None => ServerStorageRuntime::standalone(db),
+    };
+    build_app_with_storage(
+        storage,
+        external_modules,
+        auth_token,
+        max_connections,
+        user_auth,
+        sessions,
+    )
+}
+
+/// Build the daemon router from a single authoritative [`ServerStorageRuntime`].
+///
+/// Prefer this for new cluster-mode call sites so a standalone `Database` is
+/// never threaded alongside a live `ClusterRuntimeHandle`.
+pub fn build_app_with_storage(
+    storage: ServerStorageRuntime,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+    sessions: Arc<sessions::SessionStore>,
+) -> (axum::Router, ServerControl) {
+    if let Some(db) = storage.standalone_db() {
+        db.set_replication_wal_retention_segments(default_replication_wal_segments());
+        if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
+            eprintln!("[history] failed to configure retention: {error}");
+        }
     }
     let max_active_queries = default_sql_max_active_queries();
     let query_registry = Arc::new(SqlQueryRegistry::new_with_limits(
@@ -755,14 +907,36 @@ pub fn build_app_with_sessions_control_and_cluster(
         sql_max_output_rows: ReloadableUsize::new(default_sql_max_output_rows()),
         sql_max_output_bytes: ReloadableUsize::new(default_sql_max_output_bytes()),
     });
-    let (idempotency_root, idempotency_integrity) =
-        match sql_idempotency::IdempotencyIntegrity::for_database(&db) {
+    let (idempotency_root, idempotency_integrity) = match storage.standalone_db() {
+        Some(db) => match sql_idempotency::IdempotencyIntegrity::for_database(db) {
             Ok((root, integrity)) => (root, Some(integrity)),
             Err(error) => {
                 eprintln!("[idempotency] durable integrity key unavailable: {error}");
                 (db.durable_root(), None)
             }
-        };
+        },
+        None => {
+            // Cluster mode: process-local idempotency under node-data (no
+            // standalone user-database root).
+            let root = Arc::new(
+                mongreldb_core::durable_file::DurableRoot::open(storage.durable_path())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "cluster node-data durable root unavailable at {}: {error}",
+                            storage.durable_path().display()
+                        )
+                    }),
+            );
+            let integrity = match sql_idempotency::IdempotencyIntegrity::for_root(&root) {
+                Ok(integrity) => Some(integrity),
+                Err(error) => {
+                    eprintln!("[idempotency] cluster integrity key unavailable: {error}");
+                    None
+                }
+            };
+            (root, integrity)
+        }
+    };
     let sql_idempotency = Arc::new(sql_idempotency::SqlIdempotencyStore::new_with_integrity(
         Arc::clone(&idempotency_root),
         idempotency_integrity.clone(),
@@ -770,7 +944,19 @@ pub fn build_app_with_sessions_control_and_cluster(
         default_sql_idempotency_max_entries(),
     ));
     let resource_groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
-    let scheduler = admission::SchedulerAdmission::from_resource_groups(&resource_groups);
+    // Share the database MemoryGovernor when standalone so evaluate sees live
+    // reservations; cluster mode uses a process-local governor only.
+    // P1.1 NodeAdmissionController also uses this governor for parent/child budgets.
+    let node_memory_governor = match storage.standalone_db() {
+        Some(db) => db.memory_governor().clone(),
+        None => mongreldb_core::MemoryGovernor::new(
+            mongreldb_core::GovernorConfig::new(512 * 1024 * 1024),
+        )
+        .expect("default cluster node memory governor"),
+    };
+    let node_admission =
+        admission::NodeAdmissionController::new(&resource_groups, node_memory_governor.clone());
+    let scheduler = node_admission.scheduler().clone();
     let sql_semaphore = Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent()));
     let sql_priority = admission::priority_for_class(
         &resource_groups,
@@ -783,17 +969,15 @@ pub fn build_app_with_sessions_control_and_cluster(
         cancel_grace: sql_cancel_grace,
         metrics: Arc::clone(&metrics),
         reloadable: Arc::clone(&reloadable),
-        db: Arc::clone(&db),
+        storage: storage.clone(),
         audit: Arc::clone(&audit),
         sql_idempotency: Arc::clone(&sql_idempotency),
         sql_semaphore: Arc::clone(&sql_semaphore),
         scheduler: scheduler.clone(),
+        node_admission: node_admission.clone(),
         sql_priority,
-        cluster_runtime: cluster_runtime.clone(),
     };
-    // Share the database MemoryGovernor so evaluate sees live reservations
-    // and EvictCaches drives the same reclaimable page caches (S4B).
-    let node_memory_governor = db.memory_governor().clone();
+    let ops_jobs_store = mongreldb_core::OpsJobStore::new();
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new_with_integrity(
             idempotency_root,
@@ -801,7 +985,7 @@ pub fn build_app_with_sessions_control_and_cluster(
             default_sql_idempotency_ttl(),
             default_sql_idempotency_max_entries(),
         ),
-        db,
+        storage,
         external_modules: external_modules.into_iter().collect(),
         auth_token,
         user_auth,
@@ -841,6 +1025,7 @@ pub fn build_app_with_sessions_control_and_cluster(
         // Class configs seeded from resource-group defaults; env may tighten
         // InteractiveSql max_queue / max_concurrency for tests/operators.
         scheduler,
+        node_admission,
         node_governor: std::sync::Mutex::new(mongreldb_core::NodeMemoryGovernor::new(
             node_memory_governor,
         )),
@@ -848,10 +1033,9 @@ pub fn build_app_with_sessions_control_and_cluster(
         multi_region: std::sync::Mutex::new(
             mongreldb_cluster::multi_region::MultiRegionPolicy::default(),
         ),
-        ops_jobs: std::sync::Mutex::new(mongreldb_core::OpsJobStore::new()),
+        ops_jobs: std::sync::Mutex::new(ops_jobs_store),
         resource_groups,
         embedding_providers: mongreldb_core::EmbeddingProviderRegistry::new(),
-        cluster_runtime,
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -924,8 +1108,13 @@ pub fn build_app_with_sessions_control_and_cluster(
     // A credential-enforced database must never expose the authenticated
     // daemon handle when the caller forgot to configure an HTTP auth mode.
     // With neither mode enabled the middleware rejects every route.
-    let router = if state.auth_token.is_some() || state.user_auth || state.db.require_auth_enabled()
-    {
+    // Cluster mode has no standalone catalog; only explicit auth_token /
+    // user_auth flags enable the middleware.
+    let catalog_requires_auth = state
+        .try_db()
+        .map(|db| db.require_auth_enabled())
+        .unwrap_or(false);
+    let router = if state.auth_token.is_some() || state.user_auth || catalog_requires_auth {
         router.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -992,7 +1181,8 @@ async fn auth_middleware(
         }
     }
 
-    // Mode 2: User auth (Basic).
+    // Mode 2: User auth (Basic) — standalone catalog only (P0.2: cluster has
+    // no peer standalone user database for credential verification).
     if state.user_auth {
         if let Some(encoded) = header.strip_prefix("Basic ") {
             if let Ok(decoded) = base64_decode(encoded) {
@@ -1000,9 +1190,12 @@ async fn auth_middleware(
                 if let Ok(creds) = std::str::from_utf8(&decoded) {
                     if let Some((username, password)) = creds.split_once(':') {
                         attempted = username.to_string();
-                        if let Ok(Some(principal)) =
-                            state.db.authenticate_principal(username, password)
-                        {
+                        let authenticated = state
+                            .try_db()
+                            .ok()
+                            .and_then(|db| db.authenticate_principal(username, password).ok())
+                            .flatten();
+                        if let Some(principal) = authenticated {
                             let username = principal.username.clone();
                             drop(decoded);
                             state
@@ -1125,15 +1318,14 @@ async fn wal_stream(
     OptionalPrincipal(principal): OptionalPrincipal,
     axum::extract::Query(params): axum::extract::Query<WalStreamParams>,
 ) -> Result<Response, StatusCode> {
-    state
-        .db
+    state.db()
         .require_for(
             request_principal(&state, &principal).as_ref(),
             &mongreldb_core::Permission::Admin,
         )
         .map_err(|error| status_for_error(&error))?;
     let since = params.since.unwrap_or(0);
-    let db = Arc::clone(&state.db);
+    let db = Arc::clone(state.db());
     let batch = tokio::task::spawn_blocking(move || db.replication_batch_since(since))
         .await
         .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1194,13 +1386,13 @@ async fn replication_snapshot(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    let db = Arc::clone(&state.db);
+    let db = Arc::clone(state.db());
     let snapshot = match tokio::task::spawn_blocking(move || db.replication_snapshot()).await {
         Ok(Ok(snapshot)) => snapshot,
         Ok(Err(error)) => {
@@ -1328,8 +1520,7 @@ async fn events_stream(
     use std::collections::VecDeque;
     use std::convert::Infallible;
 
-    state
-        .db
+    state.db()
         .require_for(
             request_principal(&state, &principal).as_ref(),
             &mongreldb_core::Permission::Admin,
@@ -1373,9 +1564,9 @@ async fn events_stream(
         ),
         None => None,
     };
-    let receiver = state.db.subscribe_changes();
-    let change_wake = state.db.subscribe_change_commits();
-    let db = Arc::clone(&state.db);
+    let receiver = state.db().subscribe_changes();
+    let change_wake = state.db().subscribe_change_commits();
+    let db = Arc::clone(state.db());
     let resume = last_id.clone();
     let initial = tokio::task::spawn_blocking(move || db.change_events_since(resume.as_deref()))
         .await
@@ -1399,7 +1590,7 @@ async fn events_stream(
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(
         futures::stream::unfold(
             State {
-                db: Arc::clone(&state.db),
+                db: Arc::clone(state.db()),
                 receiver,
                 change_wake,
                 interval: tokio::time::interval(std::time::Duration::from_millis(250)),
@@ -1620,13 +1811,13 @@ async fn history_retention(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    Json(history_retention_response(&state.db)).into_response()
+    Json(history_retention_response(state.db())).into_response()
 }
 
 /// `PUT /history/retention` — set the durable MVCC history window.
@@ -1635,7 +1826,7 @@ async fn set_history_retention(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(request): Json<HistoryRetentionRequest>,
 ) -> Response {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
@@ -1648,8 +1839,8 @@ async fn set_history_retention(
         )
             .into_response();
     };
-    match state.db.set_history_retention_epochs(epochs) {
-        Ok(()) => Json(history_retention_response(&state.db)).into_response(),
+    match state.db().set_history_retention_epochs(epochs) {
+        Ok(()) => Json(history_retention_response(state.db())).into_response(),
         Err(error) => (status_for_error(&error), error.to_string()).into_response(),
     }
 }
@@ -1662,7 +1853,7 @@ async fn audit_handler(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
@@ -1682,7 +1873,36 @@ fn require_admin(
     action: &str,
 ) -> Result<String, Box<Response>> {
     let owner = request_owner(state, principal);
-    if let Err(error) = state.db.require_for(
+    // Cluster mode has no standalone catalog. Control-plane admin is admitted
+    // when the HTTP middleware already authenticated a bearer token, or when
+    // the deployment runs without auth (test/plaintext). Catalog `Permission::Admin`
+    // remains the authority in standalone mode.
+    if state.is_cluster_mode() {
+        if state.user_auth && principal.as_ref().is_none_or(|p| !p.is_admin) {
+            // User-auth without a local catalog cannot mint admins in cluster mode.
+            if state.auth_token.is_none() {
+                state.audit.record(
+                    &owner,
+                    format!("{action}.fail"),
+                    "cluster mode requires bearer token admin (no standalone catalog)",
+                );
+                return Err(Box::new(
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "cluster mode control plane requires --auth-token \
+                                      (standalone catalog user-auth is not the cluster data plane)",
+                            "status": "error",
+                            "category": "permission_denied",
+                        })),
+                    )
+                        .into_response(),
+                ));
+            }
+        }
+        return Ok(owner);
+    }
+    if let Err(error) = state.db().require_for(
         request_principal(state, principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
@@ -1702,9 +1922,15 @@ fn require_admin(
 /// staging work, so a drain turns the whole write plane read-only before the
 /// core closes. Returns the 503 response to emit, or `None` when writes are
 /// admitted.
+///
+/// Cluster mode always fails closed here for ordinary user writes (P0.2):
+/// public mutations must not use a standalone WAL bypass through `AppState.db`.
 fn require_writes_open(state: &AppState) -> Option<Response> {
+    if let Some(response) = refuse_cluster_standalone_data_plane(state) {
+        return Some(response);
+    }
     if state.accepting_sql.load(Ordering::Acquire)
-        && state.db.lifecycle_state() == mongreldb_core::LifecycleState::Open
+        && state.db().lifecycle_state() == mongreldb_core::LifecycleState::Open
     {
         return None;
     }
@@ -1725,8 +1951,19 @@ fn drain_status_json(state: &AppState) -> serde_json::Value {
         .lock()
         .map(|record| record.clone())
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+    let lifecycle = state
+        .try_db()
+        .map(|db| db.lifecycle_state().to_string())
+        .unwrap_or_else(|_| {
+            if state.is_cluster_mode() {
+                "cluster".into()
+            } else {
+                "unknown".into()
+            }
+        });
     json!({
-        "lifecycle": state.db.lifecycle_state().to_string(),
+        "lifecycle": lifecycle,
+        "storage_mode": state.storage().mode_name(),
         "accepting_sql": state.accepting_sql.load(Ordering::Acquire),
         "active_queries": state.query_registry.active_count(),
         "live_sessions": state.sessions.len(),
@@ -1777,8 +2014,47 @@ async fn admin_drain(
             .into_response();
     }
     let _serialization = state.drain.lock.lock().await;
+    if state.is_cluster_mode() {
+        // Cluster drain: stop admitting SQL, cancel queries, shut down the
+        // NodeRuntime. There is no peer standalone DatabaseCore to close.
+        state.accepting_sql.store(false, Ordering::Release);
+        state
+            .query_registry
+            .cancel_all(CancellationReason::ServerShutdown);
+        state.sessions.close_all();
+        if let Some(runtime) = state.cluster_runtime() {
+            if let Err(error) = runtime.shutdown().await {
+                state.audit.record(
+                    owner,
+                    "admin.drain.fail",
+                    format!("cluster runtime shutdown: {error}"),
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!("cluster runtime shutdown failed: {error}"),
+                        "storage_mode": "cluster",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        state.audit.record(
+            owner,
+            "admin.drain.ok",
+            format!("cluster drain completed deadline_ms={deadline_ms}"),
+        );
+        if let Ok(mut record) = state.drain.record.lock() {
+            record.initiated = true;
+            record.completed = true;
+            record.deadline_ms = deadline_ms;
+            record.lifecycle = "cluster".into();
+            record.detail = "cluster runtime drained".into();
+        }
+        return Json(drain_status_json(&state)).into_response();
+    }
     if matches!(
-        state.db.lifecycle_state(),
+        state.db().lifecycle_state(),
         mongreldb_core::LifecycleState::Closed
     ) {
         // Idempotent: a completed drain reports the current status again.
@@ -1806,9 +2082,9 @@ async fn admin_drain(
     state.sessions.close_all();
     // 4. Drain the storage core with the remaining deadline.
     let remaining = deadline.saturating_sub(started.elapsed());
-    let core = state.db.core();
+    let core = state.db().core();
     let result = tokio::task::spawn_blocking(move || core.shutdown(remaining)).await;
-    let lifecycle = state.db.lifecycle_state().to_string();
+    let lifecycle = state.db().lifecycle_state().to_string();
     let (completed, detail) = match &result {
         Ok(Ok(())) => (true, format!("drain completed; core {lifecycle}")),
         Ok(Err(error)) => (false, format!("drain incomplete: {error}")),
@@ -1881,7 +2157,47 @@ async fn admin_reload(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
         }
     }
-    match apply_mutable_config(&state.reloadable, &state.db, &values) {
+    let Some(db) = state.try_db().ok() else {
+        // Cluster mode: apply process-local reloadable tunables only.
+        state.reloadable.sql_max_timeout.set(values.sql_max_timeout);
+        state
+            .reloadable
+            .sql_default_timeout
+            .set(values.sql_default_timeout.min(values.sql_max_timeout));
+        state
+            .reloadable
+            .sql_cancel_grace
+            .set(values.sql_cancel_grace);
+        state
+            .reloadable
+            .sql_max_output_rows
+            .set(values.sql_max_output_rows);
+        state
+            .reloadable
+            .sql_max_output_bytes
+            .set(values.sql_max_output_bytes);
+        state
+            .reloadable
+            .slow_query_threshold
+            .set(values.slow_query_threshold);
+        let report = ReloadReport {
+            slow_query_ms: state.reloadable.slow_query_threshold.as_millis(),
+            sql_default_timeout_ms: state.reloadable.sql_default_timeout.as_millis(),
+            sql_max_timeout_ms: state.reloadable.sql_max_timeout.as_millis(),
+            sql_cancel_grace_ms: state.reloadable.sql_cancel_grace.as_millis(),
+            sql_max_output_rows: state.reloadable.sql_max_output_rows.get() as u64,
+            sql_max_output_bytes: state.reloadable.sql_max_output_bytes.get() as u64,
+            history_retention_epochs: values.history_retention_epochs,
+        };
+        state.audit.record(
+            owner,
+            "admin.reload.ok",
+            "cluster mode: process-local tunables only (no standalone history retention)",
+        );
+        return Json(json!({ "reloaded": true, "applied": report, "storage_mode": "cluster" }))
+            .into_response();
+    };
+    match apply_mutable_config(&state.reloadable, db, &values) {
         Ok(report) => {
             state.audit.record(
                 owner,
@@ -2108,7 +2424,11 @@ fn request_owner(state: &AppState, principal: &Option<mongreldb_core::Principal>
         digest.update(token.as_bytes());
         return format!("bearer:{}", sql_idempotency::hex(&digest.finalize()));
     }
-    if state.user_auth || state.db.require_auth_enabled() {
+    let catalog_requires_auth = state
+        .try_db()
+        .map(|db| db.require_auth_enabled())
+        .unwrap_or(false);
+    if state.user_auth || catalog_requires_auth {
         return "unauthenticated".into();
     }
     "anonymous".into()
@@ -2119,18 +2439,21 @@ fn request_principal(
     principal: &Option<mongreldb_core::Principal>,
 ) -> Option<mongreldb_core::Principal> {
     if let Some(principal) = principal {
-        return state
-            .db
-            .resolve_current_principal(principal)
-            .or_else(|| Some(principal.clone()));
+        return match state.try_db() {
+            Ok(db) => db
+                .resolve_current_principal(principal)
+                .or_else(|| Some(principal.clone())),
+            Err(_) => Some(principal.clone()),
+        };
     }
     state.auth_token.as_ref().and_then(|_| {
-        if state.db.require_auth_enabled() {
-            return state
-                .db
-                .principal_snapshot()
-                .and_then(|principal| state.db.resolve_current_principal(&principal))
-                .filter(|principal| principal.is_admin);
+        if let Ok(db) = state.try_db() {
+            if db.require_auth_enabled() {
+                return db
+                    .principal_snapshot()
+                    .and_then(|principal| db.resolve_current_principal(&principal))
+                    .filter(|principal| principal.is_admin);
+            }
         }
         Some(mongreldb_core::Principal {
             user_id: 0,
@@ -2148,7 +2471,10 @@ fn current_request_principal(
     principal: &Option<mongreldb_core::Principal>,
 ) -> Option<mongreldb_core::Principal> {
     if let Some(principal) = principal {
-        return state.db.resolve_current_principal(principal);
+        return match state.try_db() {
+            Ok(db) => db.resolve_current_principal(principal),
+            Err(_) => Some(principal.clone()),
+        };
     }
     request_principal(state, principal)
 }
@@ -2160,7 +2486,11 @@ fn request_identity_is_current(
     if principal.is_some() || state.auth_token.is_some() {
         return current_request_principal(state, principal).is_some();
     }
-    !state.user_auth && !state.db.require_auth_enabled()
+    let catalog_requires_auth = state
+        .try_db()
+        .map(|db| db.require_auth_enabled())
+        .unwrap_or(false);
+    !state.user_auth && !catalog_requires_auth
 }
 
 /// Map the request's authentication onto the canonical
@@ -2193,12 +2523,15 @@ async fn create_session(
     if !state.accepting_sql.load(Ordering::Acquire) {
         return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
     }
+    if let Some(response) = refuse_cluster_standalone_data_plane(&state) {
+        return response;
+    }
     if !request_identity_is_current(&state, &principal) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let owner = request_owner(&state, &principal);
     let session = match MongrelSession::open_with_external_modules_as(
-        Arc::clone(&state.db),
+        Arc::clone(state.db()),
         state.external_modules.iter().cloned(),
         request_principal(&state, &principal),
     ) {
@@ -2674,8 +3007,8 @@ async fn dispatch_paginated_sql(
     };
     let retained_bytes = serialized.retained_bytes;
     let current_binding = sql_pages::SqlPageBinding {
-        security_version: state.db.security_version(),
-        catalog_epoch: state.db.catalog_snapshot().db_epoch,
+        security_version: state.db().security_version(),
+        catalog_epoch: state.db().catalog_snapshot().db_epoch,
     };
     if current_binding != binding {
         output.fail_with_error(
@@ -3247,7 +3580,7 @@ async fn prepare_statement(
     match entry.session().run_with_query(&sql, query).await {
         Ok(_) => {
             // Bind the plan to the catalog state it was planned against.
-            let catalog_state = prepared::CatalogState::capture(&state.db);
+            let catalog_state = prepared::CatalogState::capture(state.db());
             let statement_id = entry.allocate_statement_id();
             entry.insert_prepared_binding(
                 req.name.clone(),
@@ -3356,7 +3689,7 @@ async fn execute_statement(
             state.metrics.inc_sql_errors();
             return with_query_id(*response, query_id);
         }
-        let catalog_state = prepared::CatalogState::capture(&state.db);
+        let catalog_state = prepared::CatalogState::capture(state.db());
         if !catalog_state.is_compatible(&binding) {
             // Incompatible catalog/schema change: invalidate and replan
             // (S1D-005) — a stale plan never executes silently. The old plan
@@ -3388,7 +3721,7 @@ async fn execute_statement(
                     // the CURRENT catalog (fresh secured providers:
                     // authorization is preserved).
                     let fresh = match MongrelSession::open_with_external_modules_as(
-                        Arc::clone(&state.db),
+                        Arc::clone(state.db()),
                         state.external_modules.iter().cloned(),
                         request_principal(&state, &principal),
                     ) {
@@ -3407,7 +3740,7 @@ async fn execute_statement(
                                 statement_id,
                                 binding.sql.clone(),
                                 binding.parameter_types.clone(),
-                                &prepared::CatalogState::capture(&state.db),
+                                &prepared::CatalogState::capture(state.db()),
                             );
                             entry.insert_prepared_binding(req.name.clone(), rebound);
                             None
@@ -3644,14 +3977,14 @@ async fn metrics_handler(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Admin,
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
     let body = state.metrics.prometheus_text(
-        state.db.table_names().len(),
+        state.db().table_names().len(),
         state.query_registry.stats(),
         (
             state.pre_cancellations.len(),
@@ -3673,7 +4006,7 @@ async fn compact_all(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
@@ -3682,7 +4015,7 @@ async fn compact_all(
             Json(json!({ "status": "error", "message": error.to_string() })),
         );
     }
-    match state.db.compact() {
+    match state.db().compact() {
         Ok((compacted, skipped)) => (
             StatusCode::OK,
             Json(json!({
@@ -3704,7 +4037,7 @@ async fn compact_table(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
@@ -3713,7 +4046,7 @@ async fn compact_table(
             Json(json!({ "status": "error", "table": name, "message": error.to_string() })),
         );
     }
-    match state.db.compact_table(&name) {
+    match state.db().compact_table(&name) {
         Ok(true) => (
             StatusCode::OK,
             Json(json!({ "status": "compacted", "table": name })),
@@ -3753,7 +4086,7 @@ async fn create_table(
     if let Some(response) = require_writes_open(&state) {
         return response;
     }
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
@@ -3797,7 +4130,7 @@ async fn create_table(
     if let Err(msg) = validate_table_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
-    match state.db.create_table(&req.name, schema) {
+    match state.db().create_table(&req.name, schema) {
         Ok(id) => Json(json!({
             "table_id": id,
             "table_id_text": id.to_string()
@@ -3811,21 +4144,25 @@ async fn create_table(
 async fn list_tables(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
-) -> Json<Vec<String>> {
+) -> Response {
+    if let Some(response) = refuse_cluster_standalone_data_plane(&state) {
+        return response;
+    }
     let principal = request_principal(&state, &principal);
     Json(
         state
-            .db
+            .db()
             .table_names()
             .into_iter()
             .filter(|table| {
                 state
-                    .db
+                    .db()
                     .select_column_ids_for(table, principal.as_ref())
                     .is_ok()
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     )
+        .into_response()
 }
 
 async fn drop_table(
@@ -3836,13 +4173,13 @@ async fn drop_table(
     if let Some(response) = require_writes_open(&state) {
         return response;
     }
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    match state.db.drop_table_with_epoch(&name) {
+    match state.db().drop_table_with_epoch(&name) {
         Ok(epoch) => Json(json!({
             "status": "committed",
             "epoch": epoch.0,
@@ -4164,7 +4501,7 @@ async fn put_row(
     if let Some(response) = require_writes_open(&state) {
         return response;
     }
-    let handle = match state.db.table(&name) {
+    let handle = match state.db().table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
@@ -4175,7 +4512,7 @@ async fn put_row(
     };
     state.metrics.inc_puts();
     let principal = request_principal(&state, &principal);
-    match state.db.put_for(&name, row, principal.as_ref()) {
+    match state.db().put_for(&name, row, principal.as_ref()) {
         Ok(rid) => Json(json!({ "row_id": rid.0.to_string() })).into_response(),
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
@@ -4186,8 +4523,11 @@ async fn count(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = refuse_cluster_standalone_data_plane(&state) {
+        return response;
+    }
     let principal = request_principal(&state, &principal);
-    match state.db.count_for(&name, principal.as_ref()) {
+    match state.db().count_for(&name, principal.as_ref()) {
         Ok(count) => Json(json!({ "count": count })).into_response(),
         Err(error) => (status_for_error(&error), error.to_string()).into_response(),
     }
@@ -4201,7 +4541,7 @@ async fn commit(
     if let Some(response) = require_writes_open(&state) {
         return response;
     }
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Update {
             table: name.clone(),
@@ -4209,7 +4549,7 @@ async fn commit(
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    let handle = match state.db.table(&name) {
+    let handle = match state.db().table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
@@ -5417,10 +5757,12 @@ async fn acquire_sql_permit(
     let priority = admission::priority_for_class(&state.resource_groups, class);
     let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
 
-    // Class-aware admission with oneshot waiters (no poll stealing).
-    let work = match state
-        .scheduler
-        .submit_and_wait(
+    // P1.1: product SQL path admits through NodeAdmissionController::admit_parent
+    // (hierarchical scheduler + parent memory budget), not a bare scheduler clone.
+    const SQL_PARENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+    let parent = match state
+        .node_admission
+        .admit_parent(
             admission::AdmitRequest {
                 tenant: "default",
                 class,
@@ -5429,25 +5771,22 @@ async fn acquire_sql_permit(
                 query_id: Some(types_query_id),
                 tag: "sql",
             },
+            mongreldb_core::MemoryClass::QueryExecution,
+            SQL_PARENT_BUDGET_BYTES,
             query.control().cancelled(),
         )
         .await
     {
-        Ok(work) => work,
-        Err(admission::AdmitError::Rejected(error)) => {
-            return Err(admission::scheduler_error_to_query(error));
-        }
+        Ok(parent) => parent,
         Err(admission::AdmitError::Cancelled) => {
             return Err(cancellation_checkpoint_error(query));
         }
-        Err(admission::AdmitError::PressureRejected { resource }) => {
-            return Err(admission::admit_error_to_query(
-                admission::AdmitError::PressureRejected { resource },
-            ));
+        Err(error) => {
+            return Err(admission::admit_error_to_query(error));
         }
     };
 
-    Ok(admission::SqlAdmissionGuard::new(permit, work))
+    Ok(admission::SqlAdmissionGuard::new(permit, parent))
 }
 
 /// Best-effort S4B evaluate: live DB reservations, AI semaphore saturation,
@@ -5456,18 +5795,24 @@ fn refresh_node_pressure(state: &AppState) {
     let Ok(mut governor) = state.node_governor.lock() else {
         return;
     };
-    let db_gov = state.db.memory_governor();
     let ai_capacity = default_ai_max_concurrent();
+    let (db_reserved, db_max, db_gov) = match state.try_db() {
+        Ok(db) => {
+            let gov = db.memory_governor();
+            (gov.total_used(), gov.max_bytes(), Some(gov))
+        }
+        Err(_) => (0, governor.governor.max_bytes(), None),
+    };
     let inputs = admission::build_pressure_inputs(&admission::PressureInputSources {
-        db_reserved_bytes: db_gov.total_used(),
-        db_max_bytes: db_gov.max_bytes(),
+        db_reserved_bytes: db_reserved,
+        db_max_bytes: db_max,
         node_configured_max_bytes: governor.governor.max_bytes(),
         tablet_reserved_bytes: governor.tablet_reserved_bytes(),
         ai_capacity,
         ai_available: state.ai_semaphore.available_permits(),
         process_rss_bytes: admission::process_rss_bytes(),
     });
-    admission::refresh_pressure(&mut governor, &inputs, &state.scheduler, Some(db_gov));
+    admission::refresh_pressure(&mut governor, &inputs, &state.scheduler, db_gov);
 }
 
 fn caller_may_manage_query(
@@ -5476,10 +5821,14 @@ fn caller_may_manage_query(
     owner: Option<&str>,
 ) -> bool {
     let current = current_request_principal(state, principal);
+    let catalog_requires_auth = state
+        .try_db()
+        .map(|db| db.require_auth_enabled())
+        .unwrap_or(false);
     if (principal.is_some()
         || state.auth_token.is_some()
         || state.user_auth
-        || state.db.require_auth_enabled())
+        || catalog_requires_auth)
         && current.is_none()
     {
         return false;
@@ -6447,8 +6796,8 @@ async fn continue_sql_page(
         &owner,
         &cursor_mac_key,
         sql_pages::SqlPageBinding {
-            security_version: state.db.security_version(),
-            catalog_epoch: state.db.catalog_snapshot().db_epoch,
+            security_version: state.db().security_version(),
+            catalog_epoch: state.db().catalog_snapshot().db_epoch,
         },
         &query,
     ) {
@@ -6600,6 +6949,22 @@ async fn sql(
     if !request_identity_is_current(&state, &principal) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // P0.2: handle §15 admin SQL before opening any standalone session, so
+    // cluster mode never touches AppState.db for SHOW CLUSTER / TRANSFER LEADER.
+    if let Some(response) = cluster_admin::try_admin_sql(&state, &principal, &req.sql).await {
+        return response;
+    }
+    // P0.2: ordinary public SQL in cluster mode routes through the tablet
+    // data plane (Raft propose / tablet_rows). Unsupported statements and a
+    // missing runtime still fail closed — never AppState.db.
+    if state.is_cluster_mode() {
+        if let Some(response) = cluster_data_plane::try_execute_sql(&state, &req.sql).await {
+            return response;
+        }
+        if let Some(response) = refuse_cluster_standalone_data_plane(&state) {
+            return response;
+        }
+    }
     // Session routing: an `X-Session-ID` header routes the request to a pooled
     // long-lived session, enabling cross-request `BEGIN`/`INSERT`/`COMMIT`
     // transactions. Without the header, a fresh ephemeral session is used
@@ -6734,17 +7099,17 @@ async fn sql(
                     .or(outcome.commit_ts)
                     .or_else(|| {
                         outcome.last_commit_epoch.and_then(|epoch| {
-                            state.db.commit_ts_for_epoch(mongreldb_core::Epoch(epoch))
+                            state.db().commit_ts_for_epoch(mongreldb_core::Epoch(epoch))
                         })
                     })
-                    .unwrap_or_else(|| ryw_commit_timestamp(&state.db)),
+                    .unwrap_or_else(|| ryw_commit_timestamp(state.db())),
             ),
             _ => None,
         });
         response
     } else {
         let session = match MongrelSession::open_with_external_modules_as(
-            Arc::clone(&state.db),
+            Arc::clone(state.db()),
             state.external_modules.iter().cloned(),
             request_principal(&state, &principal),
         ) {
@@ -6879,6 +7244,17 @@ async fn execute_sql(
         drop(sql_permit);
         return (response, None);
     }
+    // P0.2: tablet-routed public SQL (Raft); unsupported still fails closed.
+    if state.is_cluster_mode() {
+        if let Some(response) = cluster_data_plane::try_execute_sql(state, &req.sql).await {
+            drop(sql_permit);
+            return (response, None);
+        }
+        if let Some(response) = refuse_cluster_standalone_data_plane(state) {
+            drop(sql_permit);
+            return (response, None);
+        }
+    }
     // Keep a direct handle until the durable receipt is persisted. Finished
     // tombstone eviction must not make a committed idempotent write ambiguous.
     let idempotency_query = idempotency.as_ref().map(|_| query.clone());
@@ -6886,8 +7262,8 @@ async fn execute_sql(
     let audited = audit::is_audited_sql(&req.sql);
     let actor = request_owner(state, principal);
     let page_binding = sql_pages::SqlPageBinding {
-        security_version: state.db.security_version(),
-        catalog_epoch: state.db.catalog_snapshot().db_epoch,
+        security_version: state.db().security_version(),
+        catalog_epoch: state.db().catalog_snapshot().db_epoch,
     };
     let start = std::time::Instant::now();
     // NOTE: deliberately NOT using `run_sql_traced` here. Its thread-local
@@ -6992,7 +7368,7 @@ async fn execute_sql(
         // ledger's receipt rides the durable HTTP receipt additively; the HTTP
         // store remains the wire authority if the bookkeeping fails.
         if receipt.outcome.committed {
-            let db = Arc::clone(&state.db);
+            let db = Arc::clone(state.db());
             let owner = idempotency.owner().to_owned();
             let key = idempotency.key().to_owned();
             let binding = idempotency.binding().clone();
@@ -7449,7 +7825,7 @@ async fn txn(
                             .into_response()
                     }
                 };
-                let handle = match state.db.table(&op.table) {
+                let handle = match state.db().table(&op.table) {
                     Ok(h) => h,
                     Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
                 };
@@ -7477,7 +7853,7 @@ async fn txn(
     }
 
     state.metrics.inc_txns();
-    let mut transaction = state.db.begin_as(request_principal(&state, &principal));
+    let mut transaction = state.db().begin_as(request_principal(&state, &principal));
     let result = (|| {
         for (table, action) in &parsed {
             match action {

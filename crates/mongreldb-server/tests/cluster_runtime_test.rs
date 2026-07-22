@@ -19,7 +19,9 @@ use mongreldb_cluster::tablet::{
 use mongreldb_core::Database;
 use mongreldb_log::commit_log::ExecutionControl;
 use mongreldb_server::cluster_runtime::{ClusterRuntimeHandle, ClusterRuntimeOptions};
-use mongreldb_server::{build_app, build_app_full, build_app_with_sessions_control_and_cluster};
+use mongreldb_server::{
+    build_app, build_app_full, build_app_with_storage, ServerStorageRuntime,
+};
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::{
     DatabaseId, MetadataVersion, NodeId, RaftGroupId, SchemaVersion, TableId, TabletId,
@@ -153,7 +155,6 @@ async fn live_runtime_status_and_missing_tablet_ops() {
     let data = directory.path();
     let listen = free_addr();
     let identity = bootstrap_cluster(data, &listen);
-    let database = Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
 
     let handle = ClusterRuntimeHandle::start(ClusterRuntimeOptions {
         node_data: data.to_path_buf(),
@@ -164,20 +165,23 @@ async fn live_runtime_status_and_missing_tablet_ops() {
     .await
     .expect("plaintext runtime starts after cluster init");
 
+    // P0.2: cluster AppState has no peer standalone user database. Use bearer
+    // token admin for the control plane (no catalog user-auth dual-root).
     let sessions = Arc::new(mongreldb_server::SessionStore::new(
         32,
         Duration::from_secs(60),
     ));
-    let (app, control) = build_app_with_sessions_control_and_cluster(
-        Arc::clone(&database),
+    let (app, control) = build_app_with_storage(
+        ServerStorageRuntime::cluster(handle),
         std::iter::empty(),
+        Some("cluster-token".into()),
         None,
-        None,
-        true,
+        false,
         sessions,
-        Some(handle),
     );
-    let admin = "Basic YWRtaW46YWRtaW4tcHc=";
+    let admin = "Bearer cluster-token";
+    assert!(control.storage().is_cluster());
+    assert!(control.storage().standalone_db().is_none());
 
     let status_response = app
         .clone()
@@ -257,7 +261,6 @@ async fn transfer_leader_on_live_single_replica_tablet() {
     let data = directory.path();
     let listen = free_addr();
     let identity = bootstrap_cluster(data, &listen);
-    let database = Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
 
     let handle = ClusterRuntimeHandle::start(ClusterRuntimeOptions {
         node_data: data.to_path_buf(),
@@ -276,16 +279,15 @@ async fn transfer_leader_on_live_single_replica_tablet() {
         32,
         Duration::from_secs(60),
     ));
-    let (app, control) = build_app_with_sessions_control_and_cluster(
-        database,
+    let (app, control) = build_app_with_storage(
+        ServerStorageRuntime::cluster(handle),
         std::iter::empty(),
+        Some("cluster-token".into()),
         None,
-        None,
-        true,
+        false,
         sessions,
-        Some(handle),
     );
-    let admin = "Basic YWRtaW46YWRtaW4tcHc=";
+    let admin = "Bearer cluster-token";
 
     // Transfer to self is a documented no-op success on a single-voter group.
     let (code, body) = sql_json(

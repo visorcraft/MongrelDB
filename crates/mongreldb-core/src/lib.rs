@@ -27,6 +27,7 @@ pub mod cursor;
 pub mod database;
 pub mod durable_file;
 pub mod embedding;
+pub mod embedding_jobs;
 pub mod encryption;
 pub mod engine;
 pub mod epoch;
@@ -63,6 +64,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod security;
 pub mod security_hardening;
+pub mod service_principal;
 pub mod sorted_run;
 pub mod spill;
 pub mod storage_mode;
@@ -92,8 +94,9 @@ pub use catalog::{
 };
 pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
 pub use certification::{
-    ArchitectureQualification, ArchitectureStatus, CertificationManifest, CertificationStatus,
-    CertificationTest,
+    ArchitectureQualification, ArchitectureStage, ArchitectureStatus, CertificationManifest,
+    CertificationStatus, CertificationTest, EvidenceClass, MANDATORY_ARCHITECTURE_TASK_IDS,
+    RESIDUAL_ALIAS_TASK_IDS,
 };
 pub use cluster_import::{
     cluster_import_prepare, hash_rows_canonical, ImportPlan, ImportTablePlan,
@@ -110,23 +113,32 @@ pub use database::{
 pub use embedding::{
     EmbeddingError, EmbeddingFailurePolicy, EmbeddingFuture, EmbeddingGenerationStatus,
     EmbeddingLimits, EmbeddingModelMeta, EmbeddingNormalization, EmbeddingProvider,
-    EmbeddingProviderRegistry, EmbeddingRequest, EmbeddingResponse, EmbeddingSource,
-    FixedVectorProvider, GeneratedEmbeddingMetadata, GeneratedEmbeddingSpec,
+    EmbeddingProviderRef, EmbeddingProviderRegistry, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingSource, FixedVectorProvider, GeneratedEmbeddingMetadata, GeneratedEmbeddingSpec,
     GeneratedEmbeddingValue, ProviderExecutionMode, ProviderHealth, ProviderStatus,
+    TextRetrieveProvenance, TextRetrieveResult, TextSearchOptions,
+};
+pub use embedding_jobs::{
+    check_provider_readiness, embedding_status_is_ann_eligible, EmbeddingGenerationSlot,
+    EmbeddingJob, ProviderReadiness, ProviderReadinessEntry, ProviderReadinessReport,
+    ReEmbeddingCoordinator, ReEmbeddingJob, ReEmbeddingState,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult,
     IndexBuildPolicy, NativeAgg, NativeAggResult, ReadGeneration, Table, TableDeltas,
 };
-pub use epoch::{Epoch, EpochAuthority, EpochClock, MaintenanceReceipt, Snapshot};
+pub use epoch::{Epoch, EpochAuthority, EpochClock, GcFloor, MaintenanceReceipt, Snapshot};
 pub use error::{MongrelError, Result};
 pub use execution::{CancellationReason, ExecutionControl};
 pub use external_table::{
     ExternalTableDefinition, ExternalTableEntry, ModuleArg, ModuleCapabilities,
 };
 pub use gc::{CheckReport, DoctorReport, GcReport, GcVersionsReport};
-pub use handle::{DatabaseHandle, HandleAccess, HandleIdentity, OpenIdentity, SecretString};
+pub use handle::{
+    AuthorizedMongrelSession, AuthorizedSession, AuthorizedTransaction, DatabaseHandle,
+    HandleAccess, HandleIdentity, OpenIdentity, SecretString,
+};
 pub use index::{
     AnnDistance, AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex,
     IndexFamilyGeneration, IndexGeneration, LearnedIndex, SparseIndex,
@@ -216,6 +228,7 @@ pub use schema::{
 pub use security::{
     ColumnMask, MaskStrategy, PolicyCommand, RowPolicy, SecurityCatalog, SecurityExpr,
 };
+pub use service_principal::{ServicePrincipalDefinition, ServicePrincipalStore};
 pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,

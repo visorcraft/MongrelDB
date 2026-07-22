@@ -1222,7 +1222,7 @@ mod tests {
         let handle = db.table(table).unwrap();
         let table = handle.lock();
         table
-            .visible_rows(Snapshot::at(table.current_epoch()))
+            .visible_rows(db.snapshot_for_epoch(table.current_epoch()))
             .unwrap()
             .into_iter()
             .find(|row| row.columns.get(&1) == Some(&Value::Int64(id)))
@@ -1354,8 +1354,11 @@ mod tests {
         let table = handle.lock();
         assert!(table.schema().indexes.is_empty());
         // Rows remain.
-        let rows = table
-            .visible_rows(Snapshot::at(table.current_epoch()))
+        let epoch = table.current_epoch();
+        drop(table);
+        let rows = handle
+            .lock()
+            .visible_rows(db.snapshot_for_epoch(epoch))
             .unwrap();
         assert_eq!(rows.len(), 1);
     }

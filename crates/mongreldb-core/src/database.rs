@@ -968,6 +968,7 @@ mod spilled_wal_encoding_tests {
             .map(|row_id| crate::memtable::Row {
                 row_id: crate::rowid::RowId(row_id),
                 committed_epoch: Epoch::ZERO,
+                commit_ts: None,
                 columns: [(1, Value::Bytes(vec![0; 64]))].into_iter().collect(),
                 deleted: false,
             })
@@ -1842,6 +1843,10 @@ pub struct DatabaseCore {
     /// backends). Empty by default — dense ANN uses application-supplied
     /// vectors; sparse retrieval needs no provider.
     embedding_providers: crate::embedding::EmbeddingProviderRegistry,
+    /// Authenticated service-principal definitions for shared-handle open
+    /// (P0.1). Authority is stored here and re-resolved live per operation;
+    /// callers cannot supply their own permission vectors on attach.
+    pub(crate) service_principals: crate::service_principal::ServicePrincipalStore,
     /// S1F-002: the durable job registry (sibling `JOBS` file). Exactly one
     /// per core; jobs recovered mid-`Running` by a crash come back `Paused`.
     job_registry: Arc<crate::jobs::JobRegistry>,
@@ -2303,6 +2308,25 @@ impl Database {
             auth_state: crate::auth_state::AuthState::new(require_auth, principal),
             shared,
         }
+    }
+
+    /// Rebind this facade's principal to the live service-principal definition
+    /// (P0.1). Called by [`crate::handle::DatabaseHandle`] after each
+    /// `resolve_live` so subsequent require/txn checks see current scopes.
+    pub(crate) fn rebind_service_principal(
+        &self,
+        def: &crate::service_principal::ServicePrincipalDefinition,
+    ) {
+        let principal = crate::auth::Principal {
+            user_id: 0,
+            created_epoch: def.creation_version,
+            username: format!("service:{}", def.token_id),
+            is_admin: false,
+            roles: Vec::new(),
+            permissions: def.permissions.clone(),
+        };
+        *self.principal.write() = Some(principal.clone());
+        self.auth_state.set_principal(Some(principal));
     }
 
     /// Consume this owner and yield the shared core (keeps the core alive).
@@ -4018,6 +4042,7 @@ impl Database {
                     txn_ids: Arc::clone(&txn_ids),
                     change_wake: change_wake.clone(),
                     lifecycle: Arc::clone(&lifecycle),
+                    hlc: Arc::clone(&hlc),
                 }),
                 table_name: Some(entry.name.clone()),
                 auth: auth_checker.clone(),
@@ -4092,6 +4117,7 @@ impl Database {
             spill_manager,
             resource_groups: crate::resource::ResourceGroupRegistry::with_defaults(),
             embedding_providers: crate::embedding::EmbeddingProviderRegistry::new(),
+            service_principals: crate::service_principal::ServicePrincipalStore::new(),
             job_registry,
             commit_lock,
             kms_rotation_lock: Mutex::new(()),
@@ -4214,7 +4240,7 @@ impl Database {
         };
         let fallback_control = crate::ExecutionControl::new(None);
         let control = control.unwrap_or(&fallback_control);
-        for (table_id, staged) in staging {
+        for (table_id, staged) in &mut *staging {
             let (cells, mut update_changed_columns) = match staged {
                 crate::txn::Staged::Put(cells) => (cells, None),
                 crate::txn::Staged::Update {
@@ -4255,10 +4281,16 @@ impl Database {
                     })?;
                 let source =
                     crate::embedding::EmbeddingSource::GeneratedColumnSpec { spec: spec.clone() };
-                let provider = self
+                let (registry_generation, provider) = self
                     .embedding_providers
-                    .resolve(&source)
+                    .resolve_with_generation(&source)
                     .map_err(embedding_error)?;
+                let semantic_identity = provider.semantic_identity();
+                self.ensure_ann_semantic_identity_compatible(
+                    *table_id,
+                    target.id,
+                    &semantic_identity,
+                )?;
                 let vectors = self
                     .embedding_providers
                     .embed_controlled(
@@ -4287,6 +4319,8 @@ impl Database {
                                 status: crate::embedding::EmbeddingGenerationStatus::Ready,
                                 last_error_category: None,
                                 attempt_count: 1,
+                                semantic_identity,
+                                provider_registry_generation: registry_generation,
                             },
                         },
                     )),
@@ -4298,6 +4332,59 @@ impl Database {
             if let Some(changed_columns) = update_changed_columns {
                 changed_columns.sort_unstable();
                 changed_columns.dedup();
+            }
+        }
+        self.validate_staged_generated_embedding_identities(staging)?;
+        Ok(())
+    }
+
+    fn ensure_ann_semantic_identity_compatible(
+        &self,
+        table_id: u64,
+        column_id: u16,
+        identity: &crate::embedding::EmbeddingProviderRef,
+    ) -> Result<()> {
+        let tables = self.tables.read();
+        let Some(handle) = tables.get(&table_id) else {
+            return Ok(());
+        };
+        let table = handle.lock();
+        let Some(ann) = table.ann_index(column_id) else {
+            return Ok(());
+        };
+        if let Some(existing) = ann.semantic_identity() {
+            if existing != identity {
+                return Err(embedding_error(
+                    crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
+                        column_id,
+                        expected: existing.fingerprint_sha256(),
+                        got: identity.fingerprint_sha256(),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_staged_generated_embedding_identities(
+        &self,
+        staging: &[(u64, crate::txn::Staged)],
+    ) -> Result<()> {
+        for (table_id, staged) in staging {
+            let cells = match staged {
+                crate::txn::Staged::Put(cells) => cells.as_slice(),
+                crate::txn::Staged::Update { new_row, .. } => new_row.as_slice(),
+                crate::txn::Staged::Delete(_) | crate::txn::Staged::Truncate => continue,
+            };
+            for (column_id, value) in cells {
+                let Some(meta) = value.generated_embedding_metadata() else {
+                    continue;
+                };
+                self.ensure_ann_semantic_identity_compatible(
+                    *table_id,
+                    *column_id,
+                    &meta.semantic_identity,
+                )?;
             }
         }
         Ok(())
@@ -4365,6 +4452,53 @@ impl Database {
                 }
             })
             .collect()
+    }
+
+    /// P0.5-T6: HLC GC floor with named pin sources, projected through the
+    /// durable commit-ts ledger when an epoch pin has a stamp.
+    ///
+    /// Sources without an active pin or without a durable HLC projection
+    /// report [`HlcTimestamp::ZERO`](mongreldb_types::hlc::HlcTimestamp::ZERO).
+    /// Physical reclamation still gates on the epoch floor; this is the HLC
+    /// diagnostic / cutover surface.
+    pub fn hlc_gc_floor(&self) -> crate::epoch::GcFloor {
+        let mut combined = crate::epoch::GcFloor::ZERO;
+        // Database-level transaction / history pins (shared SnapshotRegistry).
+        if let Some(epoch) = self.snapshots.min_pinned() {
+            if let Some(ts) = self.commit_ts_for_epoch(epoch) {
+                combined.transaction_snapshot = ts;
+            }
+        }
+        if let Some(epoch) = self.snapshots.history_floor(self.epoch.visible()) {
+            if let Some(ts) = self.commit_ts_for_epoch(epoch) {
+                combined.history_retention = ts;
+            }
+        }
+        // Merge per-table pin registry projections (min of non-zero).
+        let handles: Vec<_> = self.tables.read().values().cloned().collect();
+        for handle in handles {
+            let table_floor = handle
+                .lock()
+                .hlc_gc_floor(|epoch| self.commit_ts_for_epoch(epoch));
+            for (label, ts) in table_floor.sources() {
+                if ts == mongreldb_types::hlc::HlcTimestamp::ZERO {
+                    continue;
+                }
+                let slot = match label {
+                    "transaction_snapshot" => &mut combined.transaction_snapshot,
+                    "history_retention" => &mut combined.history_retention,
+                    "backup_pitr" => &mut combined.backup_pitr,
+                    "replication" => &mut combined.replication,
+                    "read_generation" => &mut combined.read_generation,
+                    "online_index_build" => &mut combined.online_index_build,
+                    _ => continue,
+                };
+                if *slot == mongreldb_types::hlc::HlcTimestamp::ZERO || ts < *slot {
+                    *slot = ts;
+                }
+            }
+        }
+        combined
     }
 
     /// The core's key/predicate lock manager (S1B-003).
@@ -4478,6 +4612,11 @@ impl Database {
     /// `begin` captures read timestamps here; the commit sequencer allocates
     /// commit timestamps from the same clock so commit ts > every participant
     /// read/write timestamp of the transaction.
+    /// Shared HLC clock for this core (P0.5 / cluster apply stamping).
+    pub fn hlc(&self) -> &mongreldb_types::hlc::HlcClock {
+        self.hlc_clock()
+    }
+
     pub(crate) fn hlc_clock(&self) -> &mongreldb_types::hlc::HlcClock {
         &self.hlc
     }
@@ -4887,6 +5026,9 @@ impl Database {
     /// stamped sequence verbatim. Rows are restamped at that epoch by the
     /// recovery logic, becoming visible exactly as an ordinary committed
     /// transaction's rows.
+    ///
+    /// Alias: [`Self::apply_committed_transaction`] — same semantics under the
+    /// audit's apply-API name (P0.5-T4).
     pub fn apply_staged_txn_writes(
         &self,
         txn_tag: u64,
@@ -4910,7 +5052,31 @@ impl Database {
         let mut records = Vec::with_capacity(writes.len() + 2);
         for write in writes {
             let op = match write {
-                StagedTxnWrite::Put { table_id, rows } => Op::Put { table_id, rows },
+                StagedTxnWrite::Put { table_id, rows } => {
+                    // P0.5: stamp the shared decision HLC onto every staged row
+                    // version so live apply and WAL recovery observe the same
+                    // commit_ts (replicas never allocate a replacement stamp).
+                    let mut decoded: Vec<crate::memtable::Row> = bincode::deserialize(&rows)
+                        .map_err(|e| {
+                            MongrelError::Other(format!(
+                                "staged txn put rows could not be decoded: {e}"
+                            ))
+                        })?;
+                    for row in &mut decoded {
+                        // Never stamp HLC::ZERO — that would pin versions under a
+                        // zero snapshot and hide them from product reads (P0.5).
+                        if commit_ts != mongreldb_types::hlc::HlcTimestamp::ZERO {
+                            row.commit_ts = Some(commit_ts);
+                        }
+                    }
+                    let stamped = bincode::serialize(&decoded).map_err(|e| {
+                        MongrelError::Other(format!("staged txn put rows serialize: {e}"))
+                    })?;
+                    Op::Put {
+                        table_id,
+                        rows: stamped,
+                    }
+                }
                 StagedTxnWrite::Delete { table_id, row_ids } => Op::Delete {
                     table_id,
                     row_ids: row_ids.into_iter().map(crate::RowId).collect(),
@@ -4937,10 +5103,25 @@ impl Database {
             },
         ));
         let applied = self.apply_replicated_records(&records)?;
-        if applied {
+        if applied && commit_ts != mongreldb_types::hlc::HlcTimestamp::ZERO {
+            // Ledger + recovery restamp use the shared decision HLC so every
+            // replica observes the identical commit_ts (P0.5-T4 / P0.5-X1).
             self.record_commit_ts(Epoch(epoch), commit_ts);
         }
         Ok(applied)
+    }
+
+    /// Apply a committed distributed transaction at a shared `commit_ts`
+    /// (P0.5-T4). Replicas must not allocate a local replacement timestamp —
+    /// the caller's decision HLC is stamped into the durable ledger and onto
+    /// every row version recovered from the synthetic WAL records.
+    pub fn apply_committed_transaction(
+        &self,
+        transaction_id: u64,
+        commit_ts: mongreldb_types::hlc::HlcTimestamp,
+        operations: &[Vec<u8>],
+    ) -> Result<bool> {
+        self.apply_staged_txn_writes(transaction_id, operations, commit_ts)
     }
 
     /// Stage 2E (spec sections 10.6, 11.5): apply one committed replicated
@@ -5026,6 +5207,7 @@ impl Database {
                 txn_ids: Arc::clone(&self.next_txn_id),
                 change_wake: self.change_wake.clone(),
                 lifecycle: Arc::clone(&self.lifecycle),
+                hlc: Arc::clone(&self.hlc),
             }),
             table_name: Some(entry.name.clone()),
             auth: self.table_auth_checker(),
@@ -6678,6 +6860,7 @@ impl Database {
                     let row = crate::memtable::Row {
                         row_id: hit.row_id,
                         committed_epoch: crate::Epoch(0),
+                        commit_ts: None,
                         columns: hit
                             .cells
                             .iter()
@@ -6697,6 +6880,187 @@ impl Database {
                 Ok(secured)
             },
         )
+    }
+
+    /// Embed `text` with the active semantic identity for `embedding_column` and
+    /// run ANN retrieval, returning hits plus query provenance (P0.7).
+    pub fn retrieve_text(
+        &self,
+        table: &str,
+        embedding_column: u16,
+        text: &str,
+        search_options: crate::embedding::TextSearchOptions,
+    ) -> Result<crate::embedding::TextRetrieveResult> {
+        let principal = self.principal_snapshot();
+        self.retrieve_text_for_principal(
+            table,
+            embedding_column,
+            text,
+            search_options,
+            principal.as_ref(),
+        )
+    }
+
+    pub fn retrieve_text_for_principal(
+        &self,
+        table: &str,
+        embedding_column: u16,
+        text: &str,
+        search_options: crate::embedding::TextSearchOptions,
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<crate::embedding::TextRetrieveResult> {
+        if search_options.k == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "retrieve_text k must be greater than zero".into(),
+            ));
+        }
+        let catalog_bound = principal.is_some_and(|p| p.user_id != 0);
+        let (semantic_identity, registry_generation, expected_dim) = {
+            let handle = self.table(table)?;
+            let mut g = handle.lock();
+            g.ensure_indexes_complete()?;
+            let schema = g.schema().clone();
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.id == embedding_column)
+                .ok_or_else(|| {
+                    MongrelError::ColumnNotFound(format!(
+                        "embedding column {embedding_column} not found on table {table}"
+                    ))
+                })?;
+            let dim = match column.ty {
+                crate::schema::TypeId::Embedding { dim } => dim,
+                _ => {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column {embedding_column} is not an embedding column"
+                    )))
+                }
+            };
+            if let Some(identity) = g
+                .ann_index(embedding_column)
+                .and_then(|a| a.semantic_identity().cloned())
+            {
+                let (generation, provider) = self
+                    .embedding_providers
+                    .resolve_by_semantic_identity(&identity)
+                    .map_err(embedding_error)?;
+                if provider.dimension() != dim {
+                    return Err(embedding_error(
+                        crate::embedding::EmbeddingError::DimensionMismatch {
+                            expected: dim,
+                            got: provider.dimension(),
+                        },
+                    ));
+                }
+                (identity, generation, dim)
+            } else {
+                let source = column.embedding_source.clone().ok_or_else(|| {
+                    embedding_error(crate::embedding::EmbeddingError::NoActiveAnnIdentity(
+                        embedding_column,
+                    ))
+                })?;
+                let (generation, provider) = self
+                    .embedding_providers
+                    .resolve_with_generation(&source)
+                    .map_err(embedding_error)?;
+                let identity = provider.semantic_identity();
+                if identity.dimension != dim {
+                    return Err(embedding_error(
+                        crate::embedding::EmbeddingError::DimensionMismatch {
+                            expected: dim,
+                            got: identity.dimension,
+                        },
+                    ));
+                }
+                (identity, generation, dim)
+            }
+        };
+        let (_g, provider) = self
+            .embedding_providers
+            .resolve_by_semantic_identity(&semantic_identity)
+            .map_err(embedding_error)?;
+        let control = crate::ExecutionControl::new(None);
+        let response = provider
+            .embed(crate::embedding::EmbeddingRequest {
+                texts: &[text],
+                control: &control,
+                trace_id: "retrieve-text",
+            })
+            .map_err(embedding_error)?;
+        crate::embedding::validate_response(
+            provider.as_ref(),
+            1,
+            expected_dim,
+            crate::embedding::EmbeddingLimits::default(),
+            &response.vectors,
+        )
+        .map_err(embedding_error)?;
+        let query = response.vectors.into_iter().next().ok_or_else(|| {
+            MongrelError::Other("embedding provider returned no query vector".into())
+        })?;
+        if provider.semantic_identity() != semantic_identity {
+            return Err(embedding_error(
+                crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
+                    column_id: embedding_column,
+                    expected: semantic_identity.fingerprint_sha256(),
+                    got: provider.semantic_identity().fingerprint_sha256(),
+                },
+            ));
+        }
+        let retriever = crate::query::Retriever::Ann {
+            column_id: embedding_column,
+            query,
+            k: search_options.k,
+        };
+        let hits = self.with_authorized_scored_read_context_at(
+            table,
+            principal,
+            catalog_bound,
+            Some(&ReadAuthorization {
+                operation: crate::auth::ColumnOperation::Select,
+                columns: vec![embedding_column],
+                permissions: Vec::new(),
+            }),
+            None,
+            None,
+            |table_guard, snapshot, authorization, principal| {
+                self.require_columns_for(
+                    table,
+                    crate::auth::ColumnOperation::Select,
+                    &[embedding_column],
+                    principal,
+                )?;
+                if let Some(ann) = table_guard.ann_index(embedding_column) {
+                    if let Some(active) = ann.semantic_identity() {
+                        if active != &semantic_identity {
+                            return Err(embedding_error(
+                                crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
+                                    column_id: embedding_column,
+                                    expected: semantic_identity.fingerprint_sha256(),
+                                    got: active.fingerprint_sha256(),
+                                },
+                            ));
+                        }
+                    }
+                }
+                table_guard.retrieve_at_with_candidate_authorization_on_generation(
+                    &retriever,
+                    snapshot,
+                    authorization,
+                    None,
+                )
+            },
+        )?;
+        Ok(crate::embedding::TextRetrieveResult {
+            hits,
+            provenance: crate::embedding::TextRetrieveProvenance {
+                semantic_identity,
+                provider_registry_generation: registry_generation,
+                query_source_fingerprint: Sha256::digest(text.as_bytes()).into(),
+                embedding_column,
+            },
+        })
     }
 
     /// Capture one table snapshot and the security version used to authorize it.
@@ -10076,7 +10440,7 @@ impl Database {
             .as_ref()
             .is_some_and(|principal| principal.user_id != 0);
         let txn_id = self.alloc_txn_id();
-        let read = Snapshot::at(self.epoch.visible());
+        let read = self.visible_snapshot();
         crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
             .with_principal(principal, catalog_bound)
     }
@@ -10087,9 +10451,9 @@ impl Database {
         level: crate::txn::IsolationLevel,
     ) -> crate::txn::Transaction<'_> {
         let txn_id = self.alloc_txn_id();
-        // Every level pins the current visible epoch at begin; ReadCommitted
-        // re-pins per statement inside the transaction (S1B-002).
-        let read = Snapshot::at(self.epoch.visible());
+        // Every level pins the current visible epoch + HLC at begin; ReadCommitted
+        // re-pins per statement inside the transaction (S1B-002 / P0.5).
+        let read = self.visible_snapshot();
         let (principal, catalog_bound) = self.transaction_principal_snapshot();
         crate::txn::Transaction::new(self, txn_id, read, level)
             .with_principal(principal, catalog_bound)
@@ -10102,7 +10466,7 @@ impl Database {
         bridge: &'a dyn ExternalTriggerBridge,
     ) -> crate::txn::Transaction<'a> {
         let txn_id = self.alloc_txn_id();
-        let read = Snapshot::at(self.epoch.visible());
+        let read = self.visible_snapshot();
         let (principal, catalog_bound) = self.transaction_principal_snapshot();
         crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
             .with_external_trigger_bridge(bridge)
@@ -10118,7 +10482,7 @@ impl Database {
             .as_ref()
             .is_some_and(|principal| principal.user_id != 0);
         let txn_id = self.alloc_txn_id();
-        let read = Snapshot::at(self.epoch.visible());
+        let read = self.visible_snapshot();
         crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
             .with_external_trigger_bridge(bridge)
             .with_principal(principal, catalog_bound)
@@ -10687,7 +11051,7 @@ impl Database {
         use crate::txn::Staged;
         use std::collections::{HashMap, VecDeque};
 
-        let snapshot = Snapshot::at(read_epoch);
+        let snapshot = self.snapshot_for_epoch(read_epoch);
         let cat = self.catalog.read();
         let mut table_names = HashMap::new();
         let mut table_schemas = HashMap::new();
@@ -10989,7 +11353,7 @@ impl Database {
                                 ))
                             })?;
                         let handle = self.table(table)?;
-                        let snapshot = Snapshot::at(self.epoch.visible());
+                        let snapshot = self.snapshot_for_epoch(self.epoch.visible());
                         let old = handle.lock().get(row_id, snapshot).ok_or_else(|| {
                             MongrelError::NotFound(format!(
                                 "trigger {:?} update target not visible",
@@ -11046,7 +11410,7 @@ impl Database {
                     conditions,
                 } => {
                     let schema = self.table(table)?.lock().schema().clone();
-                    let snapshot = Snapshot::at(read_epoch);
+                    let snapshot = self.snapshot_for_epoch(read_epoch);
                     let handle = self.table(table)?;
                     let rows = match control {
                         Some(control) => {
@@ -11113,7 +11477,7 @@ impl Database {
                 }
                 TriggerStep::DeleteWhere { table, conditions } => {
                     let schema = self.table(table)?.lock().schema().clone();
-                    let snapshot = Snapshot::at(read_epoch);
+                    let snapshot = self.snapshot_for_epoch(read_epoch);
                     let handle = self.table(table)?;
                     let rows = match control {
                         Some(control) => {
@@ -11149,7 +11513,7 @@ impl Database {
                     cells,
                 } => {
                     let schema = self.table(table)?.lock().schema().clone();
-                    let snapshot = Snapshot::at(read_epoch);
+                    let snapshot = self.snapshot_for_epoch(read_epoch);
                     let handle = self.table(table)?;
                     let rows = match control {
                         Some(control) => {
@@ -11392,7 +11756,9 @@ impl Database {
         use std::collections::HashSet;
 
         commit_prepare_checkpoint(control, 0)?;
-        let snapshot = Snapshot::at(read_epoch);
+        // P0.5: constraint checks must use an HLC-pinned snapshot so parent /
+        // unique rows stamped with commit_ts remain visible.
+        let snapshot = self.snapshot_for_epoch(read_epoch);
         let cat = self.catalog.read().clone();
 
         // Collect live (id, name, constraints-bearing?) for staged tables.
@@ -12126,7 +12492,7 @@ impl Database {
                     let old = self
                         .table_by_id(*table_id)?
                         .lock()
-                        .get(*row_id, Snapshot::at(read_epoch))
+                        .get(*row_id, self.snapshot_for_epoch(read_epoch))
                         .ok_or_else(|| {
                             MongrelError::NotFound(format!("row {} not found", row_id.0))
                         })?;
@@ -12143,7 +12509,7 @@ impl Database {
                     let old = self
                         .table_by_id(*table_id)?
                         .lock()
-                        .get(*row_id, Snapshot::at(read_epoch))
+                        .get(*row_id, self.snapshot_for_epoch(read_epoch))
                         .ok_or_else(|| {
                             MongrelError::NotFound(format!("row {} not found", row_id.0))
                         })?;
@@ -12699,7 +13065,7 @@ impl Database {
                             prebuilt[index] = Some(row);
                         }
                         Staged::Delete(row_id) => {
-                            delete_images[index] = t.get(*row_id, Snapshot::at(read_epoch));
+                            delete_images[index] = t.get(*row_id, self.snapshot_for_epoch(read_epoch));
                         }
                         Staged::Put(_) | Staged::Truncate => {}
                         Staged::Update { .. } => {
@@ -12889,12 +13255,26 @@ impl Database {
         // records are serialized. Build them before taking the shared WAL
         // lock, and cap their aggregate memory/WAL footprint.
         let new_epoch = self.epoch.assigned().next();
+        // S1B-004 step 5 / P0.5: allocate the commit HLC under the sequencer
+        // lock *before* durable row payloads are encoded so every Put /
+        // SpilledRows version carries the same commit_ts as the receipt.
+        // Spec §8.2: strictly greater than every participant read/write
+        // timestamp captured at `begin`.
+        let commit_ts = match context.read_ts {
+            Some(read_ts) => self.hlc.commit_timestamp([read_ts]),
+            None => self.hlc.now().map_err(|skew| {
+                MongrelError::Other(format!(
+                    "clock skew rejected commit timestamp allocation: {skew}"
+                ))
+            })?,
+        };
         let mut spilled_wal_bytes = 0;
         let mut spilled_wal_records = Vec::<(u64, Op)>::new();
         let spill_prepare = (|| {
             for run in &mut spilled {
                 for row in &mut run.rows {
                     row.committed_epoch = new_epoch;
+                    row.commit_ts = Some(commit_ts);
                 }
                 for rows in encode_spilled_row_chunks(
                     &run.rows,
@@ -13015,6 +13395,7 @@ impl Database {
                                 )
                             })?;
                             row.committed_epoch = new_epoch;
+                            row.commit_ts = Some(commit_ts);
                             rows.push(row);
                             index += 1;
                         }
@@ -13154,21 +13535,9 @@ impl Database {
                 ));
             }
 
-            // S1B-004 steps 5–6: assign the commit timestamp (spec §8.2:
-            // strictly greater than every participant read/write timestamp of
-            // this transaction — the transaction's HLC read timestamp captured
-            // at `begin` is threaded through the commit context) and enter
-            // commit-critical state before the proposal can become durable.
-            // Internal commits with no transaction timestamp allocate from the
-            // fail-closed clock gate instead.
-            let commit_ts = match context.read_ts {
-                Some(read_ts) => self.hlc.commit_timestamp([read_ts]),
-                None => self.hlc.now().map_err(|skew| {
-                    MongrelError::Other(format!(
-                        "clock skew rejected commit timestamp allocation: {skew}"
-                    ))
-                })?,
-            };
+            // S1B-004 step 6: enter commit-critical before the proposal can
+            // become durable. The HLC commit_ts was allocated above under the
+            // commit lock so every row payload already carries it.
             // FND-006: `txn.decision.before` fires immediately before the
             // durable commit decision (enter CommitCritical / WAL proposal).
             // A Fail aborts while still Preparing — nothing durable yet.
@@ -13260,7 +13629,7 @@ impl Database {
                         StagedOp::Put(rows) => t.apply_put_rows_prepared(rows),
                         StagedOp::Delete(row_ids) => {
                             for row_id in row_ids {
-                                t.apply_delete(row_id, new_epoch);
+                                t.apply_delete_at(row_id, new_epoch, Some(commit_ts));
                             }
                         }
                         StagedOp::Truncate => t.apply_truncate(new_epoch),
@@ -13350,20 +13719,40 @@ impl Database {
         Ok((new_epoch, committed_row_ids))
     }
 
-    /// Register a read snapshot at the current visible epoch and return it with
-    /// a guard that retains it for GC until dropped.
+    /// Build an HLC-authoritative snapshot at the current visible watermark
+    /// (P0.5). Prefers the durable receipt HLC for the visible epoch; falls
+    /// back to the live clock so HLC-stamped rows remain comparable.
+    pub fn visible_snapshot(&self) -> Snapshot {
+        self.snapshot_for_epoch(self.epoch.visible())
+    }
+
+    /// Build an HLC-pinned snapshot at a specific commit epoch (P0.5).
+    ///
+    /// Prefer the durable ledger stamp for `epoch`, then the live HLC clock,
+    /// then [`HlcTimestamp::MAX`] so HLC-stamped versions remain readable.
+    pub fn snapshot_for_epoch(&self, epoch: Epoch) -> Snapshot {
+        let commit_ts = self
+            .commit_ts_for_epoch(epoch)
+            .filter(|ts| *ts != mongreldb_types::hlc::HlcTimestamp::ZERO)
+            .or_else(|| self.hlc.now().ok())
+            .unwrap_or(mongreldb_types::hlc::HlcTimestamp::MAX);
+        Snapshot::at_hlc(epoch, commit_ts)
+    }
+
+    /// Register a read snapshot at the current visible epoch + HLC and return
+    /// it with a guard that retains it for GC until dropped.
     pub fn snapshot(&self) -> (Snapshot, SnapshotGuard<'_>) {
-        let e = self.epoch.visible();
-        let g = self.snapshots.register(e);
-        (Snapshot::at(e), g)
+        let snap = self.visible_snapshot();
+        let g = self.snapshots.register(snap.epoch);
+        (snap, g)
     }
 
     /// Owned (clonable-handle) variant of [`Self::snapshot`] for cross-thread
     /// retention.
     pub fn snapshot_owned(&self) -> (Snapshot, OwnedSnapshotGuard) {
-        let e = self.epoch.visible();
-        let g = self.snapshots.register_owned(e);
-        (Snapshot::at(e), g)
+        let snap = self.visible_snapshot();
+        let g = self.snapshots.register_owned(snap.epoch);
+        (snap, g)
     }
 
     /// Configure a rolling history window measured in prior commit epochs.
@@ -13409,6 +13798,8 @@ impl Database {
 
     /// Pin a guaranteed historical epoch for the lifetime of the returned
     /// guard. Rejects future epochs and epochs outside the configured window.
+    /// When a durable HLC receipt exists for `epoch`, the snapshot is
+    /// HLC-authoritative (`at_hlc`); otherwise it falls back to epoch-only.
     pub fn snapshot_at_owned(&self, epoch: Epoch) -> Result<(Snapshot, OwnedSnapshotGuard)> {
         let current = self.epoch.visible();
         if epoch > current {
@@ -13425,7 +13816,11 @@ impl Database {
             )));
         }
         let guard = self.snapshots.register_owned(epoch);
-        Ok((Snapshot::at(epoch), guard))
+        let snap = match self.commit_ts_for_epoch(epoch) {
+            Some(commit_ts) => Snapshot::at_hlc(epoch, commit_ts),
+            None => Snapshot::at(epoch),
+        };
+        Ok((snap, guard))
     }
 
     /// Names of all live tables.
@@ -13814,6 +14209,7 @@ impl Database {
                 txn_ids: Arc::clone(&self.next_txn_id),
                 change_wake: self.change_wake.clone(),
                 lifecycle: Arc::clone(&self.lifecycle),
+                hlc: Arc::clone(&self.hlc),
             }),
             table_name: Some(name.to_string()),
             auth: self.table_auth_checker(),
@@ -14733,7 +15129,7 @@ impl Database {
                 && !next_flags.contains(crate::schema::ColumnFlags::NULLABLE)
                 && old.default_value.is_some()
             {
-                let snapshot = Snapshot::at(self.epoch.visible());
+                let snapshot = self.snapshot_for_epoch(self.epoch.visible());
                 let mut updates = Vec::new();
                 let rows = match control {
                     Some(control) => table.visible_rows_controlled(snapshot, control)?,
@@ -16663,21 +17059,35 @@ fn recover_shared_wal(
 
     // Pass 1: committed-txn outcomes + collect spilled-run info.
     let mut committed: HashMap<u64, u64> = HashMap::new();
+    // Physical HLC micros from Op::CommitTimestamp, keyed by txn_id (P0.5).
+    let mut commit_ts_by_txn: HashMap<u64, mongreldb_types::hlc::HlcTimestamp> = HashMap::new();
     let mut spilled_to_link: Vec<(
         u64, /*txn_id*/
         u64, /*epoch*/
         Vec<crate::wal::AddedRun>,
     )> = Vec::new();
     for r in records {
-        if let Op::TxnCommit {
-            epoch: ce,
-            ref added_runs,
-        } = r.op
-        {
-            committed.insert(r.txn_id, ce);
-            if !added_runs.is_empty() {
-                spilled_to_link.push((r.txn_id, ce, added_runs.clone()));
+        match &r.op {
+            Op::CommitTimestamp { unix_nanos } => {
+                commit_ts_by_txn.insert(
+                    r.txn_id,
+                    mongreldb_types::hlc::HlcTimestamp {
+                        physical_micros: unix_nanos / 1_000,
+                        logical: 0,
+                        node_tiebreaker: 0,
+                    },
+                );
             }
+            Op::TxnCommit {
+                epoch: ce,
+                ref added_runs,
+            } => {
+                committed.insert(r.txn_id, *ce);
+                if !added_runs.is_empty() {
+                    spilled_to_link.push((r.txn_id, *ce, added_runs.clone()));
+                }
+            }
+            _ => {}
         }
     }
     for record in records {
@@ -16756,10 +17166,16 @@ fn recover_shared_wal(
                 })?;
                 // Re-stamp each row at the txn commit epoch (rows are pre-stamped
                 // at pending_epoch which equals the commit epoch, but be robust).
+                // P0.5: prefer the durable CommitTimestamp HLC for this txn when
+                // present so recovery restores HLC-authoritative versions.
+                let txn_commit_ts = commit_ts_by_txn.get(&r.txn_id).copied();
                 let rows: Vec<Row> = rows
                     .into_iter()
                     .map(|mut row| {
                         row.committed_epoch = commit_epoch;
+                        if row.commit_ts.is_none() {
+                            row.commit_ts = txn_commit_ts;
+                        }
                         row
                     })
                     .collect();
@@ -16869,7 +17285,7 @@ fn recover_shared_wal(
         // The WAL can be newer than the copied/persisted manifest after a
         // crash or replication apply. Rebuild O(1) count metadata from the
         // recovered state before endorsing the commit epoch in the manifest.
-        let rows = t.visible_rows(Snapshot::at(Epoch(u64::MAX)))?;
+        let rows = t.visible_rows(Snapshot::unbounded())?;
         t.live_count = rows.len() as u64;
         // Recovery can replay older row commits while a newer spilled run is
         // already linked by the copied manifest. Never move that manifest's
@@ -16978,7 +17394,7 @@ fn validate_recovery_table_stages(
         let table = handle.lock();
         // Force all existing immutable runs through their integrity/decode path
         // before any other table manifest can be changed.
-        table.visible_rows(Snapshot::at(Epoch(u64::MAX)))?;
+        table.visible_rows(Snapshot::unbounded())?;
         for row in rows {
             validate_recovered_row(table.schema(), row)?;
         }
@@ -21036,6 +21452,7 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod commit_ts_ledger_tests {
     use super::*;
+    use crate::memtable::Row;
 
     fn int_pk_schema() -> Schema {
         Schema {
@@ -21130,6 +21547,191 @@ mod commit_ts_ledger_tests {
                 node_tiebreaker: 0,
             })
         );
+    }
+
+    #[test]
+    fn new_writes_always_have_some_commit_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let mut txn = db.begin();
+        let state = txn.state_handle();
+        txn.put("t", vec![(1, Value::Int64(7))]).unwrap();
+        let epoch = txn.commit().unwrap();
+        let crate::txn::TransactionState::Committed(receipt) = state.state() else {
+            panic!("expected Committed receipt");
+        };
+        let handle = db.table("t").unwrap();
+        let table = handle.lock();
+        // Product snapshots are HLC-pinned; epoch-only Snapshot::at hides
+        // HLC-stamped versions by design (no dual authority).
+        let (snap, _g) = db.snapshot();
+        let rows = table.visible_rows(snap).expect("visible rows");
+        assert_eq!(rows.len(), 1, "committed put must be visible under HLC snapshot");
+        assert_eq!(rows[0].commit_ts, Some(receipt.commit_ts));
+        assert_eq!(db.commit_ts_for_epoch(epoch), Some(receipt.commit_ts));
+    }
+
+    #[test]
+    fn same_transaction_identical_hlc_on_apply() {
+        use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create_cluster_replica(
+            dir.path(),
+            ClusterId::from_bytes([1; 16]),
+            NodeId::from_bytes([2; 16]),
+            DatabaseId::from_bytes([3; 16]),
+        )
+        .unwrap();
+        db.apply_replicated_catalog_command(&crate::catalog_cmds::CatalogCommandRecord {
+            version: crate::catalog_cmds::CATALOG_COMMAND_FORMAT_VERSION,
+            catalog_version: 1,
+            command: crate::catalog_cmds::CatalogCommand::CreateTable {
+                name: "t".into(),
+                schema: int_pk_schema(),
+                created_epoch: 1,
+            },
+        })
+        .unwrap();
+        let table_id = db.table_id("t").unwrap();
+        let commit_ts = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 42_000,
+            logical: 3,
+            node_tiebreaker: 9,
+        };
+        // Same decision HLC applied twice (two participants / two apply
+        // calls) must stamp identical commit_ts on every row version.
+        let staged = vec![StagedTxnWrite::Put {
+            table_id,
+            rows: bincode::serialize(&vec![
+                Row::new(crate::RowId(1), Epoch(0)).with_column(1, Value::Int64(1)),
+            ])
+            .unwrap(),
+        }
+        .encode()
+        .unwrap()];
+        assert!(db
+            .apply_committed_transaction(1 << 63, commit_ts, &staged)
+            .unwrap());
+        let staged2 = vec![StagedTxnWrite::Put {
+            table_id,
+            rows: bincode::serialize(&vec![
+                Row::new(crate::RowId(2), Epoch(0)).with_column(1, Value::Int64(2)),
+            ])
+            .unwrap(),
+        }
+        .encode()
+        .unwrap()];
+        assert!(db
+            .apply_committed_transaction((1 << 63) + 1, commit_ts, &staged2)
+            .unwrap());
+        let handle = db.table("t").unwrap();
+        let table = handle.lock();
+        let row1 = table
+            .get(crate::RowId(1), Snapshot::unbounded())
+            .expect("applied row 1");
+        let row2 = table
+            .get(crate::RowId(2), Snapshot::unbounded())
+            .expect("applied row 2");
+        assert_eq!(row1.commit_ts, Some(commit_ts));
+        assert_eq!(row2.commit_ts, Some(commit_ts));
+        assert_eq!(row1.commit_ts, row2.commit_ts);
+        drop(table);
+        // Latest applied epoch's ledger entry matches the shared decision HLC
+        // physical component (logical/tiebreaker may be zero on recovery form).
+        let epoch = db.visible_epoch();
+        assert_eq!(
+            db.commit_ts_for_epoch(epoch)
+                .map(|ts| ts.physical_micros),
+            Some(commit_ts.physical_micros)
+        );
+    }
+
+    #[test]
+    fn snapshot_hlc_hides_later_commit_ts_even_if_epoch_higher() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        // Snapshot at early HLC with a high epoch budget still hides a later HLC.
+        let snap = Snapshot::at_hlc(Epoch(99), early);
+        assert!(!snap.observes_version(Epoch(1), Some(late)));
+        assert!(snap.observes_version(Epoch(1), Some(early)));
+        // Live Database snapshots are HLC-pinned.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        let (snap, _g) = db.snapshot();
+        assert_ne!(
+            snap.commit_ts,
+            HlcTimestamp::ZERO,
+            "Database::snapshot must pin live HLC via at_hlc"
+        );
+    }
+
+    #[test]
+    fn hlc_stamped_row_visible_at_hlc_snapshot_not_epoch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let (_epoch, commit_ts) = commit_one(&db);
+        assert_ne!(commit_ts, mongreldb_types::hlc::HlcTimestamp::ZERO);
+
+        let handle = db.table("t").unwrap();
+        let table = handle.lock();
+        // (a) HLC-stamped row visible at an HLC-pinned snapshot.
+        let hlc_snap = Snapshot::at_hlc(Epoch(u64::MAX), commit_ts);
+        let rows = table.visible_rows(hlc_snap).expect("visible");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].commit_ts, Some(commit_ts));
+        assert!(table.get(rows[0].row_id, hlc_snap).is_some());
+
+        // (b) Epoch-only snapshot does NOT claim equal authority for HLC rows.
+        let legacy = Snapshot::at(Epoch(u64::MAX));
+        assert!(!legacy.uses_hlc_authority());
+        assert!(
+            table.visible_rows(legacy).expect("visible").is_empty(),
+            "epoch-only snapshot must not observe HLC-stamped product rows"
+        );
+        assert!(table.get(rows[0].row_id, legacy).is_none());
+    }
+
+    #[test]
+    fn hlc_gc_floor_reports_named_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let (epoch, commit_ts) = commit_one(&db);
+
+        // No pins: every HLC source is ZERO.
+        let empty = db.hlc_gc_floor();
+        assert_eq!(empty.floor(), mongreldb_types::hlc::HlcTimestamp::ZERO);
+        assert_eq!(empty.sources().len(), 6);
+
+        // Pin via product snapshot (transaction source, epoch-backed).
+        let (_snap, guard) = db.snapshot();
+        let with_pin = db.hlc_gc_floor();
+        // Projection succeeds only when the ledger has a stamp for the pin epoch.
+        let projected = db.commit_ts_for_epoch(epoch);
+        if let Some(ts) = projected {
+            // Snapshot pins the *visible* watermark, which should match the commit.
+            assert_eq!(with_pin.transaction_snapshot, ts);
+            assert_eq!(with_pin.floor(), ts);
+            assert_eq!(ts.physical_micros, commit_ts.physical_micros);
+        } else {
+            assert_eq!(
+                with_pin.transaction_snapshot,
+                mongreldb_types::hlc::HlcTimestamp::ZERO
+            );
+        }
+        drop(guard);
     }
 }
 
@@ -21399,10 +22001,9 @@ mod stage2e_replicated_apply_tests {
 
     fn visible_ids(db: &Database, table: &str) -> Vec<i64> {
         let handle = db.table(table).unwrap();
-        let rows = handle
-            .lock()
-            .visible_rows(crate::epoch::Snapshot::at(Epoch(u64::MAX)))
-            .unwrap();
+        // P0.5: HLC-stamped versions require an HLC-pinned snapshot.
+        let snap = db.visible_snapshot();
+        let rows = handle.lock().visible_rows(snap).unwrap();
         let mut values: Vec<i64> = rows
             .iter()
             .map(|row| match row.columns.get(&1) {
@@ -21557,10 +22158,9 @@ mod stage2c_spill_translation_tests {
 
     fn visible_ids(db: &Database, table: &str) -> Vec<i64> {
         let handle = db.table(table).unwrap();
-        let rows = handle
-            .lock()
-            .visible_rows(crate::epoch::Snapshot::at(Epoch(u64::MAX)))
-            .unwrap();
+        // P0.5: HLC-stamped versions require an HLC-pinned snapshot.
+        let snap = db.visible_snapshot();
+        let rows = handle.lock().visible_rows(snap).unwrap();
         let mut values: Vec<i64> = rows
             .iter()
             .map(|row| match row.columns.get(&1) {

@@ -658,4 +658,58 @@ mod tests {
         assert_eq!(batch[0].work_id, high);
         assert_ne!(batch[0].work_id, low);
     }
+
+    /// P1.1-X3: Compaction/maintenance yields to OLTP under weighted fair scheduling.
+    ///
+    /// Maintenance weight is lower than OLTP, so while both classes compete for
+    /// the first N poll slots OLTP receives a strictly larger share.
+    #[test]
+    fn p11_x3_maintenance_yields_to_oltp() {
+        let mut sched = HierarchicalScheduler::new();
+        for class in [WorkloadClass::Oltp, WorkloadClass::Maintenance] {
+            let mut cfg = ClassConfig::for_class(class);
+            cfg.max_concurrency = 1;
+            cfg.max_queue = 128;
+            sched.set_class_config(class, cfg);
+        }
+        // Flood maintenance; keep a full OLTP backlog too so competition lasts.
+        for i in 0..64 {
+            sched
+                .submit(
+                    "t",
+                    WorkloadClass::Maintenance,
+                    50,
+                    None,
+                    None,
+                    format!("m-{i}"),
+                )
+                .unwrap();
+        }
+        for i in 0..64 {
+            sched
+                .submit("t", WorkloadClass::Oltp, 200, None, None, format!("o-{i}"))
+                .unwrap();
+        }
+        let mut oltp = 0usize;
+        let mut maintenance = 0usize;
+        // Sample the first 32 dispatches while both queues still have depth.
+        for _ in 0..32 {
+            let batch = sched.poll(1);
+            assert_eq!(batch.len(), 1, "both classes still have demand");
+            match batch[0].class {
+                WorkloadClass::Oltp => oltp += 1,
+                WorkloadClass::Maintenance => maintenance += 1,
+                other => panic!("unexpected class {other:?}"),
+            }
+            sched.complete(batch[0].work_id).unwrap();
+        }
+        assert!(
+            oltp > maintenance,
+            "OLTP must receive more early slots than maintenance (compaction yields): oltp={oltp} maintenance={maintenance}"
+        );
+        assert!(
+            maintenance >= 1,
+            "maintenance must still make progress (not fully starved): maintenance={maintenance}"
+        );
+    }
 }

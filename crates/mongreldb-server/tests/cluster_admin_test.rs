@@ -538,10 +538,8 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     )
     .await;
     assert_eq!(restore["status"], "accepted");
-    assert_eq!(
-        restore["job"]["kind"].as_str().unwrap(),
-        "restore_verification"
-    );
+    // OpsJobKind::Restore serializes as kind name "restore" (RestoreVerification aliases the same name).
+    assert_eq!(restore["job"]["kind"].as_str().unwrap(), "restore");
     assert!(
         restore["restore_plan"]["tablet_count"].as_u64().unwrap() >= 1,
         "restore plan must come from published backup: {restore}"
@@ -553,6 +551,14 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     assert!(
         job_list.iter().any(|j| j["source"] == "ops"),
         "expected ops jobs in SHOW JOBS: {jobs}"
+    );
+    // P1.6-X5: progress is visible on the public SHOW JOBS surface.
+    assert!(
+        job_list.iter().any(|j| {
+            j["source"] == "ops"
+                && j["progress"].as_str().map(|p| !p.is_empty()).unwrap_or(false)
+        }),
+        "ops jobs must expose non-empty progress: {jobs}"
     );
 
     let backups = sql_json(&app, admin, "SHOW BACKUPS").await;

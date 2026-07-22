@@ -5,9 +5,10 @@
 //! the prototype skip list. A Bε-tree buffers many pending mutations per
 //! internal node and flushes them to one child in bulk, so write amplification
 //! approaches O(1) — the update-amplification win the design calls for. The
-//! composite key keeps multiple versions of a logical row coexisting so a
-//! snapshot read returns the newest version with `committed_epoch <= snapshot`,
-//! which is what makes MVCC correct within the live memtable.
+//! composite key keeps multiple versions of a logical row coexisting. Product
+//! visibility prefers HLC via [`crate::epoch::Snapshot::observes_row`] /
+//! [`crate::epoch::Snapshot::version_is_newer`] when versions carry `commit_ts`
+//! (P0.5-T3); epoch-only APIs remain for dual-model legacy call sites.
 
 use crate::be_tree::BeTree;
 use crate::epoch::Epoch;
@@ -129,6 +130,10 @@ impl Value {
 pub struct Row {
     pub row_id: RowId,
     pub committed_epoch: Epoch,
+    /// Optional HLC stamp (P0.5 dual-model). Always encoded for bincode WAL
+    /// payloads — do not use `skip_serializing_if` (non-self-describing format).
+    #[serde(default)]
+    pub commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     pub columns: HashMap<u16, Value>,
     pub deleted: bool,
 }
@@ -138,6 +143,21 @@ impl Row {
         Self {
             row_id,
             committed_epoch,
+            commit_ts: None,
+            columns: HashMap::new(),
+            deleted: false,
+        }
+    }
+
+    pub fn new_with_hlc(
+        row_id: RowId,
+        committed_epoch: Epoch,
+        commit_ts: mongreldb_types::hlc::HlcTimestamp,
+    ) -> Self {
+        Self {
+            row_id,
+            committed_epoch,
+            commit_ts: Some(commit_ts),
             columns: HashMap::new(),
             deleted: false,
         }
@@ -211,6 +231,7 @@ impl Memtable {
         let row = Row {
             row_id,
             committed_epoch: epoch,
+            commit_ts: None,
             columns,
             deleted: true,
         };
@@ -226,19 +247,50 @@ impl Memtable {
     }
 
     /// Newest version of `row_id` with `epoch <= snapshot`, **including
-    /// tombstones** (as a `Row` with `deleted=true`). Used by the engine to
-    /// merge versions across the memtable and sorted runs.
+    /// tombstones** (as a `Row` with `deleted=true`). Legacy epoch-only entry
+    /// point; prefer [`Self::get_version_at`] when the caller holds a full
+    /// [`crate::epoch::Snapshot`].
     pub fn get_version(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<(Epoch, Row)> {
-        let mut best = self.active.tree.get_version(row_id, snapshot_epoch);
-        for segment in self.frozen.iter().rev() {
-            let Some(candidate) = segment.tree.get_version(row_id, snapshot_epoch) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(epoch, _)| candidate.0 > *epoch) {
-                best = Some(candidate);
+        self.get_version_at(row_id, crate::epoch::Snapshot::at(snapshot_epoch))
+    }
+
+    /// Newest version of `row_id` visible under `snapshot` (including
+    /// tombstones). Uses HLC authority when stamps are present (P0.5-T3).
+    ///
+    /// Scans each segment's versions of `row_id` so dual-model mixes
+    /// (stamped + unstamped) and HLC/epoch order inversions stay correct.
+    pub fn get_version_at(
+        &self,
+        row_id: RowId,
+        snapshot: crate::epoch::Snapshot,
+    ) -> Option<(Epoch, Row)> {
+        let mut best: Option<Row> = None;
+        for segment in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.tree)
+            .chain(std::iter::once(&self.active.tree))
+        {
+            for row in segment.versions() {
+                if row.row_id != row_id {
+                    continue;
+                }
+                if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|current| {
+                    crate::epoch::Snapshot::version_is_newer(
+                        row.committed_epoch,
+                        row.commit_ts,
+                        current.committed_epoch,
+                        current.commit_ts,
+                    )
+                }) {
+                    best = Some(row);
+                }
             }
         }
-        best
+        best.map(|row| (row.committed_epoch, row))
     }
 
     /// Number of stored versions.
@@ -272,6 +324,10 @@ impl Memtable {
     /// tombstones** (as `Row`s with `deleted=true`). Used by the engine to merge
     /// versions across the memtable and sorted runs.
     pub fn visible_versions(&self, snapshot_epoch: Epoch) -> Vec<Row> {
+        self.visible_versions_at(crate::epoch::Snapshot::at(snapshot_epoch))
+    }
+
+    pub fn visible_versions_at(&self, snapshot: crate::epoch::Snapshot) -> Vec<Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
         for segment in self
             .frozen
@@ -280,16 +336,22 @@ impl Memtable {
             .chain(std::iter::once(&self.active.tree))
         {
             for row in segment.versions() {
-                if row.committed_epoch <= snapshot_epoch {
-                    by_row
-                        .entry(row.row_id)
-                        .and_modify(|existing| {
-                            if row.committed_epoch > existing.committed_epoch {
-                                *existing = row.clone();
-                            }
-                        })
-                        .or_insert(row);
+                if !snapshot.observes_version(row.committed_epoch, row.commit_ts) {
+                    continue;
                 }
+                by_row
+                    .entry(row.row_id)
+                    .and_modify(|existing| {
+                        if crate::epoch::Snapshot::version_is_newer(
+                            row.committed_epoch,
+                            row.commit_ts,
+                            existing.committed_epoch,
+                            existing.commit_ts,
+                        ) {
+                            *existing = row.clone();
+                        }
+                    })
+                    .or_insert(row);
             }
         }
         by_row.into_values().collect()
@@ -397,6 +459,108 @@ mod tests {
         writer.upsert(row(99, 99));
         assert!(generation.get(RowId(99), Epoch(99)).is_none());
         assert!(writer.get(RowId(99), Epoch(99)).is_some());
+    }
+
+    #[test]
+    fn hlc_visibility_is_authoritative_when_stamped() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let mut m = Memtable::new();
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let mut r1 = Row::new_with_hlc(RowId(1), Epoch(1), early);
+        r1.columns.insert(1, Value::Int64(1));
+        let mut r2 = Row::new_with_hlc(RowId(1), Epoch(2), late);
+        r2.columns.insert(1, Value::Int64(2));
+        m.upsert(r1);
+        m.upsert(r2);
+        let snap = crate::epoch::Snapshot::at_hlc(Epoch(99), early);
+        let versions = m.visible_versions_at(snap);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].columns.get(&1), Some(&Value::Int64(1)));
+        let snap2 = crate::epoch::Snapshot::at_hlc(Epoch(1), late);
+        assert_eq!(
+            m.visible_versions_at(snap2)[0].columns.get(&1),
+            Some(&Value::Int64(2))
+        );
+    }
+
+    #[test]
+    fn snapshot_hlc_hides_later_commit_ts_even_if_epoch_higher() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let mut m = Memtable::new();
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        // Epoch(1) with late HLC would win under epoch-only rules when snap
+        // epoch is 99 — HLC authority must hide it under an early pin.
+        let mut late_row = Row::new_with_hlc(RowId(1), Epoch(1), late);
+        late_row.columns.insert(1, Value::Int64(99));
+        let mut early_row = Row::new_with_hlc(RowId(1), Epoch(50), early);
+        early_row.columns.insert(1, Value::Int64(1));
+        m.upsert(late_row);
+        m.upsert(early_row);
+        let snap = crate::epoch::Snapshot::at_hlc(Epoch(99), early);
+        let versions = m.visible_versions_at(snap);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].columns.get(&1), Some(&Value::Int64(1)));
+        assert_eq!(versions[0].commit_ts, Some(early));
+    }
+
+    #[test]
+    fn epoch_only_snapshot_does_not_observe_hlc_stamped_rows() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let mut m = Memtable::new();
+        let ts = HlcTimestamp {
+            physical_micros: 50,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(1), ts).with_column(1, Value::Int64(1)));
+        m.upsert(Row::new(RowId(2), Epoch(1)).with_column(1, Value::Int64(2)));
+        let legacy = crate::epoch::Snapshot::at(Epoch(99));
+        let versions = m.visible_versions_at(legacy);
+        assert_eq!(versions.len(), 1, "only pure-legacy row is visible");
+        assert_eq!(versions[0].row_id, RowId(2));
+        assert!(versions[0].commit_ts.is_none());
+        assert!(m.get_version_at(RowId(1), legacy).is_none());
+        assert!(m.get_version_at(RowId(2), legacy).is_some());
+    }
+
+    #[test]
+    fn get_version_at_prefers_hlc_over_epoch_order() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let mut m = Memtable::new();
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(1), late).with_column(1, Value::Int64(99)));
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(50), early).with_column(1, Value::Int64(1)));
+        let snap = crate::epoch::Snapshot::at_hlc(Epoch(99), early);
+        let (_, row) = m.get_version_at(RowId(1), snap).expect("visible");
+        assert_eq!(row.columns.get(&1), Some(&Value::Int64(1)));
+        assert_eq!(row.commit_ts, Some(early));
     }
 
     #[test]

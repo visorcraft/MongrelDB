@@ -50,7 +50,7 @@ pub async fn list(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    Json(json!({ "triggers": state.db.triggers() })).into_response()
+    Json(json!({ "triggers": state.db().triggers() })).into_response()
 }
 
 pub async fn describe(
@@ -61,7 +61,7 @@ pub async fn describe(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    match state.db.trigger(&name) {
+    match state.db().trigger(&name) {
         Some(trigger) => Json(json!({ "trigger": trigger })).into_response(),
         None => error(
             StatusCode::NOT_FOUND,
@@ -120,8 +120,7 @@ pub async fn create(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state
-                .db
+            state.db()
                 .create_trigger_as_controlled(trigger, effective_principal.as_ref(), || {
                     validate_trigger_binding(
                         &state,
@@ -205,8 +204,7 @@ pub async fn replace(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state
-                .db
+            state.db()
                 .create_or_replace_trigger_as_controlled(
                     trigger,
                     effective_principal.as_ref(),
@@ -281,8 +279,7 @@ pub async fn drop_trigger(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state
-                .db
+            state.db()
                 .drop_triggers_with_epoch_as_controlled(
                     std::slice::from_ref(&name),
                     effective_principal.as_ref(),
@@ -364,10 +361,9 @@ fn preflight_trigger(
     requested: Option<&StoredTrigger>,
 ) -> Result<TriggerExecutionBinding, Box<Response>> {
     for _ in 0..3 {
-        let security_version = state.db.security_version();
-        let catalog_epoch = state.db.catalog_snapshot().db_epoch;
-        state
-            .db
+        let security_version = state.db().security_version();
+        let catalog_epoch = state.db().catalog_snapshot().db_epoch;
+        state.db()
             .require_for(principal, &Permission::Ddl)
             .map_err(|failure| {
                 Box::new(error(
@@ -376,18 +372,18 @@ fn preflight_trigger(
                     &failure.to_string(),
                 ))
             })?;
-        let existing_trigger = state.db.trigger(name);
+        let existing_trigger = state.db().trigger(name);
         let mut tables = Vec::new();
         let source = requested.or(existing_trigger.as_ref());
         if let Some(trigger) = source {
             for table in referenced_trigger_tables(trigger) {
-                match state.db.table_identity(&table) {
+                match state.db().table_identity(&table) {
                     Ok((table_id, schema_id)) => tables.push(TriggerTableBinding {
                         name: table,
                         table_id,
                         schema_id,
                     }),
-                    Err(_) if state.db.external_table(&table).is_some() => {}
+                    Err(_) if state.db().external_table(&table).is_some() => {}
                     Err(_) => {
                         return Err(Box::new(error(
                             StatusCode::BAD_REQUEST,
@@ -398,8 +394,8 @@ fn preflight_trigger(
                 }
             }
         }
-        if state.db.security_version() == security_version
-            && state.db.catalog_snapshot().db_epoch == catalog_epoch
+        if state.db().security_version() == security_version
+            && state.db().catalog_snapshot().db_epoch == catalog_epoch
         {
             return Ok(TriggerExecutionBinding {
                 catalog_epoch,
@@ -452,14 +448,14 @@ fn validate_trigger_payload_binding(
     principal: Option<&mongreldb_core::Principal>,
     binding: &TriggerPayloadBinding,
 ) -> mongreldb_core::Result<()> {
-    state.db.require_for(principal, &Permission::Ddl)?;
-    if state.db.security_version() != binding.security_version {
+    state.db().require_for(principal, &Permission::Ddl)?;
+    if state.db().security_version() != binding.security_version {
         return Err(mongreldb_core::MongrelError::Conflict(
             "trigger authorization changed".into(),
         ));
     }
     for table in &binding.tables {
-        if state.db.table_identity(&table.name).ok() != Some((table.table_id, table.schema_id)) {
+        if state.db().table_identity(&table.name).ok() != Some((table.table_id, table.schema_id)) {
             return Err(mongreldb_core::MongrelError::Conflict(format!(
                 "trigger table {:?} changed",
                 table.name
@@ -476,8 +472,8 @@ fn validate_trigger_binding(
     name: &str,
 ) -> mongreldb_core::Result<()> {
     validate_trigger_payload_binding(state, principal, &binding.payload)?;
-    if state.db.catalog_snapshot().db_epoch != binding.catalog_epoch
-        || state.db.trigger(name) != binding.existing_trigger
+    if state.db().catalog_snapshot().db_epoch != binding.catalog_epoch
+        || state.db().trigger(name) != binding.existing_trigger
     {
         return Err(mongreldb_core::MongrelError::Conflict(
             "trigger catalog changed before publication".into(),
@@ -506,13 +502,13 @@ fn validate_trigger_replay(
             .cloned()
             .and_then(|value| serde_json::from_value::<StoredTrigger>(value).ok())
             .is_some_and(|trigger| trigger.name == name)
-            && state.db.trigger(name).is_none()
+            && state.db().trigger(name).is_none()
     } else {
         let expected = body
             .get("trigger")
             .cloned()
             .and_then(|value| serde_json::from_value::<StoredTrigger>(value).ok());
-        expected.is_some() && state.db.trigger(name) == expected
+        expected.is_some() && state.db().trigger(name) == expected
     };
     if valid {
         Ok(())
@@ -529,8 +525,7 @@ fn require_ddl(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
 ) -> Result<(), Box<Response>> {
-    state
-        .db
+    state.db()
         .require_for(
             request_principal(state, principal).as_ref(),
             &mongreldb_core::Permission::Ddl,

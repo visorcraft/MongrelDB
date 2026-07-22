@@ -91,7 +91,7 @@ impl native::query_service_server::QueryService for TestServices {
     async fn cancel_query(
         &self,
         _: Request<native::CancelQueryRequest>,
-    ) -> Result<Response<native::Empty>, Status> {
+    ) -> Result<Response<native::CancelQueryResponse>, Status> {
         unimplemented()
     }
 
@@ -186,6 +186,9 @@ fn client_config(
     }
 }
 
+// ID: P1.2-X3 Remote TLS client works (loopback TLS HTTP/2 native path).
+// ID: P1.2-X4 Wrong hostname rejected.
+// ID: P1.2-X7 Connection/session limits enforced (max_connections=1).
 #[tokio::test]
 async fn real_tls_http2_listener_validates_ca_and_hostname() {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -320,4 +323,124 @@ async fn real_tls_http2_listener_validates_ca_and_hostname() {
 
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
+}
+
+// ID: P1.2-X5 Client certificate requirement works (mTLS client identity accepted).
+#[tokio::test]
+async fn native_mtls_accepts_client_certificate() {
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-ca");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let mut client_params = rcgen::CertificateParams::new(vec!["client".into()]).unwrap();
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "client");
+    client_params.extended_key_usages =
+        vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let ca_pem = ca_cert.pem().into_bytes();
+    let server_cert_pem = server_cert.pem().into_bytes();
+    let server_key_pem = server_key.serialize_pem().into_bytes();
+    let client_cert_pem = client_cert.pem().into_bytes();
+    let client_key_pem = client_key.serialize_pem().into_bytes();
+
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    drop(socket);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(
+        NativeRpcServer::new(NativeRpcServerConfig {
+            address,
+            certificate_pem: server_cert_pem,
+            private_key_pem: server_key_pem,
+            client_ca_pem: Some(ca_pem.clone()),
+            max_connections: 8,
+            max_concurrent_streams: 32,
+            max_in_flight_per_connection: 32,
+            request_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
+            keepalive_interval: Duration::from_secs(10),
+            keepalive_timeout: Duration::from_secs(2),
+        })
+        .serve_with_shutdown(
+            NativeRpcServices {
+                auth: TestServices,
+                session: TestServices,
+                query: TestServices,
+                transaction: TestServices,
+                catalog: TestServices,
+                admin: TestServices,
+                health: TestServices,
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ),
+    );
+
+    let with_client = NativeRpcClientConfig {
+        endpoint: format!("https://127.0.0.1:{}", address.port()),
+        domain_name: "localhost".into(),
+        ca_certificate_pem: ca_pem.clone(),
+        client_identity_pem: Some((client_cert_pem, client_key_pem)),
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+        max_in_flight: 16,
+        tcp_keepalive: Duration::from_secs(30),
+        http2_keepalive_interval: Duration::from_secs(10),
+    };
+    let mut connection = None;
+    for _ in 0..50 {
+        match NativeRpcConnection::connect(&with_client).await {
+            Ok(connected) => {
+                connection = Some(connected);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let connection = connection.expect("mTLS client with identity must connect");
+    let health = connection
+        .client()
+        .health()
+        .status(native::HealthRequest {
+            context: Some(native::RequestContext {
+                version: Some(native::ApiVersion {
+                    major: NATIVE_API_MAJOR,
+                    minor: 0,
+                }),
+                request_id: "mtls-health".into(),
+                deadline_unix_micros: 0,
+                idempotency_key: String::new(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(health.serving);
+    // Config surface for required client certs is covered in native_listen
+    // (require_client_cert + CA). This exercise proves mTLS client identity is
+    // accepted end-to-end on the shipped NativeRpcServer path.
+
+    let _ = shutdown_tx.send(());
+    let _ = ca_pem;
+    server_task.await.unwrap().unwrap();
 }

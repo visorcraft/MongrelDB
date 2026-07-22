@@ -31,22 +31,189 @@ pub struct MaintenanceReceipt {
 }
 
 /// A point-in-time read view.
+///
+/// # Authority model (P0.5-T7)
+///
+/// **[`HlcTimestamp`](mongreldb_types::hlc::HlcTimestamp) is the sole
+/// cluster-wide visibility authority** when present on a snapshot or row
+/// version. Local [`Epoch`] is a per-core sequencing aid only — it must never
+/// be treated as an equal authority for cross-replica / HLC-stamped data.
+///
+/// | Snapshot `commit_ts` | Row `commit_ts` | Visibility rule |
+/// |----------------------|-----------------|-----------------|
+/// | non-`ZERO` (`at_hlc`) | `Some(ts)`      | HLC: `ts <= snap.commit_ts` |
+/// | `ZERO` (legacy)      | `Some(_)`       | **not visible** (no epoch fallback) |
+/// | any                  | `None` (legacy) | epoch: `row_epoch <= snap.epoch` |
+///
+/// Prefer [`Self::at_hlc`] / [`Self::unbounded`] for product reads. Prefer
+/// [`Self::at`] only for pure-legacy paths that never see HLC-stamped rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Local sequencing watermark (aid only when HLC is active).
     pub epoch: Epoch,
+    /// Sole cluster-wide visibility timestamp (HLC). `ZERO` means a legacy
+    /// epoch-only snapshot for dual-model compatibility — not an equal
+    /// authority for HLC-stamped row versions.
+    pub commit_ts: mongreldb_types::hlc::HlcTimestamp,
 }
 
 impl Snapshot {
     #[inline]
     pub fn at(epoch: Epoch) -> Self {
-        Self { epoch }
+        Self {
+            epoch,
+            commit_ts: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        }
+    }
+
+    /// Pin a snapshot with an explicit HLC commit timestamp (authoritative).
+    #[inline]
+    pub fn at_hlc(epoch: Epoch, commit_ts: mongreldb_types::hlc::HlcTimestamp) -> Self {
+        Self { epoch, commit_ts }
+    }
+
+    /// Unbounded product/recovery snapshot: observes every epoch and every HLC.
+    ///
+    /// Prefer this over [`Self::at`]`(`[`Epoch`]`(u64::MAX))` once rows may carry
+    /// HLC stamps — epoch-only snapshots intentionally hide HLC-stamped versions.
+    #[inline]
+    pub fn unbounded() -> Self {
+        Self::at_hlc(
+            Epoch(u64::MAX),
+            mongreldb_types::hlc::HlcTimestamp::MAX,
+        )
+    }
+
+    /// Whether this snapshot uses HLC as the cluster-wide visibility authority.
+    ///
+    /// `false` means legacy epoch-only (`commit_ts == ZERO`): HLC-stamped rows
+    /// are intentionally not observed.
+    #[inline]
+    pub fn uses_hlc_authority(&self) -> bool {
+        self.commit_ts != mongreldb_types::hlc::HlcTimestamp::ZERO
     }
 
     /// A cache page tagged with `page_epoch` is visible to this snapshot iff
     /// the page was committed at or before the snapshot.
+    ///
+    /// Cache pages remain epoch-tagged during dual-model migration; row-version
+    /// visibility must use [`Self::observes_version`] / [`Self::observes_row`].
     #[inline]
     pub fn observes(&self, page_epoch: Epoch) -> bool {
         page_epoch <= self.epoch
+    }
+
+    /// Row visibility under HLC-authoritative MVCC (P0.5-T7).
+    ///
+    /// See the type-level authority table. Alias of the same rule used by every
+    /// product visibility path that has access to both stamps.
+    #[inline]
+    pub fn observes_version(
+        &self,
+        row_epoch: Epoch,
+        row_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) -> bool {
+        match (self.uses_hlc_authority(), row_commit_ts) {
+            (true, Some(ts)) => ts <= self.commit_ts,
+            (false, Some(_)) => false,
+            (_, None) => row_epoch <= self.epoch,
+        }
+    }
+
+    /// Same as [`Self::observes_version`] — preferred name at call sites that
+    /// reason about full row versions rather than cache pages.
+    #[inline]
+    pub fn observes_row(
+        &self,
+        row_epoch: Epoch,
+        row_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) -> bool {
+        self.observes_version(row_epoch, row_commit_ts)
+    }
+
+    /// Whether version `a` is strictly newer than version `b` under HLC
+    /// authority. When **both** carry HLC, HLC order wins; otherwise local
+    /// epoch order is used (legacy / mixed).
+    #[inline]
+    pub fn version_is_newer(
+        a_epoch: Epoch,
+        a_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+        b_epoch: Epoch,
+        b_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) -> bool {
+        match (a_commit_ts, b_commit_ts) {
+            (Some(a), Some(b)) => a > b,
+            _ => a_epoch > b_epoch,
+        }
+    }
+}
+
+/// Named HLC pin sources that form the version-GC floor (P0.5-T6).
+///
+/// Each field is the oldest HLC still required by that pin source. Sources that
+/// are not currently pinning, or that only pin a local epoch without a durable
+/// HLC projection, report [`HlcTimestamp::ZERO`](mongreldb_types::hlc::HlcTimestamp::ZERO).
+///
+/// The epoch-based floor ([`crate::engine::Table::version_gc_floor`]) remains
+/// the physical reclamation gate until every pin source carries HLC; this
+/// struct exposes the HLC projection for diagnostics and progressive cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcFloor {
+    pub transaction_snapshot: mongreldb_types::hlc::HlcTimestamp,
+    pub history_retention: mongreldb_types::hlc::HlcTimestamp,
+    pub backup_pitr: mongreldb_types::hlc::HlcTimestamp,
+    pub replication: mongreldb_types::hlc::HlcTimestamp,
+    pub read_generation: mongreldb_types::hlc::HlcTimestamp,
+    pub online_index_build: mongreldb_types::hlc::HlcTimestamp,
+}
+
+impl Default for GcFloor {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl GcFloor {
+    /// No HLC pins reported by any source.
+    pub const ZERO: Self = Self {
+        transaction_snapshot: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        history_retention: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        backup_pitr: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        replication: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        read_generation: mongreldb_types::hlc::HlcTimestamp::ZERO,
+        online_index_build: mongreldb_types::hlc::HlcTimestamp::ZERO,
+    };
+
+    /// Minimum non-`ZERO` HLC across all named sources, or `ZERO` when none
+    /// report an HLC pin.
+    #[inline]
+    pub fn floor(&self) -> mongreldb_types::hlc::HlcTimestamp {
+        [
+            self.transaction_snapshot,
+            self.history_retention,
+            self.backup_pitr,
+            self.replication,
+            self.read_generation,
+            self.online_index_build,
+        ]
+        .into_iter()
+        .filter(|ts| *ts != mongreldb_types::hlc::HlcTimestamp::ZERO)
+        .min()
+        .unwrap_or(mongreldb_types::hlc::HlcTimestamp::ZERO)
+    }
+
+    /// Stable `(source_label, hlc)` pairs for diagnostics.
+    pub fn sources(
+        &self,
+    ) -> [(&'static str, mongreldb_types::hlc::HlcTimestamp); 6] {
+        [
+            ("transaction_snapshot", self.transaction_snapshot),
+            ("history_retention", self.history_retention),
+            ("backup_pitr", self.backup_pitr),
+            ("replication", self.replication),
+            ("read_generation", self.read_generation),
+            ("online_index_build", self.online_index_build),
+        ]
     }
 }
 
@@ -292,6 +459,139 @@ fn raise_to(cell: &AtomicU64, target: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mongreldb_types::hlc::HlcTimestamp;
+
+    fn hlc(physical_micros: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical_micros,
+            logical: 0,
+            node_tiebreaker: 1,
+        }
+    }
+
+    #[test]
+    fn hlc_visibility_is_authoritative_when_stamped() {
+        let early = hlc(100);
+        let late = hlc(200);
+        // High epoch, early HLC: only early-stamped versions are visible.
+        let snap = Snapshot::at_hlc(Epoch(99), early);
+        assert!(snap.uses_hlc_authority());
+        assert!(snap.observes_version(Epoch(1), Some(early)));
+        assert!(!snap.observes_version(Epoch(2), Some(late)));
+        assert!(snap.observes_row(Epoch(1), Some(early)));
+        assert!(!snap.observes_row(Epoch(2), Some(late)));
+        // Low epoch, late HLC: late-stamped versions win even if epoch is lower
+        // than a concurrent higher-epoch stamp that is still later in HLC order.
+        let snap2 = Snapshot::at_hlc(Epoch(1), late);
+        assert!(snap2.observes_version(Epoch(1), Some(early)));
+        assert!(snap2.observes_version(Epoch(2), Some(late)));
+    }
+
+    #[test]
+    fn snapshot_hlc_hides_later_commit_ts_even_if_epoch_higher() {
+        let early = hlc(100);
+        let late = hlc(200);
+        // Snapshot pinned at early HLC with a *low* epoch budget still hides a
+        // later-commit_ts row even when that row's epoch is below the pin.
+        let snap = Snapshot::at_hlc(Epoch(10), early);
+        assert!(!snap.observes_version(Epoch(5), Some(late)));
+        assert!(snap.observes_version(Epoch(5), Some(early)));
+        // Legacy epoch-only snapshot must not reclaim HLC-stamped rows via epoch.
+        let legacy = Snapshot::at(Epoch(99));
+        assert!(!legacy.uses_hlc_authority());
+        assert!(!legacy.observes_version(Epoch(1), Some(early)));
+        assert!(legacy.observes_version(Epoch(1), None));
+    }
+
+    #[test]
+    fn version_is_newer_prefers_hlc_when_both_stamped() {
+        let early = hlc(100);
+        let late = hlc(200);
+        // Later HLC is newer even with a lower local epoch.
+        assert!(Snapshot::version_is_newer(
+            Epoch(1),
+            Some(late),
+            Epoch(50),
+            Some(early)
+        ));
+        assert!(!Snapshot::version_is_newer(
+            Epoch(50),
+            Some(early),
+            Epoch(1),
+            Some(late)
+        ));
+        // Mixed / legacy falls back to epoch order.
+        assert!(Snapshot::version_is_newer(Epoch(3), None, Epoch(2), None));
+        assert!(Snapshot::version_is_newer(
+            Epoch(3),
+            Some(early),
+            Epoch(2),
+            None
+        ));
+    }
+
+    #[test]
+    fn hlc_clock_order_matches_visibility_order() {
+        let a = hlc(100);
+        let b = HlcTimestamp {
+            physical_micros: 100,
+            logical: 1,
+            node_tiebreaker: 1,
+        };
+        let c = HlcTimestamp {
+            physical_micros: 100,
+            logical: 1,
+            node_tiebreaker: 2,
+        };
+        assert!(a < b && b < c);
+        let snap = Snapshot::at_hlc(Epoch(1), b);
+        assert!(snap.observes_row(Epoch(1), Some(a)));
+        assert!(snap.observes_row(Epoch(1), Some(b)));
+        assert!(!snap.observes_row(Epoch(1), Some(c)));
+    }
+
+    #[test]
+    fn gc_floor_min_skips_zero_sources() {
+        let mut floor = GcFloor::ZERO;
+        assert_eq!(floor.floor(), HlcTimestamp::ZERO);
+        floor.transaction_snapshot = hlc(300);
+        floor.backup_pitr = hlc(100);
+        floor.replication = hlc(200);
+        assert_eq!(floor.floor(), hlc(100));
+        assert_eq!(floor.sources().len(), 6);
+    }
+
+    /// P0.5-X5: excessive skew rejects timestamp allocation on the shared
+    /// [`mongreldb_types::hlc::HlcClock`] API used by Database/Table commits.
+    #[test]
+    fn clock_skew_rejects_timestamp_allocation() {
+        use mongreldb_types::hlc::HlcClock;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let wall = Arc::new(AtomicU64::new(10_000));
+        let wall_src = {
+            let wall = Arc::clone(&wall);
+            Arc::new(move || wall.load(AtomicOrdering::Relaxed)) as mongreldb_types::hlc::WallClockSource
+        };
+        let clock = HlcClock::with_time_source(1, Duration::from_micros(1_000), wall_src);
+        let remote = HlcTimestamp {
+            physical_micros: 15_000,
+            logical: 0,
+            node_tiebreaker: 2,
+        };
+        assert!(clock.observe(remote).is_err(), "5ms skew must exceed 1ms bound");
+        assert!(
+            clock.now().is_err(),
+            "further allocation stays rejected after skew trip"
+        );
+        // next_after is not skew-gated (recovery path); product commits use now().
+        let _ = clock.next_after(HlcTimestamp::ZERO);
+    }
+
+    // P0.5-X7: bounded-staleness rejection of lagging replicas is tested in
+    // mongreldb-consensus (`read::tests` + cluster integration), not here.
 
     #[test]
     fn snapshot_visibility_is_monotonic() {

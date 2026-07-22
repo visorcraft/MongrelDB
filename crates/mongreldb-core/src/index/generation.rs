@@ -16,60 +16,74 @@
 //! because readers exist; writers keep mutating only their small active
 //! delta.
 //!
-//! `applied_through` is the engine's commit-epoch watermark ([`Epoch`]): the
-//! generation reflects every commit whose epoch is `<= applied_through`. (The
-//! spec's `HlcTimestamp` maps onto this watermark at the commit-log layer —
-//! see `CommitReceipt::commit_ts`; the engine's visibility currency is the
-//! epoch.)
+//! `applied_through_hlc` is the **authoritative** readiness watermark (P0.5):
+//! the generation reflects every commit whose HLC is `<= applied_through_hlc`.
+//! `applied_through` (epoch) remains a local sequencing aid for dual-model
+//! compatibility and must not be used alone for cross-replica readiness.
 
 use crate::epoch::Epoch;
 use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, MinHashIndex, SparseIndex};
+use mongreldb_types::hlc::HlcTimestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One index family's published generation: the per-column index views,
 /// structurally shared with the writer's frozen layers, plus the highest
-/// commit epoch applied into them.
+/// commit watermark applied into them.
 #[derive(Clone)]
 pub struct IndexFamilyGeneration<T> {
     indexes: Arc<HashMap<u16, T>>,
+    /// Local sequencing epoch (aid only).
     applied_through: Epoch,
+    /// Authoritative HLC readiness watermark (P0.5-T5).
+    applied_through_hlc: HlcTimestamp,
 }
 
 impl<T> Default for IndexFamilyGeneration<T> {
     fn default() -> Self {
-        Self::empty(Epoch(0))
+        Self::empty(Epoch(0), HlcTimestamp::ZERO)
     }
 }
 
 impl<T> IndexFamilyGeneration<T> {
     /// An empty generation (no per-column indexes yet).
-    pub fn empty(applied_through: Epoch) -> Self {
+    pub fn empty(applied_through: Epoch, applied_through_hlc: HlcTimestamp) -> Self {
         Self {
             indexes: Arc::new(HashMap::new()),
             applied_through,
+            applied_through_hlc,
         }
     }
 
     /// Capture by cloning the per-column map. Callers seal first, so each
     /// cloned index shares its frozen layers and carries an empty active
     /// delta — the clone is O(#columns), never O(#rows).
-    pub(crate) fn capture(indexes: &HashMap<u16, T>, applied_through: Epoch) -> Self
+    pub(crate) fn capture(
+        indexes: &HashMap<u16, T>,
+        applied_through: Epoch,
+        applied_through_hlc: HlcTimestamp,
+    ) -> Self
     where
         T: Clone,
     {
         Self {
             indexes: Arc::new(indexes.clone()),
             applied_through,
+            applied_through_hlc,
         }
     }
 
     /// Capture by sharing an already-`Arc`-wrapped map (the learned-range
     /// family is rebuilt wholesale into a fresh `Arc`, so sharing is stable).
-    pub(crate) fn share(indexes: Arc<HashMap<u16, T>>, applied_through: Epoch) -> Self {
+    pub(crate) fn share(
+        indexes: Arc<HashMap<u16, T>>,
+        applied_through: Epoch,
+        applied_through_hlc: HlcTimestamp,
+    ) -> Self {
         Self {
             indexes,
             applied_through,
+            applied_through_hlc,
         }
     }
 
@@ -87,9 +101,25 @@ impl<T> IndexFamilyGeneration<T> {
         self.indexes.is_empty()
     }
 
-    /// Highest commit epoch applied into these indexes.
+    /// Local sequencing epoch.
     pub fn applied_through(&self) -> Epoch {
         self.applied_through
+    }
+
+    /// Authoritative HLC readiness watermark (P0.5-T5).
+    pub fn applied_through_hlc(&self) -> HlcTimestamp {
+        self.applied_through_hlc
+    }
+
+    /// Whether this family is ready for a request at `request_hlc`.
+    pub fn ready_for_hlc(&self, request_hlc: HlcTimestamp) -> bool {
+        if request_hlc == HlcTimestamp::ZERO {
+            return true;
+        }
+        if self.applied_through_hlc == HlcTimestamp::ZERO {
+            return false;
+        }
+        self.applied_through_hlc >= request_hlc
     }
 
     /// Iterate `(column_id, index)` pairs.
@@ -108,7 +138,7 @@ impl<T> IndexFamilyGeneration<T> {
 /// The six public index families, captured and published as one atomic
 /// generation (S1C-002). Readers pin an `Arc<IndexGeneration>`; writers
 /// publish a replacement with a single `ArcSwap` store.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IndexGeneration {
     bitmap: IndexFamilyGeneration<BitmapIndex>,
     range: IndexFamilyGeneration<ColumnLearnedRange>,
@@ -117,11 +147,27 @@ pub struct IndexGeneration {
     sparse: IndexFamilyGeneration<SparseIndex>,
     minhash: IndexFamilyGeneration<MinHashIndex>,
     applied_through: Epoch,
+    applied_through_hlc: HlcTimestamp,
+}
+
+impl Default for IndexGeneration {
+    fn default() -> Self {
+        Self {
+            bitmap: IndexFamilyGeneration::default(),
+            range: IndexFamilyGeneration::default(),
+            fm: IndexFamilyGeneration::default(),
+            ann: IndexFamilyGeneration::default(),
+            sparse: IndexFamilyGeneration::default(),
+            minhash: IndexFamilyGeneration::default(),
+            applied_through: Epoch(0),
+            applied_through_hlc: HlcTimestamp::ZERO,
+        }
+    }
 }
 
 impl IndexGeneration {
     /// Capture one generation from the writer's (freshly sealed) per-family
-    /// index maps at the `applied_through` watermark.
+    /// index maps at the epoch + HLC watermarks (P0.5-T5).
     pub(crate) fn capture(
         bitmap: &HashMap<u16, BitmapIndex>,
         range: &Arc<HashMap<u16, ColumnLearnedRange>>,
@@ -130,15 +176,21 @@ impl IndexGeneration {
         sparse: &HashMap<u16, SparseIndex>,
         minhash: &HashMap<u16, MinHashIndex>,
         applied_through: Epoch,
+        applied_through_hlc: HlcTimestamp,
     ) -> Self {
         Self {
-            bitmap: IndexFamilyGeneration::capture(bitmap, applied_through),
-            range: IndexFamilyGeneration::share(Arc::clone(range), applied_through),
-            fm: IndexFamilyGeneration::capture(fm, applied_through),
-            ann: IndexFamilyGeneration::capture(ann, applied_through),
-            sparse: IndexFamilyGeneration::capture(sparse, applied_through),
-            minhash: IndexFamilyGeneration::capture(minhash, applied_through),
+            bitmap: IndexFamilyGeneration::capture(bitmap, applied_through, applied_through_hlc),
+            range: IndexFamilyGeneration::share(
+                Arc::clone(range),
+                applied_through,
+                applied_through_hlc,
+            ),
+            fm: IndexFamilyGeneration::capture(fm, applied_through, applied_through_hlc),
+            ann: IndexFamilyGeneration::capture(ann, applied_through, applied_through_hlc),
+            sparse: IndexFamilyGeneration::capture(sparse, applied_through, applied_through_hlc),
+            minhash: IndexFamilyGeneration::capture(minhash, applied_through, applied_through_hlc),
             applied_through,
+            applied_through_hlc,
         }
     }
 
@@ -166,11 +218,19 @@ impl IndexGeneration {
         &self.minhash
     }
 
-    /// Highest commit epoch applied into this generation. Every family is
-    /// captured at the same watermark, so this equals each family's
-    /// `applied_through`.
+    /// Highest commit epoch applied into this generation (local sequencing).
     pub fn applied_through(&self) -> Epoch {
         self.applied_through
+    }
+
+    /// Authoritative HLC readiness watermark for this generation (P0.5-T5).
+    pub fn applied_through_hlc(&self) -> HlcTimestamp {
+        self.applied_through_hlc
+    }
+
+    /// Whether indexes are ready for a request at `request_hlc`.
+    pub fn ready_for_hlc(&self, request_hlc: HlcTimestamp) -> bool {
+        self.bitmap.ready_for_hlc(request_hlc)
     }
 }
 
@@ -186,7 +246,12 @@ mod tests {
         writer.seal();
         let mut map = HashMap::new();
         map.insert(7u16, writer.clone());
-        let generation = IndexFamilyGeneration::capture(&map, Epoch(5));
+        let hlc = HlcTimestamp {
+            physical_micros: 50,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let generation = IndexFamilyGeneration::capture(&map, Epoch(5), hlc);
 
         // Writes after the capture go to the writer's fresh active delta and
         // are invisible through the pinned generation.
@@ -196,6 +261,8 @@ mod tests {
         assert!(pinned.get(b"blue").is_empty());
         assert!(writer.get(b"blue").contains(2));
         assert_eq!(generation.applied_through(), Epoch(5));
+        assert_eq!(generation.applied_through_hlc(), hlc);
+        assert!(generation.ready_for_hlc(hlc));
         assert_eq!(generation.len(), 1);
         assert_eq!(generation.column_ids().collect::<Vec<_>>(), vec![7]);
     }
@@ -206,6 +273,11 @@ mod tests {
         bitmap.insert(1u16, BitmapIndex::new());
         let mut ann = HashMap::new();
         ann.insert(2u16, AnnIndex::new(8));
+        let hlc = HlcTimestamp {
+            physical_micros: 11,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
         let generation = IndexGeneration::capture(
             &bitmap,
             &Arc::new(HashMap::new()),
@@ -214,9 +286,12 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Epoch(11),
+            hlc,
         );
         assert_eq!(generation.applied_through(), Epoch(11));
+        assert_eq!(generation.applied_through_hlc(), hlc);
         assert_eq!(generation.bitmap().applied_through(), Epoch(11));
+        assert_eq!(generation.bitmap().applied_through_hlc(), hlc);
         assert!(generation.bitmap().get(1).is_some());
         assert!(generation.ann().get(2).is_some());
         assert!(generation.fm().is_empty());

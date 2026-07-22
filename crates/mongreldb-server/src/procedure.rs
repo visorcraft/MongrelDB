@@ -48,7 +48,7 @@ pub async fn list(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    Json(json!({ "procedures": state.db.procedures() })).into_response()
+    Json(json!({ "procedures": state.db().procedures() })).into_response()
 }
 
 pub async fn describe(
@@ -59,7 +59,7 @@ pub async fn describe(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    match state.db.procedure(&name) {
+    match state.db().procedure(&name) {
         Some(procedure) => Json(json!({ "procedure": procedure })).into_response(),
         None => error(
             StatusCode::NOT_FOUND,
@@ -80,7 +80,7 @@ pub async fn create(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    match normalized(req.procedure).and_then(|procedure| state.db.create_procedure(procedure)) {
+    match normalized(req.procedure).and_then(|procedure| state.db().create_procedure(procedure)) {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
         Err(failure) => crate::kit::durable_core_error_response(&failure).unwrap_or_else(|| {
             error(
@@ -107,7 +107,7 @@ pub async fn replace(
     let mut procedure = req.procedure;
     procedure.name = name;
     match normalized(procedure)
-        .and_then(|procedure| state.db.create_or_replace_procedure(procedure))
+        .and_then(|procedure| state.db().create_or_replace_procedure(procedure))
     {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
         Err(failure) => crate::kit::durable_core_error_response(&failure).unwrap_or_else(|| {
@@ -131,7 +131,7 @@ pub async fn drop_procedure(
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
-    match state.db.drop_procedure_with_epoch(&name) {
+    match state.db().drop_procedure_with_epoch(&name) {
         Ok(epoch) => Json(json!({
             "status": "committed",
             "epoch": epoch.0,
@@ -216,8 +216,7 @@ async fn call_inner(
                         &message,
                     ))
                 })?;
-            match state
-                .db
+            match state.db()
                 .call_procedure_as_bound(&procedure, args, principal.as_ref())
             {
                 Ok(result) => Ok(json!({
@@ -251,9 +250,8 @@ fn authorized_procedure_revision(
     principal: Option<&mongreldb_core::Principal>,
 ) -> Result<(StoredProcedure, u64), Box<Response>> {
     for _ in 0..3 {
-        let security_version = state.db.security_version();
-        if let Err(failure) = state
-            .db
+        let security_version = state.db().security_version();
+        if let Err(failure) = state.db()
             .require_for(principal, &mongreldb_core::Permission::All)
         {
             return Err(Box::new(error(
@@ -262,14 +260,14 @@ fn authorized_procedure_revision(
                 &failure.to_string(),
             )));
         }
-        let Some(procedure) = state.db.procedure(name) else {
+        let Some(procedure) = state.db().procedure(name) else {
             return Err(Box::new(error(
                 StatusCode::NOT_FOUND,
                 "PROCEDURE_NOT_FOUND",
                 "procedure not found",
             )));
         };
-        if state.db.security_version() == security_version {
+        if state.db().security_version() == security_version {
             return Ok((procedure, security_version));
         }
     }
@@ -284,8 +282,7 @@ fn require_ddl(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
 ) -> Result<(), Box<Response>> {
-    state
-        .db
+    state.db()
         .require_for(
             request_principal(state, principal).as_ref(),
             &mongreldb_core::Permission::Ddl,

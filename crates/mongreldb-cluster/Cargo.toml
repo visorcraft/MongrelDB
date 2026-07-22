@@ -36,3 +36,9 @@ mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.63.1" }
 [dev-dependencies]
 mongreldb-sim = { path = "../mongreldb-sim", version = "0.63.1" }
 tempfile = "3"
+
+[features]
+default = []
+# Escape hatch that exposes plaintext cluster transport constructors outside
+# `cfg(test)`. Production binaries must never enable this feature.
+dangerous-test-transport = []

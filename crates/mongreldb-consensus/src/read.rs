@@ -310,6 +310,8 @@ mod tests {
         ));
     }
 
+    /// ID: P0.5-X7 — bounded-staleness rejects a lagging replica once applied
+    /// HLC lag exceeds the requested bound (and fails closed when unapplied).
     #[test]
     fn behind_replica_measures_applied_ts_age() {
         let now = || {
@@ -344,5 +346,21 @@ mod tests {
                 ..
             }
         ));
+
+        // Replica applied_hlc far behind required freshness (100 ms lag vs 50 ms bound).
+        let lagging = evaluate_bounded_staleness(
+            &watermark(5, Some(999_900_000)),
+            Some(20),
+            now,
+            50,
+        )
+        .unwrap_err();
+        match lagging {
+            ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms } => {
+                assert_eq!(max_lag_ms, 50);
+                assert_eq!(lag_ms, 100);
+            }
+            other => panic!("expected StalenessExceeded for lagging replica, got {other:?}"),
+        }
     }
 }

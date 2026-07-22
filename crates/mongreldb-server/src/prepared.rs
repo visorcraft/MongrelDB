@@ -222,6 +222,7 @@ mod tests {
         );
     }
 
+    // ID: P0.4-X13 Stale schema forces prepared replan (binding incompatible).
     #[test]
     fn binding_compatibility_follows_catalog_state() {
         let dir = tempdir().unwrap();

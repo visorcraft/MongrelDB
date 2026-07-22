@@ -222,8 +222,8 @@ where
     ) -> Result<T, MongrelError>,
 {
     let catalog_bound = principal
-        .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    state.db.with_authorized_scored_read_context_at_stamped(
+        .is_some_and(|principal| state.db().resolve_principal(&principal.username).is_some());
+    state.db().with_authorized_scored_read_context_at_stamped(
         table,
         principal,
         catalog_bound,
@@ -806,8 +806,7 @@ pub(crate) fn idempotency_owner(
     authenticated_user: Option<&mongreldb_core::Principal>,
 ) -> std::result::Result<String, Box<Response>> {
     if let Some(principal) = authenticated_user {
-        state
-            .db
+        state.db()
             .resolve_current_principal(principal)
             .ok_or_else(|| Box::new(kit_core_error(&MongrelError::AuthRequired)))?;
         return Ok(format!(
@@ -816,11 +815,10 @@ pub(crate) fn idempotency_owner(
         ));
     }
     if let Some(token) = state.auth_token.as_deref() {
-        if state.db.require_auth_enabled()
-            && !state
-                .db
+        if state.db().require_auth_enabled()
+            && !state.db()
                 .principal_snapshot()
-                .and_then(|principal| state.db.resolve_current_principal(&principal))
+                .and_then(|principal| state.db().resolve_current_principal(&principal))
                 .is_some_and(|principal| principal.is_admin)
         {
             return Err(Box::new(kit_core_error(&MongrelError::AuthRequired)));
@@ -834,7 +832,7 @@ pub(crate) fn idempotency_owner(
             crate::sql_idempotency::hex(&digest.finalize())
         ));
     }
-    if state.user_auth || state.db.require_auth_enabled() {
+    if state.user_auth || state.db().require_auth_enabled() {
         return Err(Box::new(kit_core_error(&MongrelError::AuthRequired)));
     }
     Ok("anonymous".into())
@@ -1221,7 +1219,7 @@ pub async fn schema_all(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     let principal = request_principal(&state, &principal);
-    let names = state.db.table_names();
+    let names = state.db().table_names();
     let mut tables = serde_json::Map::new();
     for name in &names {
         if let Ok(schema) = visible_schema(&state, name, principal.as_ref()) {
@@ -1248,8 +1246,8 @@ fn visible_schema(
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
 ) -> mongreldb_core::Result<Schema> {
-    let allowed = state.db.select_column_ids_for(table, principal)?;
-    let mut schema = state.db.table(table)?.lock().schema().clone();
+    let allowed = state.db().select_column_ids_for(table, principal)?;
+    let mut schema = state.db().table(table)?.lock().schema().clone();
     let restricted = allowed.len() != schema.columns.len();
     schema.columns.retain(|column| allowed.contains(&column.id));
     schema
@@ -1574,7 +1572,7 @@ pub async fn kit_create_table(
     if let Some(response) = crate::require_writes_open(&state) {
         return response;
     }
-    if let Err(error) = state.db.require_for(
+    if let Err(error) = state.db().require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
@@ -1694,7 +1692,7 @@ pub async fn kit_create_table(
         constraints: req.constraints,
         clustered: false,
     };
-    match state.db.create_table(&req.name, schema) {
+    match state.db().create_table(&req.name, schema) {
         Ok(id) => Json(json!({
             "table_id": id,
             "table_id_text": id.to_string()
@@ -1766,6 +1764,16 @@ pub async fn kit_txn(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitTxnRequest>,
 ) -> Response {
+    // P0.2: cluster mode routes simple put batches through tablet Raft; never
+    // open standalone AppState.db for ordinary Kit writes.
+    if state.is_cluster_mode() {
+        if let Some(response) = crate::cluster_data_plane::try_kit_txn(&state, &req).await {
+            return response;
+        }
+        if let Some(response) = crate::refuse_cluster_standalone_data_plane(&state) {
+            return response;
+        }
+    }
     if let Some(response) = crate::require_writes_open(&state) {
         return response;
     }
@@ -2203,7 +2211,7 @@ pub enum JsonRetriever {
 }
 
 impl JsonRetriever {
-    fn column_id(&self) -> u16 {
+    pub(crate) fn column_id(&self) -> u16 {
         match self {
             Self::Ann { column_id, .. }
             | Self::Sparse { column_id, .. }
@@ -2282,13 +2290,12 @@ pub async fn kit_ai_metrics(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     let principal = request_principal(&state, &principal);
-    if let Err(error) = state
-        .db
+    if let Err(error) = state.db()
         .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
     {
         return kit_core_error(&error);
     }
-    let stats = state.db.rls_cache_stats();
+    let stats = state.db().rls_cache_stats();
     Json(json!({
         "rls_cache": {
             "entries": stats.entries,
@@ -2314,7 +2321,7 @@ pub async fn kit_retrieve(
     };
     let principal = request_principal(&state, &principal);
     let column_id = req.retriever.column_id();
-    if let Err(error) = state.db.require_columns_for(
+    if let Err(error) = state.db().require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &[column_id],
@@ -2371,7 +2378,7 @@ pub async fn kit_ann_rerank(
         Err(error) => return kit_core_error(&error),
     };
     let principal = request_principal(&state, &principal);
-    if let Err(error) = state.db.require_columns_for(
+    if let Err(error) = state.db().require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &[req.column_id],
@@ -2537,7 +2544,7 @@ fn execute_kit_search(
     context: &mongreldb_core::query::AiExecutionContext,
 ) -> Result<Jval, MongrelError> {
     let cursor_mac_key = state.cursor_mac_key.get()?;
-    let handle = state.db.table(&req.table)?;
+    let handle = state.db().table(&req.table)?;
     let schema = mongreldb_core::lock_table_with_context(&handle, Some(context))?
         .schema()
         .clone();
@@ -2579,7 +2586,7 @@ fn execute_kit_search(
     }
     required.sort_unstable();
     required.dedup();
-    state.db.require_columns_for(
+    state.db().require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &required,
@@ -2675,8 +2682,8 @@ fn execute_kit_search(
     }
     let epoch = cursor
         .map(|cursor| cursor.epoch)
-        .unwrap_or_else(|| state.db.visible_epoch().0);
-    let (snapshot, _snapshot_guard) = state.db.snapshot_at_owned(mongreldb_core::Epoch(epoch))?;
+        .unwrap_or_else(|| state.db().visible_epoch().0);
+    let (snapshot, _snapshot_guard) = state.db().snapshot_at_owned(mongreldb_core::Epoch(epoch))?;
     let search_after = cursor
         .map(|cursor| {
             Ok::<_, MongrelError>(mongreldb_core::query::SearchAfter {
@@ -2712,8 +2719,7 @@ fn execute_kit_search(
                     Some(&read_context),
                     search_after,
                 )?;
-                state
-                    .db
+                state.db()
                     .mask_search_hits_for(&req.table, &mut hits, effective_principal)?;
                 Ok(hits)
             },
@@ -2812,10 +2818,20 @@ pub async fn kit_search(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitSearchRequest>,
 ) -> Response {
+    // P0.2 / P0.8: cluster mode serves tablet_rows with hybrid fusion when
+    // multiple retrievers are present (fuse_distributed_hits → merge_hybrid_contributions).
+    // Never open standalone AppState.db for Kit search.
+    if state.is_cluster_mode() {
+        if let Some(response) = crate::cluster_data_plane::try_kit_search(&state, &req).await {
+            return response;
+        }
+        if let Some(response) = crate::refuse_cluster_standalone_data_plane(&state) {
+            return response;
+        }
+    }
     let principal = request_principal(&state, &principal);
     if req.explain {
-        if let Err(error) = state
-            .db
+        if let Err(error) = state.db()
             .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
         {
             return kit_core_error(&error);
@@ -2860,7 +2876,7 @@ pub async fn kit_set_similarity(
         Err(error) => return kit_core_error(&error),
     };
     let principal = request_principal(&state, &principal);
-    if let Err(error) = state.db.require_columns_for(
+    if let Err(error) = state.db().require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &[req.column_id],
@@ -2947,13 +2963,12 @@ pub async fn kit_query(
         Err(error) => return kit_core_error(&error),
     };
     let principal = request_principal(&state, &principal);
-    let handle = match state.db.table(&req.table) {
+    let handle = match state.db().table(&req.table) {
         Ok(h) => h,
         Err(error) => return kit_core_error(&error),
     };
     let schema = handle.lock().schema().clone();
-    let allowed = match state
-        .db
+    let allowed = match state.db()
         .select_column_ids_for(&req.table, principal.as_ref())
     {
         Ok(allowed) => allowed,
@@ -2997,7 +3012,7 @@ pub async fn kit_query(
     }
     required.sort_unstable();
     required.dedup();
-    if let Err(error) = state.db.require_columns_for(
+    if let Err(error) = state.db().require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &required,
@@ -3046,8 +3061,8 @@ pub async fn kit_query(
     }
     let epoch = cursor
         .map(|cursor| cursor.epoch)
-        .unwrap_or_else(|| state.db.visible_epoch().0);
-    let (snapshot, _snapshot_guard) = match state.db.snapshot_at_owned(mongreldb_core::Epoch(epoch))
+        .unwrap_or_else(|| state.db().visible_epoch().0);
+    let (snapshot, _snapshot_guard) = match state.db().snapshot_at_owned(mongreldb_core::Epoch(epoch))
     {
         Ok(snapshot) => snapshot,
         Err(error) => return kit_core_error(&error),
@@ -3069,8 +3084,8 @@ pub async fn kit_query(
         .collect::<std::collections::HashSet<_>>();
     let principal_catalog_bound = principal
         .as_ref()
-        .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    let (rows, stamp) = match state.db.with_authorized_read_context_stamped(
+        .is_some_and(|principal| state.db().resolve_principal(&principal.username).is_some());
+    let (rows, stamp) = match state.db().with_authorized_read_context_stamped(
         &req.table,
         principal.as_ref(),
         principal_catalog_bound,
@@ -3089,8 +3104,7 @@ pub async fn kit_query(
                 after_row_id,
                 query_time_nanos,
             )?;
-            state
-                .db
+            state.db()
                 .secure_rows_for(&req.table, rows, effective_principal)
         },
     ) {
@@ -3279,9 +3293,9 @@ fn preflight_kit_txn(
     principal: Option<&mongreldb_core::Principal>,
 ) -> Result<KitTxnPreflight, Box<Response>> {
     for _ in 0..3 {
-        let security_version = state.db.security_version();
+        let security_version = state.db().security_version();
         let tables = preflight_kit_txn_once(state, req, principal)?;
-        if state.db.security_version() == security_version {
+        if state.db().security_version() == security_version {
             return Ok(KitTxnPreflight {
                 tables,
                 security_version,
@@ -3317,8 +3331,7 @@ fn preflight_kit_txn_once(
                     let cells = parse_cells(cells, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
                     let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
-                    state
-                        .db
+                    state.db()
                         .require_columns_for(
                             table,
                             mongreldb_core::ColumnOperation::Insert,
@@ -3339,8 +3352,7 @@ fn preflight_kit_txn_once(
                     let cells = parse_cells(cells, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
                     let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
-                    state
-                        .db
+                    state.db()
                         .require_columns_for(
                             table,
                             mongreldb_core::ColumnOperation::Insert,
@@ -3357,8 +3369,7 @@ fn preflight_kit_txn_once(
                             .iter()
                             .map(|(column, _)| *column)
                             .collect::<Vec<_>>();
-                        state
-                            .db
+                        state.db()
                             .require_columns_for(
                                 table,
                                 mongreldb_core::ColumnOperation::Update,
@@ -3371,8 +3382,7 @@ fn preflight_kit_txn_once(
                         require_returning_columns(state, table, &schema, principal)?;
                     }
                 }
-                KitOp::Delete { .. } => state
-                    .db
+                KitOp::Delete { .. } => state.db()
                     .require_for(
                         principal,
                         &mongreldb_core::Permission::Delete {
@@ -3383,8 +3393,7 @@ fn preflight_kit_txn_once(
                 KitOp::DeleteByPk { pk, .. } => {
                     pk_value(pk, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
-                    state
-                        .db
+                    state.db()
                         .require_for(
                             principal,
                             &mongreldb_core::Permission::Delete {
@@ -3394,7 +3403,7 @@ fn preflight_kit_txn_once(
                         .map_err(|error| Box::new(kit_core_error(&error)))?;
                 }
             }
-            if state.db.table_identity(table).ok() == Some((binding.table_id, binding.schema_id)) {
+            if state.db().table_identity(table).ok() == Some((binding.table_id, binding.schema_id)) {
                 stable = Some(binding);
                 break;
             }
@@ -3419,8 +3428,7 @@ fn require_returning_columns(
         .iter()
         .map(|column| column.id)
         .collect::<Vec<_>>();
-    state
-        .db
+    state.db()
         .require_columns_for(
             table,
             mongreldb_core::ColumnOperation::Select,
@@ -3435,10 +3443,10 @@ fn current_kit_table(
     table: &str,
 ) -> mongreldb_core::Result<(KitTxnTableBinding, Schema)> {
     for _ in 0..3 {
-        let (table_id, schema_id) = state.db.table_identity(table)?;
-        let schema = state.db.table(table)?.lock().schema().clone();
+        let (table_id, schema_id) = state.db().table_identity(table)?;
+        let schema = state.db().table(table)?.lock().schema().clone();
         if schema.schema_id == schema_id
-            && state.db.table_identity(table).ok() == Some((table_id, schema_id))
+            && state.db().table_identity(table).ok() == Some((table_id, schema_id))
         {
             return Ok((
                 KitTxnTableBinding {
@@ -3574,7 +3582,7 @@ fn execute_kit_txn(
     // 2. Execute the whole batch inside ONE core transaction. Constraint
     //    enforcement (unique / FK / check) is authoritative at commit; any
     //    violation aborts the entire batch atomically (no partial commit).
-    let db = Arc::clone(&state.db);
+    let db = Arc::clone(state.db());
     let mut transaction = db.begin_as(principal);
     let outcome: mongreldb_core::Result<Vec<KitOpResult>> = (|| {
         let mut results: Vec<KitOpResult> = Vec::with_capacity(parsed.len());
@@ -3666,7 +3674,7 @@ fn execute_kit_txn(
             | KitOp::Delete { table, .. }
             | KitOp::DeleteByPk { table, .. } => table,
         };
-        if state.db.table_identity(table).ok() != Some((binding.table_id, binding.schema_id)) {
+        if state.db().table_identity(table).ok() != Some((binding.table_id, binding.schema_id)) {
             return Err(idempotent_txn_failure(MongrelError::Conflict(format!(
                 "table {table:?} changed before transaction commit"
             ))));

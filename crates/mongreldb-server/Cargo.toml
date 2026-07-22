@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "mongreldb_server"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Non-production escape hatch: allows plaintext cluster transport in non-test
+# builds of the server library/binary. Never enable for release packages.
+dangerous-test-transport = ["mongreldb-cluster/dangerous-test-transport"]
+
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.63.1" }
 mongreldb-query = { path = "../mongreldb-query", version = "0.63.1" }
@@ -30,6 +36,9 @@ mongreldb-log = { path = "../mongreldb-log", version = "0.63.1" }
 # CLI subcommands and the `/admin/cluster/*` endpoints map onto this crate's
 # node-identity and membership functions.
 mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.63.1" }
+# Tablet engine sinks for production fragment/AI workers (P0.2): resolve the
+# applied ClusterReplica core for a hosted tablet without dual-root opens.
+mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.63.1" }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -38,6 +47,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
 arrow = "58"
+# Public cluster SQL planning seam (P0.4) names DataFusion logical plans.
+datafusion = "54.0.0"
 futures = "0.3"
 async-trait = "0.1"
 prost = "0.14"

@@ -334,6 +334,8 @@ async fn per_request_output_limits_must_be_positive_and_clamp_to_server_limits()
     assert_eq!(clamped.status(), StatusCode::OK);
 }
 
+/// P0.6-X5: multi-statement partial commit reports committed_statements > 0
+/// with structural outcome fields (no string parsing).
 #[tokio::test]
 async fn buffered_output_limit_preserves_and_reports_earlier_commits() {
     let dir = tempdir().unwrap();

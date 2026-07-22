@@ -1989,6 +1989,7 @@ mod tests {
         assert_eq!(status.terminal_error.unwrap().code, "SERIALIZATION_FAILED");
     }
 
+    // ID: P0.6-X6 Serialization failure after commit keeps durable receipt.
     #[test]
     fn serialization_failure_after_commit_keeps_exact_durable_outcome() {
         let registry = Arc::new(SqlQueryRegistry::default());
@@ -2005,8 +2006,13 @@ mod tests {
 
         let status = registry.status(query.id()).unwrap();
         assert_eq!(status.phase, SqlQueryPhase::Failed);
+        assert!(status.durable_outcome.committed);
         assert_eq!(status.durable_outcome.last_commit_epoch, Some(73));
         assert_eq!(status.durable_outcome.committed_statements, 1);
+        assert_eq!(
+            status.serialization_outcome,
+            SerializationOutcome::Failed
+        );
         assert_eq!(
             status.terminal_error.unwrap().code,
             "SERIALIZATION_FAILED_AFTER_COMMIT"
