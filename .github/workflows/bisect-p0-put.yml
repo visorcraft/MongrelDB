@@ -1,0 +1,99 @@
+name: Bisect P0 put latency
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOOD_SHA: eecb39fcbe9d8da7c0921db871f032a3e59e0762
+  BAD_SHA: bb59eb8d7071a2c08e2d0084b11c1c82cb12a521
+  RUST_VERSION: "1.96.1"
+  CARGO_TARGET_DIR: /tmp/target-p0-bisect
+
+jobs:
+  bisect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
+      - name: Bisect write_path/put_no_fsync
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/p0-bisect
+          log=/tmp/p0-bisect/results.tsv
+          printf 'commit\tslope_ns\tclassification\n' > "$log"
+
+          cat > /tmp/classify-p0.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          commit=$(git rev-parse HEAD)
+          criterion="$CARGO_TARGET_DIR/criterion/write_path/put_no_fsync"
+          rm -rf "$criterion"
+          run_log="/tmp/p0-bisect/${commit}.log"
+          if ! timeout 1200 cargo "+$RUST_VERSION" bench -p mongreldb-core \
+              --bench write_path -- write_path/put_no_fsync \
+              --noplot --sample-size 50 --measurement-time 3 --warm-up-time 1 \
+              >"$run_log" 2>&1; then
+            printf '%s\tNA\tskip\n' "$commit" >> /tmp/p0-bisect/results.tsv
+            exit 125
+          fi
+          estimate=$(find "$criterion" -path '*/new/estimates.json' -print -quit)
+          if [[ -z "$estimate" ]]; then
+            printf '%s\tNA\tskip-no-estimate\n' "$commit" >> /tmp/p0-bisect/results.tsv
+            exit 125
+          fi
+          ns=$(jq -r '.slope.point_estimate // .mean.point_estimate' "$estimate")
+          classification=$(python3 - "$ns" <<'PY'
+          import sys
+          value = float(sys.argv[1])
+          print('good' if value < 1950.0 else 'bad')
+          PY
+          )
+          printf '%s\t%s\t%s\n' "$commit" "$ns" "$classification" | tee -a /tmp/p0-bisect/results.tsv
+          [[ "$classification" == good ]]
+          SCRIPT
+          chmod +x /tmp/classify-p0.sh
+
+          git reset --hard "$BAD_SHA"
+          echo '=== endpoint checks ===' | tee /tmp/p0-bisect/bisect.log
+          git checkout --detach "$GOOD_SHA"
+          /tmp/classify-p0.sh
+          git checkout --detach "$BAD_SHA"
+          if /tmp/classify-p0.sh; then
+            echo 'bad endpoint classified good' | tee -a /tmp/p0-bisect/bisect.log
+            exit 1
+          fi
+
+          git bisect start "$BAD_SHA" "$GOOD_SHA"
+          set +e
+          git bisect run /tmp/classify-p0.sh 2>&1 | tee -a /tmp/p0-bisect/bisect.log
+          status=${PIPESTATUS[0]}
+          set -e
+          git bisect log > /tmp/p0-bisect/bisect-commands.log
+          first_bad=$(git rev-parse HEAD)
+          git show --stat --summary --format=fuller "$first_bad" > /tmp/p0-bisect/first-bad.txt
+          git show --format=fuller --find-renames "$first_bad" > /tmp/p0-bisect/first-bad.patch
+          printf '%s\n' "$first_bad" > /tmp/p0-bisect/first-bad.sha
+          cat "$log"
+          cat /tmp/p0-bisect/first-bad.txt
+          if [[ $status -ne 0 ]]; then
+            exit "$status"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p0-put-bisect
+          path: /tmp/p0-bisect
+          if-no-files-found: error
