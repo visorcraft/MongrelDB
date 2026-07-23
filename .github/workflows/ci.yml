@@ -1,13 +1,13 @@
-name: CI
+name: Callgrind P0 profile
 
 on:
   push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+    branches:
+      - agent/profile-p0-callgrind
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: p0-callgrind-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -37,6 +37,7 @@ jobs:
           set -euo pipefail
           out=/tmp/p0-callgrind
           mkdir -p "$out"
+          exec > >(tee "$out/driver.log") 2>&1
           git worktree add --detach /tmp/p0-good "$GOOD_SHA"
           git worktree add --detach /tmp/p0-bad "$BAD_SHA"
 
@@ -61,14 +62,17 @@ jobs:
           }
 
           profile() {
-            local dir=$1 label=$2 target="/tmp/target-callgrind-$label"
+            local dir=$1
+            local label=$2
+            local target="/tmp/target-callgrind-$label"
             prepare "$dir"
-            build_json="$out/$label-build.jsonl"
+            local build_json="$out/$label-build.jsonl"
             (
               cd "$dir"
               CARGO_TARGET_DIR="$target" cargo "+$RUST_VERSION" bench \
                 -p mongreldb-core --bench write_path --no-run --message-format=json
             ) | tee "$build_json"
+            local exe
             exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "write_path" and .executable != null) | .executable' "$build_json" | tail -1)
             test -x "$exe"
             valgrind --tool=callgrind \
@@ -94,9 +98,9 @@ jobs:
             echo '=== bad totals ==='
             cat "$out/bad-totals.txt"
             echo '=== good top inclusive ==='
-            head -80 "$out/good-inclusive.txt"
+            head -100 "$out/good-inclusive.txt"
             echo '=== bad top inclusive ==='
-            head -80 "$out/bad-inclusive.txt"
+            head -100 "$out/bad-inclusive.txt"
           } | tee "$out/summary.txt"
       - uses: actions/upload-artifact@v4
         if: always()
