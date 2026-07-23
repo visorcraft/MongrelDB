@@ -5,9 +5,12 @@ set -euo pipefail
 : "${RUST_OLD:?}"
 out=/tmp/p0-ablation
 mkdir -p "$out"
+exec > >(tee "$out/driver.log") 2>&1
 
 make_variant() {
-  local name=$1 mode=$2 dir="/tmp/p0-$name"
+  local name=$1
+  local mode=$2
+  local dir="/tmp/p0-$name"
   git worktree add --detach "$dir" "$HEAD_SHA"
   python3 - "$dir" "$mode" <<'PY'
 from pathlib import Path
@@ -75,7 +78,6 @@ if "unchecked_wal_seq" in modes:
 '''
     )
 PY
-  cargo "+$RUST_OLD" fmt --manifest-path "$dir/Cargo.toml"
 }
 
 make_variant normal none
@@ -86,7 +88,9 @@ make_variant unchecked-wal-seq unchecked_wal_seq
 make_variant combined no_typecheck+unchecked_rowid+no_private_flags+unchecked_wal_seq
 
 run_one() {
-  local name=$1 dir="/tmp/p0-$name" target="/tmp/target-p0-ablate-$name"
+  local name=$1
+  local dir="/tmp/p0-$name"
+  local target="/tmp/target-p0-ablate-$name"
   (
     cd "$dir"
     CARGO_TARGET_DIR="$target" cargo "+$RUST_OLD" bench -p mongreldb-core \
