@@ -1,0 +1,63 @@
+name: Compare exact P2 HTTP baseline
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: edb690b115846681f5149b2bd56fc92b05ff6166
+  HEAD_SHA: bb59eb8d7071a2c08e2d0084b11c1c82cb12a521
+  RUST_OLD: "1.96.1"
+  RUST_NEW: "1.97.1"
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_NEW }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: rustup toolchain install "$RUST_OLD" --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Compare exact documented HTTP qualification baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=/tmp/p2-http
+          mkdir -p "$out"
+          git worktree add --detach /tmp/p2-base "$BASE_SHA"
+          git worktree add --detach /tmp/p2-head "$HEAD_SHA"
+
+          run_one() {
+            local dir=$1 label=$2 toolchain=$3 target="/tmp/target-p2-${label}-${toolchain//./_}"
+            local log="$out/${label}-${toolchain}.log"
+            for repetition in 1 2 3; do
+              echo "=== repetition $repetition ===" | tee -a "$log"
+              (
+                cd "$dir/crates/mongreldb-server"
+                CARGO_TARGET_DIR="$target" cargo "+$toolchain" test --release \
+                  --test scale_test loopback_point_query_p95_baseline -- --nocapture
+              ) 2>&1 | tee -a "$log"
+            done
+            grep '"test":"loopback_point_query"' "$log" > "$out/${label}-${toolchain}.jsonl" || true
+          }
+
+          run_one /tmp/p2-base base "$RUST_OLD"
+          run_one /tmp/p2-head head "$RUST_OLD"
+          run_one /tmp/p2-head head "$RUST_NEW"
+          cat "$out"/*.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: exact-p2-http-comparison
+          path: /tmp/p2-http
+          if-no-files-found: error
