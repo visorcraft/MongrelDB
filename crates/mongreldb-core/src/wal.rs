@@ -411,6 +411,19 @@ impl Wal {
         Ok(wal)
     }
 
+    /// Create the initial WAL segment through a [`DurableRoot`], respecting
+    /// its deferred-fsync mode. Used by [`crate::engine::Table::create_in`]
+    /// so the parent-directory fsync is batched into the create-time
+    /// `finalize_deferred_sync` pass instead of issuing an eager one.
+    pub(crate) fn create_in_root(
+        wal_root: &crate::durable_file::DurableRoot,
+        segment_no: u64,
+        epoch_created: Epoch,
+        cipher: Option<Box<dyn crate::encryption::Cipher>>,
+    ) -> Result<Self> {
+        Self::create_chained_in(wal_root, segment_no, epoch_created, cipher, [0; 32])
+    }
+
     fn create_chained_from_file(
         file: File,
         path: PathBuf,

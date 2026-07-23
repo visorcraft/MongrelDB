@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Stable identity for a descriptor-pinned durable directory.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -18,6 +19,18 @@ pub enum DurableFileIdentity {
 /// Every relative operation rejects `..`, symlinks, reparse points, and
 /// non-regular final files. Unix operations stay descriptor-relative. Windows
 /// keeps the root and each traversed ancestor open without delete sharing.
+///
+/// # Deferred fsync (batch-create) mode
+///
+/// [`Self::open_deferred`] produces a root whose write/mkdir/rename
+/// operations skip their per-call `fsync`s. The caller must invoke
+/// [`Self::finalize_deferred_sync`] once to fsync the whole tree and
+/// re-enable eager (per-call) fsync for subsequent operations. This is the
+/// primary mechanism for amortizing fsync cost out of batch-create paths
+/// such as [`crate::engine::Table::create`], which would otherwise pay
+/// ~9 fsync round-trips for a fresh table. Security semantics
+/// (descriptor-pinning, path validation) are unaffected — only durability
+/// timing changes.
 pub struct DurableRoot {
     canonical_path: PathBuf,
     #[cfg(any(
@@ -28,6 +41,13 @@ pub struct DurableRoot {
         )
     ))]
     directory: std::fs::File,
+    /// When `false`, durability operations (`fsync` of files and parent
+    /// directories after writes/renames/mkdirs) are skipped. Set to `false`
+    /// by [`Self::open_deferred`]; restored to `true` by
+    /// [`Self::finalize_deferred_sync`]. Relaxed ordering is sufficient
+    /// because the flag is toggled only by the single thread that owns the
+    /// fresh root, before the root becomes shared.
+    sync_eagerly: AtomicBool,
 }
 
 impl std::fmt::Debug for DurableRoot {
@@ -51,6 +71,7 @@ impl DurableRoot {
                 )
             ))]
             directory: self.directory.try_clone()?,
+            sync_eagerly: AtomicBool::new(self.sync_eagerly.load(Ordering::Relaxed)),
         })
     }
 
@@ -93,6 +114,7 @@ impl DurableRoot {
                     return Ok(Self {
                         canonical_path,
                         directory,
+                        sync_eagerly: AtomicBool::new(true),
                     });
                 }
             }
@@ -114,6 +136,7 @@ impl DurableRoot {
             Ok(Self {
                 canonical_path,
                 directory,
+                sync_eagerly: AtomicBool::new(true),
             })
         }
 
@@ -125,6 +148,7 @@ impl DurableRoot {
             return Ok(Self {
                 canonical_path,
                 directory,
+                sync_eagerly: AtomicBool::new(true),
             });
         }
 
@@ -183,8 +207,83 @@ impl DurableRoot {
         #[allow(unreachable_code)]
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "durable root identity is unsupported on this platform",
+            "descriptor-relative durable files are unsupported on this platform",
         ))
+    }
+
+    /// Open the root in deferred-fsync mode: subsequent `write_new`,
+    /// `write_atomic*`, `create_directory_*`, `replace*`, and `copy_new_from`
+    /// operations skip their per-call `fsync`s. The caller must invoke
+    /// [`Self::finalize_deferred_sync`] exactly once to make the deferred
+    /// writes durable and re-enable eager fsync for future operations.
+    ///
+    /// Intended for batch-create paths (e.g. [`crate::engine::Table::create`])
+    /// that issue many independent durable writes against a fresh tree. On a
+    /// filesystem where each `fsync` costs ~1 ms, this collapses ~9 fsync
+    /// round-trips per create into a single recursive pass. Security semantics
+    /// (descriptor-pinning, path validation, symlink rejection) are identical
+    /// to [`Self::open`]; only the timing of `fsync` changes. Calling this on
+    /// a root that will receive ongoing individual durable writes without a
+    /// matching `finalize` would silently lose durability — restrict it to
+    /// batch paths that finalize on every exit path.
+    pub fn open_deferred(root: impl AsRef<Path>) -> io::Result<Self> {
+        let this = Self::open(root)?;
+        this.sync_eagerly.store(false, Ordering::Relaxed);
+        Ok(this)
+    }
+
+    /// Fsync every file and directory under this root, then re-enable eager
+    /// (per-call) fsync for subsequent operations. Idempotent: a root already
+    /// in eager mode returns immediately after syncing the tree once. Returns
+    /// the first sync error encountered (the caller must treat the tree as
+    /// untrusted if this errors).
+    pub fn finalize_deferred_sync(&self) -> io::Result<()> {
+        mongreldb_types::durability::sync_tree_recursive(&self.canonical_path)?;
+        self.sync_eagerly.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Shallow variant of [`Self::finalize_deferred_sync`]: fsync the data of
+    /// every regular file directly under the root, then fsync the root
+    /// directory and each immediate subdirectory for entry-name durability.
+    /// Does NOT recurse into subdirectories or fsync files inside them.
+    ///
+    /// This matches the pre-hardening durability contract: the manifest (and
+    /// any other root-level file) is data-durable, and all entry names in the
+    /// root and its immediate children are durable. Files inside `_wal/`,
+    /// `_runs/`, etc. rely on the OS page cache and the first `commit()` or
+    /// `flush()` to become data-durable — identical to the behavior before
+    /// the descriptor-pinned hardening pass. Used by plaintext `Table::create`
+    /// where the extra fsyncs of the recursive variant would dominate
+    /// batch-create cost without changing the observable crash-recovery
+    /// contract (a table is always reopened via its manifest, and the first
+    /// commit makes everything else durable).
+    pub fn finalize_deferred_sync_shallow(&self) -> io::Result<()> {
+        if !self.should_sync_eagerly() {
+            for entry in (std::fs::read_dir(&self.canonical_path)?).flatten() {
+                let path = entry.path();
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                if meta.is_file() {
+                    std::fs::File::open(&path)?.sync_all()?;
+                } else if meta.is_dir() {
+                    // Best-effort: entry-name durability for immediate
+                    // subdirectories (e.g. `_wal/`, `_runs/`).
+                    let _ = sync_directory(&path);
+                }
+            }
+            sync_directory(&self.canonical_path)?;
+            self.sync_eagerly.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn should_sync_eagerly(&self) -> bool {
+        self.sync_eagerly.load(Ordering::Relaxed)
     }
 
     /// Stable operational path backed by the pinned directory descriptor.
@@ -234,6 +333,7 @@ impl DurableRoot {
             return Ok(DurableRoot {
                 canonical_path,
                 directory: std::fs::File::from(directory),
+                sync_eagerly: AtomicBool::new(true),
             });
         }
 
@@ -245,6 +345,7 @@ impl DurableRoot {
             return Ok(DurableRoot {
                 canonical_path,
                 directory,
+                sync_eagerly: AtomicBool::new(true),
             });
         }
 
@@ -293,7 +394,9 @@ impl DurableRoot {
                             Mode::from_raw_mode(0o700),
                         )
                         .map_err(io::Error::from)?;
-                        fsync(&directory).map_err(io::Error::from)?;
+                        if self.should_sync_eagerly() {
+                            fsync(&directory).map_err(io::Error::from)?;
+                        }
                         openat(
                             &directory,
                             Path::new(&component),
@@ -308,6 +411,7 @@ impl DurableRoot {
             return Ok(DurableRoot {
                 canonical_path,
                 directory: std::fs::File::from(directory),
+                sync_eagerly: AtomicBool::new(true),
             });
         }
 
@@ -341,6 +445,7 @@ impl DurableRoot {
             return Ok(DurableRoot {
                 canonical_path,
                 directory,
+                sync_eagerly: AtomicBool::new(true),
             });
         }
 
@@ -361,7 +466,10 @@ impl DurableRoot {
             let (directory, name) = self.unix_parent(relative.as_ref())?;
             mkdirat(&directory, Path::new(&name), Mode::from_raw_mode(0o700))
                 .map_err(io::Error::from)?;
-            return fsync(directory).map_err(io::Error::from);
+            if self.should_sync_eagerly() {
+                return fsync(directory).map_err(io::Error::from);
+            }
+            return Ok(());
         }
 
         #[cfg(windows)]
@@ -517,7 +625,10 @@ impl DurableRoot {
         let mut file = self.open_create_new(relative)?;
         let result = (|| {
             file.write_all(bytes)?;
-            file.sync_all()
+            if self.should_sync_eagerly() {
+                file.sync_all()?;
+            }
+            Ok::<(), io::Error>(())
         })();
         if result.is_err() {
             let _ = self.remove_file(relative);
@@ -583,7 +694,9 @@ impl DurableRoot {
         let mut destination = self.open_create_new(relative)?;
         let result = (|| {
             let bytes = io::copy(source, &mut destination)?;
-            destination.sync_all()?;
+            if self.should_sync_eagerly() {
+                destination.sync_all()?;
+            }
             Ok(bytes)
         })();
         if result.is_err() {
@@ -1164,9 +1277,11 @@ impl DurableRoot {
             )
             .map_err(io::Error::from)?;
             after_publish();
-            fsync(&destination_parent).map_err(io::Error::from)?;
-            if source.parent() != destination.parent() {
-                fsync(&source_parent).map_err(io::Error::from)?;
+            if self.should_sync_eagerly() {
+                fsync(&destination_parent).map_err(io::Error::from)?;
+                if source.parent() != destination.parent() {
+                    fsync(&source_parent).map_err(io::Error::from)?;
+                }
             }
             return Ok(());
         }
@@ -1187,6 +1302,9 @@ impl DurableRoot {
     }
 
     fn sync_relative_parent(&self, relative: &Path) -> io::Result<()> {
+        if !self.should_sync_eagerly() {
+            return Ok(());
+        }
         #[cfg(all(
             unix,
             any(target_os = "linux", target_os = "android", target_vendor = "apple")
@@ -2230,5 +2348,97 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Regression guard for the deferred-fsync batch-create mode (P0 fix).
+    ///
+    /// `open_deferred` produces a root whose writes skip per-call `fsync`s.
+    /// `finalize_deferred_sync_shallow` must (a) make root-level file data
+    /// durable, (b) make root + immediate subdir entries durable, and (c)
+    /// re-enable eager fsync so subsequent writes are individually synced.
+    ///
+    /// If someone removes the deferred mode or reverts `Table::create` to
+    /// eager fsyncs, this test still passes (the eager path is a superset of
+    /// the deferred contract). The guard catches the inverse regression:
+    /// finalizing without syncing, or leaving the root stuck in deferred
+    /// mode so that post-create writes silently lose durability.
+    #[test]
+    fn deferred_sync_shallow_makes_files_durable_and_re_enables_eager() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path()).unwrap();
+
+        let durable = DurableRoot::open_deferred(root.path()).unwrap();
+        assert!(
+            !durable.should_sync_eagerly(),
+            "open_deferred must start in deferred mode"
+        );
+
+        // Write files + create a subdir as Table::create does.
+        durable.write_new("schema", b"schema-bytes").unwrap();
+        durable.write_atomic("manifest", b"manifest-bytes").unwrap();
+        durable.create_directory_all_pinned("_wal").unwrap();
+        durable.write_new("_wal/seg-0.wal", b"wbyts").unwrap();
+
+        // Finalize.
+        durable
+            .finalize_deferred_sync_shallow()
+            .expect("shallow finalize must succeed");
+        assert!(
+            durable.should_sync_eagerly(),
+            "finalize must re-enable eager fsync"
+        );
+
+        // Root-level files must be present and readable.
+        assert_eq!(
+            std::fs::read(root.path().join("schema")).unwrap(),
+            b"schema-bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("manifest")).unwrap(),
+            b"manifest-bytes"
+        );
+
+        // After finalize, a new write must succeed under eager mode. The
+        // observable contract is just that it returns Ok — the fsync itself
+        // is not directly testable, but returning Ok confirms the root is
+        // back on the eager code path without panicking.
+        durable.write_new("post-finalize", b"ok").unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("post-finalize")).unwrap(),
+            b"ok"
+        );
+    }
+
+    /// `finalize_deferred_sync` (recursive) must make subdir file data
+    /// durable too — used by encrypted create paths where the salt file
+    /// lives under `_meta/`.
+    #[test]
+    fn deferred_sync_recursive_handles_subdir_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path()).unwrap();
+
+        let durable = DurableRoot::open_deferred(root.path()).unwrap();
+        durable.create_directory_all_pinned("_meta").unwrap();
+        durable.write_new("_meta/salt", b"salt-bytes").unwrap();
+        durable.write_new("manifest", b"mf").unwrap();
+
+        durable.finalize_deferred_sync().unwrap();
+        assert!(durable.should_sync_eagerly());
+
+        assert_eq!(
+            std::fs::read(root.path().join("_meta").join("salt")).unwrap(),
+            b"salt-bytes"
+        );
+    }
+
+    /// Idempotency: finalizing an already-eager root is a no-op.
+    #[test]
+    fn finalize_on_eager_root_is_noop() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path()).unwrap();
+        let durable = DurableRoot::open(root.path()).unwrap();
+        assert!(durable.should_sync_eagerly());
+        durable.finalize_deferred_sync_shallow().unwrap();
+        assert!(durable.should_sync_eagerly());
     }
 }

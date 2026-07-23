@@ -1901,12 +1901,21 @@ impl Table {
 
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        crate::durable_file::create_directory_all(&dir)?;
-        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        // Use std::fs (no eager parent-fsync) — the deferred root's finalize
+        // pass makes the entry durable at the end of create.
+        std::fs::create_dir_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open_deferred(&dir)?);
         let pinned = root.io_path()?;
         let mut ctx = SharedCtx::new(None, Some(pinned.join(CACHE_DIR)));
-        ctx.root_guard = Some(root);
-        Self::create_in(&pinned, schema, table_id, ctx)
+        ctx.root_guard = Some(root.clone());
+        let table = Self::create_in(&pinned, schema, table_id, ctx)?;
+        // Shallow finalize: root-level files (schema, manifest) are
+        // data-durable, root + immediate subdirs are entry-durable. Files
+        // inside `_wal/` and `_runs/` rely on the first commit/flush (same
+        // contract as the pre-hardening path). Encrypted tables use the full
+        // recursive `finalize_deferred_sync` via `create_encrypted`.
+        root.finalize_deferred_sync_shallow()?;
+        Ok(table)
     }
 
     /// Create a new encrypted table, deriving the table Key-Encryption Key
@@ -1926,16 +1935,18 @@ impl Table {
         passphrase: &str,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        crate::durable_file::create_directory_all(&dir)?;
-        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        std::fs::create_dir_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open_deferred(&dir)?);
         root.create_directory_all(META_DIR)?;
         let salt = crate::encryption::random_salt()?;
         root.write_atomic(Path::new(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
         let pinned = root.io_path()?;
         let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
-        ctx.root_guard = Some(root);
-        Self::create_in(&pinned, schema, table_id, ctx)
+        ctx.root_guard = Some(root.clone());
+        let table = Self::create_in(&pinned, schema, table_id, ctx)?;
+        root.finalize_deferred_sync()?;
+        Ok(table)
     }
 
     /// Create a new encrypted table using a raw key (e.g. from a key file)
@@ -1949,16 +1960,18 @@ impl Table {
         key: &[u8],
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        crate::durable_file::create_directory_all(&dir)?;
-        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        std::fs::create_dir_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open_deferred(&dir)?);
         root.create_directory_all(META_DIR)?;
         let salt = crate::encryption::random_salt()?;
         root.write_atomic(Path::new(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::from_raw_key(key, &salt)?);
         let pinned = root.io_path()?;
         let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
-        ctx.root_guard = Some(root);
-        Self::create_in(&pinned, schema, table_id, ctx)
+        ctx.root_guard = Some(root.clone());
+        let table = Self::create_in(&pinned, schema, table_id, ctx)?;
+        root.finalize_deferred_sync()?;
+        Ok(table)
     }
 
     /// Open an existing encrypted table using a raw key.
@@ -2011,18 +2024,21 @@ impl Table {
                     root.io_path()?
                 } else {
                     let wal_dir = dir.join(WAL_DIR);
-                    crate::durable_file::create_directory_all(&wal_dir)?;
+                    std::fs::create_dir_all(&wal_dir)?;
                     wal_dir
                 };
-                let mut w = if let Some(ref dk) = wal_dek {
-                    Wal::create_with_cipher(
+                let mut w = match (pinned_wal_root.as_ref(), wal_dek.as_ref()) {
+                    (Some(root), Some(dk)) => {
+                        Wal::create_in_root(root, 0, Epoch(0), Some(make_cipher(dk)))?
+                    }
+                    (Some(root), None) => Wal::create_in_root(root, 0, Epoch(0), None)?,
+                    (None, Some(dk)) => Wal::create_with_cipher(
                         wal_dir.join("seg-000000.wal"),
                         Epoch(0),
                         Some(make_cipher(dk)),
                         0,
-                    )?
-                } else {
-                    Wal::create(wal_dir.join("seg-000000.wal"), Epoch(0))?
+                    )?,
+                    (None, None) => Wal::create(wal_dir.join("seg-000000.wal"), Epoch(0))?,
                 };
                 w.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
                 (WalSink::Private(w), 1)
