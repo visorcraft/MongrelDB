@@ -1,6 +1,9 @@
 name: Ablate P1 bulk-load validation
 
 on:
+  push:
+    branches:
+      - agent/ablate-p1-bulk-bb59
   pull_request:
     branches:
       - master
