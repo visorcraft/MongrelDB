@@ -31,7 +31,7 @@ use crate::trigger::{
 };
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1225,10 +1225,17 @@ fn cdc_rows_json_bytes(rows: &[crate::memtable::Row]) -> usize {
     })
 }
 
+struct RlsCacheEntry {
+    value: Arc<HashSet<RowId>>,
+    bytes: usize,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct RlsCache {
-    entries: HashMap<RlsCacheKey, (Arc<HashSet<RowId>>, usize)>,
-    lru: VecDeque<RlsCacheKey>,
+    entries: HashMap<RlsCacheKey, RlsCacheEntry>,
+    lru: BTreeSet<(u64, RlsCacheKey)>,
+    next_generation: u64,
     bytes: usize,
     hits: u64,
     misses: u64,
@@ -1239,7 +1246,7 @@ struct RlsCache {
 
 impl RlsCache {
     fn get(&mut self, key: &RlsCacheKey) -> Option<Arc<HashSet<RowId>>> {
-        let value = self.entries.get(key).map(|(value, _)| Arc::clone(value));
+        let value = self.entries.get(key).map(|entry| Arc::clone(&entry.value));
         if value.is_some() {
             self.hits = self.hits.saturating_add(1);
             self.touch(key);
@@ -1263,27 +1270,63 @@ impl RlsCache {
         if bytes > RLS_CACHE_MAX_BYTES {
             return;
         }
-        if let Some((_, old_bytes)) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(old_bytes);
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+            self.lru.remove(&(old.generation, key.clone()));
         }
-        self.lru.retain(|candidate| candidate != &key);
         while self.bytes.saturating_add(bytes) > RLS_CACHE_MAX_BYTES {
-            let Some(oldest) = self.lru.pop_front() else {
+            let Some((_, oldest)) = self.lru.pop_first() else {
                 break;
             };
-            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(old_bytes);
+            if let Some(old) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old.bytes);
                 self.evictions = self.evictions.saturating_add(1);
             }
         }
+        let generation = self.allocate_generation();
         self.bytes = self.bytes.saturating_add(bytes);
-        self.lru.push_back(key.clone());
-        self.entries.insert(key, (value, bytes));
+        self.lru.insert((generation, key.clone()));
+        self.entries.insert(
+            key,
+            RlsCacheEntry {
+                value,
+                bytes,
+                generation,
+            },
+        );
     }
 
     fn touch(&mut self, key: &RlsCacheKey) {
-        self.lru.retain(|candidate| candidate != key);
-        self.lru.push_back(key.clone());
+        let Some(previous) = self.entries.get(key).map(|entry| entry.generation) else {
+            return;
+        };
+        self.lru.remove(&(previous, key.clone()));
+        let generation = self.allocate_generation();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.generation = generation;
+        }
+        self.lru.insert((generation, key.clone()));
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.rebase_generations();
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
+    }
+
+    fn rebase_generations(&mut self) {
+        let ordered = std::mem::take(&mut self.lru);
+        for (generation, (_, key)) in ordered.into_iter().enumerate() {
+            let generation = generation as u64;
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.generation = generation;
+                self.lru.insert((generation, key));
+            }
+        }
+        self.next_generation = self.lru.len() as u64;
     }
 
     fn stats(&self) -> RlsCacheStats {
@@ -1296,6 +1339,45 @@ impl RlsCache {
             build_nanos: self.build_nanos,
             rows_evaluated: self.rows_evaluated,
         }
+    }
+}
+
+#[cfg(test)]
+mod rls_cache_tests {
+    use super::*;
+
+    fn key(principal: &str) -> RlsCacheKey {
+        ("table".into(), 1, 1, principal.into())
+    }
+
+    fn rows(row_id: u64) -> Arc<HashSet<RowId>> {
+        Arc::new(std::iter::once(RowId(row_id)).collect())
+    }
+
+    #[test]
+    fn hits_update_recency_without_growing_the_order_index() {
+        let mut cache = RlsCache::default();
+        let first = key("first");
+        let second = key("second");
+        cache.insert(first.clone(), rows(1));
+        cache.insert(second.clone(), rows(2));
+        assert_eq!(cache.lru.len(), cache.entries.len());
+
+        for _ in 0..1_000 {
+            assert!(cache.get(&first).is_some());
+        }
+
+        assert_eq!(cache.lru.len(), cache.entries.len());
+        assert_eq!(
+            cache.lru.first().map(|(_, candidate)| candidate),
+            Some(&second)
+        );
+
+        cache.insert(first.clone(), rows(3));
+        assert_eq!(cache.lru.len(), cache.entries.len());
+        let replacement = cache.get(&first).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert!(replacement.contains(&RowId(3)));
     }
 }
 
