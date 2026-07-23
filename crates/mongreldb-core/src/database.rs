@@ -1388,6 +1388,20 @@ pub enum TableGuard<'a> {
     },
 }
 
+/// Read-only guard for one mounted table.
+///
+/// Copy-on-write handles use the shared side of the table `RwLock`, so
+/// independent readers do not serialize on the writer lock. Legacy direct
+/// handles retain their existing mutex semantics.
+pub enum TableReadGuard<'a> {
+    CopyOnWrite {
+        table: parking_lot::RwLockReadGuard<'a, Arc<Table>>,
+    },
+    Direct {
+        table: parking_lot::MutexGuard<'a, Table>,
+    },
+}
+
 impl TableHandle {
     fn new(table: Table) -> Self {
         Self {
@@ -1398,6 +1412,19 @@ impl TableHandle {
 
     pub fn from_table(table: Table) -> Self {
         Self::new(table)
+    }
+
+    /// Acquire a read-only table guard. Copy-on-write handles admit concurrent
+    /// readers; callers that mutate the table must continue to use [`Self::lock`].
+    pub fn read(&self) -> TableReadGuard<'_> {
+        match &self.inner {
+            TableHandleInner::CopyOnWrite(table) => TableReadGuard::CopyOnWrite {
+                table: table.read(),
+            },
+            TableHandleInner::Direct(table) => TableReadGuard::Direct {
+                table: table.lock(),
+            },
+        }
     }
 
     pub fn lock(&self) -> TableGuard<'_> {
@@ -1495,6 +1522,17 @@ impl std::ops::Deref for TableGuard<'_> {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::CopyOnWrite { table, .. } => table.as_ref(),
+            Self::Direct { table } => table,
+        }
+    }
+}
+
+impl std::ops::Deref for TableReadGuard<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::CopyOnWrite { table } => table.as_ref(),
             Self::Direct { table } => table,
         }
     }

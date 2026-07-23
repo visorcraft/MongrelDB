@@ -487,7 +487,7 @@ impl<'db> Transaction<'db> {
         let snap = self.statement_snapshot();
         let id = self.db.table_id(table)?;
         let handle = self.db.table(table)?;
-        let row = handle.lock().get(row_id, snap);
+        let row = handle.read().get(row_id, snap);
         Ok(row.map(|row| {
             self.read_set.record_row(id, row_id);
             owned_row_from_map(row.columns)
