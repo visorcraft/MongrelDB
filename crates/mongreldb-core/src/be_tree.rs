@@ -163,6 +163,17 @@ impl BeTree {
         }
     }
 
+    /// Visit every buffered version of `row_id`, in the same relative order as
+    /// [`Self::versions`], without materializing the whole tree or descending
+    /// into unrelated key ranges.
+    ///
+    /// A logical row can span several leaves because the physical key includes
+    /// its epoch, so the range walk covers every child intersecting
+    /// `(row_id, Epoch::ZERO)..=(row_id, Epoch(u64::MAX))`.
+    pub(crate) fn visit_versions(&self, row_id: RowId, mut visit: impl FnMut(Row)) {
+        Self::visit_row_versions(&self.root, row_id, &mut visit);
+    }
+
     /// Every buffered version (non-consuming), in no defined order — leaves
     /// plus every internal-node buffer. Used by the memtable adapter to dedup
     /// the newest visible version per `RowId` for a full visible-rows scan.
@@ -319,6 +330,37 @@ impl BeTree {
         }
     }
 
+    fn visit_row_versions(node: &Node, row_id: RowId, visit: &mut impl FnMut(Row)) {
+        match node {
+            Node::Leaf { rows } => {
+                let start = rows.partition_point(|row| row.row_id < row_id);
+                let end = rows.partition_point(|row| row.row_id <= row_id);
+                for row in &rows[start..end] {
+                    visit(row.clone());
+                }
+            }
+            Node::Internal {
+                keys,
+                children,
+                buffer,
+            } => {
+                // Match `collect_all_versions` ordering so the existing
+                // mixed HLC/epoch winner fold remains iteration-equivalent.
+                for message in buffer {
+                    if message.key().0 == row_id {
+                        visit(message.to_row().1);
+                    }
+                }
+
+                let first = Self::child_index(keys, (row_id, Epoch::ZERO));
+                let last = Self::child_index(keys, (row_id, Epoch(u64::MAX)));
+                for child in &children[first..=last] {
+                    Self::visit_row_versions(child, row_id, visit);
+                }
+            }
+        }
+    }
+
     fn flush_all(node: &mut Node) {
         match node {
             Node::Leaf { .. } => {}
@@ -468,6 +510,21 @@ mod tests {
             t.insert_row(val_row(e, e, 0));
         }
         assert_eq!(t.mutations(), 2 * N as usize);
+        let expected = t
+            .versions()
+            .into_iter()
+            .filter(|row| row.row_id == RowId(7777))
+            .map(|row| row.committed_epoch)
+            .collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        t.visit_versions(RowId(7777), |row| {
+            assert_eq!(row.row_id, RowId(7777));
+            visited.push(row.committed_epoch);
+        });
+        assert_eq!(visited, expected);
+        visited.sort_unstable();
+        assert_eq!(visited, (0..N).map(Epoch).collect::<Vec<_>>());
+
         // Every snapshot epoch must see exactly epoch `s` as the newest version
         // of row 7777 (versions are dense 0..N).
         for s in 0..N {

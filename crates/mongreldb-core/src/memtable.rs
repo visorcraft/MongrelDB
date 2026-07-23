@@ -264,13 +264,30 @@ impl Memtable {
     /// Newest version of `row_id` visible under `snapshot` (including
     /// tombstones). Uses HLC authority when stamps are present (P0.5-T3).
     ///
-    /// Scans each segment's versions of `row_id` so dual-model mixes
-    /// (stamped + unstamped) and HLC/epoch order inversions stay correct.
+    /// Seeks each segment's composite-key range for `row_id` so dual-model
+    /// mixes (stamped + unstamped) and HLC/epoch order inversions stay correct
+    /// without materializing every version in the memtable.
     pub fn get_version_at(
         &self,
         row_id: RowId,
         snapshot: crate::epoch::Snapshot,
     ) -> Option<(Epoch, Row)> {
+        if !snapshot.uses_hlc_authority() {
+            let mut best = self.active.tree.get_version(row_id, snapshot.epoch);
+            for segment in self.frozen.iter().rev() {
+                let Some(candidate) = segment.tree.get_version(row_id, snapshot.epoch) else {
+                    continue;
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|(epoch, _)| candidate.0 > *epoch)
+                {
+                    best = Some(candidate);
+                }
+            }
+            return best;
+        }
+
         let mut best: Option<Row> = None;
         for segment in self
             .frozen
@@ -278,12 +295,9 @@ impl Memtable {
             .map(|segment| &segment.tree)
             .chain(std::iter::once(&self.active.tree))
         {
-            for row in segment.versions() {
-                if row.row_id != row_id {
-                    continue;
-                }
+            segment.visit_versions(row_id, |row| {
                 if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
-                    continue;
+                    return;
                 }
                 if best.as_ref().is_none_or(|current| {
                     crate::epoch::Snapshot::version_is_newer(
@@ -295,7 +309,7 @@ impl Memtable {
                 }) {
                     best = Some(row);
                 }
-            }
+            });
         }
         best.map(|row| (row.committed_epoch, row))
     }
