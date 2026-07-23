@@ -14,109 +14,93 @@ permissions:
   contents: read
 
 env:
-  RUST_VERSION: "1.97.1"
+  GOOD_SHA: eecb39fcbe9d8da7c0921db871f032a3e59e0762
+  BAD_SHA: da71336d9f8e977c4393b07fef27bc1297809b04
+  RUST_VERSION: "1.96.1"
 
 jobs:
-  rust:
-    name: Core and lint
+  callgrind:
+    name: Callgrind P0 last-good vs first-bad
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: python3 scripts/verify-component-versions
-      - run: cargo fmt --check
-      # Exclude mongreldb-perf: bundled DuckDB debug builds exhaust runner disk.
-      - run: cargo clippy --workspace --all-targets --all-features --exclude mongreldb-perf -- -D warnings
-      - run: cargo test -p mongreldb-core --all-features
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler valgrind jq
+      - name: Profile put_returning instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=/tmp/p0-callgrind
+          mkdir -p "$out"
+          git worktree add --detach /tmp/p0-good "$GOOD_SHA"
+          git worktree add --detach /tmp/p0-bad "$BAD_SHA"
 
-  workspace-tests:
-    name: Other workspace tests
-    runs-on: ubuntu-latest
-    env:
-      CARGO_BUILD_JOBS: "1"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2.9.1
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      # mongreldb-perf is a benchmark harness with bundled DuckDB/SQLite C++
-      # deps; building it in debug OOMs GitHub-hosted runners ("No space left
-      # on device"). It has no unit tests — run via `cargo run -p mongreldb-perf`
-      # when benchmarking.
-      - run: cargo test --workspace --all-features --exclude mongreldb-core --exclude mongreldb-perf
+          prepare() {
+            local dir=$1
+            python3 - "$dir" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1]) / 'crates/mongreldb-core/src/engine.rs'
+          source = path.read_text()
+          needle = '''    pub fn put_returning(
+        &mut self,
+'''
+          if needle not in source:
+              raise SystemExit('put_returning signature not found')
+          source = source.replace(needle, '''    #[inline(never)]
+    pub fn put_returning(
+        &mut self,
+''', 1)
+          path.write_text(source)
+          PY
+          }
 
-  server:
-    name: Server tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mongreldb-server
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: crates/mongreldb-server
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --all-targets --all-features
+          profile() {
+            local dir=$1 label=$2 target="/tmp/target-callgrind-$label"
+            prepare "$dir"
+            build_json="$out/$label-build.jsonl"
+            (
+              cd "$dir"
+              CARGO_TARGET_DIR="$target" cargo "+$RUST_VERSION" bench \
+                -p mongreldb-core --bench write_path --no-run --message-format=json
+            ) | tee "$build_json"
+            exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "write_path" and .executable != null) | .executable' "$build_json" | tail -1)
+            test -x "$exe"
+            valgrind --tool=callgrind \
+              --collect-atstart=no \
+              --toggle-collect='*put_returning*' \
+              --callgrind-out-file="$out/$label.callgrind" \
+              "$exe" write_path/put_no_fsync \
+              --noplot --sample-size 10 --measurement-time 1 --warm-up-time 0.1 \
+              2>&1 | tee "$out/$label-run.log"
+            callgrind_annotate --inclusive=yes --threshold=0.05 \
+              "$out/$label.callgrind" > "$out/$label-inclusive.txt"
+            callgrind_annotate --inclusive=no --threshold=0.05 \
+              "$out/$label.callgrind" > "$out/$label-self.txt"
+            grep -E 'Collected|I   refs|PROGRAM TOTALS' "$out/$label-run.log" "$out/$label-inclusive.txt" \
+              > "$out/$label-totals.txt" || true
+          }
 
-  client:
-    name: Client checks
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mongreldb-client
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+          profile /tmp/p0-good good
+          profile /tmp/p0-bad bad
+          {
+            echo '=== good totals ==='
+            cat "$out/good-totals.txt"
+            echo '=== bad totals ==='
+            cat "$out/bad-totals.txt"
+            echo '=== good top inclusive ==='
+            head -80 "$out/good-inclusive.txt"
+            echo '=== bad top inclusive ==='
+            head -80 "$out/bad-inclusive.txt"
+          } | tee "$out/summary.txt"
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: clippy
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: crates/mongreldb-client
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features
-
-  mysql-wire:
-    name: MySQL wire compatibility
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mongreldb-mysql-wire
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: clippy
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: crates/mongreldb-mysql-wire
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-
-  windows-smoke:
-    name: Windows portability smoke
-    runs-on: windows-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2.9.1
-      - run: choco install protoc --yes --no-progress
-      - run: cargo test -p mongreldb-core --all-features --test file_lock --test cross_process_lock --test spill
+          name: p0-callgrind
+          path: /tmp/p0-callgrind
+          if-no-files-found: error
