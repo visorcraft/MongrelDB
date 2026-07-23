@@ -29,7 +29,7 @@ use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
 use arc_swap::ArcSwap;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -933,8 +933,8 @@ struct CachedEntry {
 }
 
 /// Size-bounded **access-order LRU** result cache (Phase 19.1 + hardening (a)).
-/// Every `get_*` promotes the key to the back (most-recently-used); eviction
-/// pops from the front (least-recently-used) — a true LRU, not FIFO.
+/// Every `get_*` assigns a new recency generation; eviction removes the lowest
+/// generation (least-recently-used) — a true LRU, not FIFO.
 ///
 /// Hardening (b): an optional on-disk persistent tier (`dir = Some(_)`). On a
 /// memory miss, the cache tries disk before falling through to re-resolution.
@@ -944,7 +944,15 @@ struct CachedEntry {
 /// resumes across restart.
 struct ResultCache {
     entries: std::collections::HashMap<u64, CachedEntry>,
-    order: std::collections::VecDeque<u64>,
+    order: BTreeSet<(u64, u64)>,
+    generations: HashMap<u64, u64>,
+    next_generation: u64,
+    /// Reverse index for conservative insert invalidation. Its size is bounded
+    /// by cached query-condition metadata, not by survivor rows.
+    condition_index: HashMap<u16, HashSet<u64>>,
+    /// Entries whose row footprint could not be resolved. Any delete must
+    /// conservatively invalidate these entries.
+    empty_footprint_entries: HashSet<u64>,
     bytes: u64,
     max_bytes: u64,
     dir: Option<std::path::PathBuf>,
@@ -966,20 +974,35 @@ enum SerializedData {
     Columns(Vec<(u16, columnar::NativeColumn)>),
 }
 
-impl SerializedEntry {
-    fn from_entry(entry: &CachedEntry) -> Self {
+#[derive(serde::Serialize)]
+struct SerializedEntryRef<'a> {
+    condition_cols: &'a [u16],
+    footprint_bits: Vec<u32>,
+    data: SerializedDataRef<'a>,
+}
+
+#[derive(serde::Serialize)]
+enum SerializedDataRef<'a> {
+    Rows(&'a [Row]),
+    Columns(&'a [(u16, columnar::NativeColumn)]),
+}
+
+impl<'a> SerializedEntryRef<'a> {
+    fn from_entry(entry: &'a CachedEntry) -> Self {
         let footprint_bits: Vec<u32> = entry.footprint.iter().collect();
         let data = match &entry.data {
-            CachedData::Rows(r) => SerializedData::Rows((**r).clone()),
-            CachedData::Columns(c) => SerializedData::Columns((**c).clone()),
+            CachedData::Rows(rows) => SerializedDataRef::Rows(rows.as_slice()),
+            CachedData::Columns(columns) => SerializedDataRef::Columns(columns.as_slice()),
         };
         Self {
-            condition_cols: entry.condition_cols.clone(),
+            condition_cols: &entry.condition_cols,
             footprint_bits,
             data,
         }
     }
+}
 
+impl SerializedEntry {
     fn into_entry(self) -> Option<CachedEntry> {
         let footprint: roaring::RoaringBitmap = self.footprint_bits.into_iter().collect();
         let data = match self.data {
@@ -1011,7 +1034,11 @@ impl ResultCache {
     fn with_max_bytes(max_bytes: u64) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
+            order: BTreeSet::new(),
+            generations: HashMap::new(),
+            next_generation: 0,
+            condition_index: HashMap::new(),
+            empty_footprint_entries: HashSet::new(),
             bytes: 0,
             max_bytes,
             dir: None,
@@ -1041,7 +1068,7 @@ impl ResultCache {
         let Some(path) = self.disk_path(key) else {
             return;
         };
-        let serialized = match bincode::serialize(&SerializedEntry::from_entry(entry)) {
+        let serialized = match bincode::serialize(&SerializedEntryRef::from_entry(entry)) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -1162,8 +1189,9 @@ impl ResultCache {
                 Ok(serialized) => {
                     if let Some(entry) = serialized.into_entry() {
                         self.bytes = self.bytes.saturating_add(entry.data.approx_bytes());
+                        self.index_entry(key, &entry);
                         self.entries.insert(key, entry);
-                        self.order.push_back(key);
+                        self.touch(key);
                     } else {
                         let _ = std::fs::remove_file(&path);
                     }
@@ -1181,10 +1209,68 @@ impl ResultCache {
         self.evict();
     }
 
-    /// Promote `key` to most-recently-used position (back of the deque).
+    /// Promote `key` to most-recently-used position without scanning every
+    /// cache entry. The generation-ordered set provides exact LRU in O(log n).
     fn touch(&mut self, key: u64) {
-        self.order.retain(|k| *k != key);
-        self.order.push_back(key);
+        if !self.entries.contains_key(&key) {
+            return;
+        }
+        if let Some(previous) = self.generations.remove(&key) {
+            self.order.remove(&(previous, key));
+        }
+        let generation = self.allocate_generation();
+        self.generations.insert(key, generation);
+        self.order.insert((generation, key));
+    }
+
+    fn untrack(&mut self, key: u64) {
+        if let Some(generation) = self.generations.remove(&key) {
+            self.order.remove(&(generation, key));
+        }
+    }
+
+    fn index_entry(&mut self, key: u64, entry: &CachedEntry) {
+        for column in &entry.condition_cols {
+            self.condition_index.entry(*column).or_default().insert(key);
+        }
+        if entry.footprint.is_empty() {
+            self.empty_footprint_entries.insert(key);
+        }
+    }
+
+    fn unindex_entry(&mut self, key: u64, entry: &CachedEntry) {
+        for column in &entry.condition_cols {
+            let remove_column = self.condition_index.get_mut(column).is_some_and(|keys| {
+                keys.remove(&key);
+                keys.is_empty()
+            });
+            if remove_column {
+                self.condition_index.remove(column);
+            }
+        }
+        if entry.footprint.is_empty() {
+            self.empty_footprint_entries.remove(&key);
+        }
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.rebase_generations();
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
+    }
+
+    fn rebase_generations(&mut self) {
+        let ordered = std::mem::take(&mut self.order);
+        self.generations.clear();
+        for (generation, (_, key)) in ordered.into_iter().enumerate() {
+            let generation = generation as u64;
+            self.generations.insert(key, generation);
+            self.order.insert((generation, key));
+        }
+        self.next_generation = self.order.len() as u64;
     }
 
     fn get_rows(&mut self, key: u64) -> Option<Arc<Vec<Row>>> {
@@ -1205,8 +1291,9 @@ impl ResultCache {
             if res.is_some() {
                 let approx = entry.data.approx_bytes();
                 self.bytes = self.bytes.saturating_add(approx);
+                self.index_entry(key, &entry);
                 self.entries.insert(key, entry);
-                self.order.push_back(key);
+                self.touch(key);
                 self.evict();
                 return res;
             }
@@ -1232,8 +1319,9 @@ impl ResultCache {
             if res.is_some() {
                 let approx = entry.data.approx_bytes();
                 self.bytes = self.bytes.saturating_add(approx);
+                self.index_entry(key, &entry);
                 self.entries.insert(key, entry);
-                self.order.push_back(key);
+                self.touch(key);
                 self.evict();
                 return res;
             }
@@ -1243,15 +1331,17 @@ impl ResultCache {
 
     fn insert(&mut self, key: u64, entry: CachedEntry) {
         let approx = entry.data.approx_bytes();
-        if self.entries.remove(&key).is_some() {
-            self.order.retain(|k| *k != key);
-            self.bytes = self.entries.values().map(|e| e.data.approx_bytes()).sum();
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.data.approx_bytes());
+            self.unindex_entry(key, &previous);
+            self.untrack(key);
         }
         // Write to the persistent tier (b) before memory insert.
         self.store_to_disk(key, &entry);
         self.bytes = self.bytes.saturating_add(approx);
+        self.index_entry(key, &entry);
         self.entries.insert(key, entry);
-        self.order.push_back(key);
+        self.touch(key);
         self.evict();
     }
 
@@ -1272,28 +1362,39 @@ impl ResultCache {
             return;
         }
         let has_deletes = !delete_rids.is_empty();
-        let to_remove: std::collections::HashSet<u64> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| {
-                let delete_hit = if e.footprint.is_empty() {
-                    has_deletes
-                } else {
-                    e.footprint.intersection_len(delete_rids) > 0
-                };
-                let col_hit = e.condition_cols.iter().any(|c| put_cols.contains(c));
-                delete_hit || col_hit
-            })
-            .map(|(&k, _)| k)
-            .collect();
-        for key in &to_remove {
-            if let Some(e) = self.entries.remove(key) {
-                self.bytes = self.bytes.saturating_sub(e.data.approx_bytes());
+        let mut to_remove = HashSet::new();
+
+        // Inserts/updates are the common mutation path. Resolve affected cache
+        // keys directly from the condition-column reverse index instead of
+        // scanning every cached result on every commit.
+        for column in put_cols {
+            if let Some(keys) = self.condition_index.get(column) {
+                to_remove.extend(keys.iter().copied());
             }
-            self.remove_from_disk(*key);
         }
-        if !to_remove.is_empty() {
-            self.order.retain(|k| !to_remove.contains(k));
+
+        if has_deletes {
+            // Entries with an unknown footprint are conservatively stale after
+            // any delete. Known footprints still require a bitmap intersection;
+            // this scan is paid only by delete commits, not every insert.
+            to_remove.extend(self.empty_footprint_entries.iter().copied());
+            for (&key, entry) in &self.entries {
+                if !to_remove.contains(&key)
+                    && !entry.footprint.is_empty()
+                    && entry.footprint.intersection_len(delete_rids) > 0
+                {
+                    to_remove.insert(key);
+                }
+            }
+        }
+
+        for key in to_remove {
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.data.approx_bytes());
+                self.unindex_entry(key, &entry);
+            }
+            self.remove_from_disk(key);
+            self.untrack(key);
         }
     }
 
@@ -1311,22 +1412,123 @@ impl ResultCache {
         }
         self.entries.clear();
         self.order.clear();
+        self.generations.clear();
+        self.next_generation = 0;
+        self.condition_index.clear();
+        self.empty_footprint_entries.clear();
         self.bytes = 0;
     }
 
     fn evict(&mut self) {
         while self.bytes > self.max_bytes {
-            let Some(k) = self.order.pop_front() else {
+            let Some((_, key)) = self.order.pop_first() else {
                 break;
             };
-            if let Some(e) = self.entries.remove(&k) {
-                self.bytes = self.bytes.saturating_sub(e.data.approx_bytes());
+            self.generations.remove(&key);
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.data.approx_bytes());
+                self.unindex_entry(key, &entry);
                 // Also delete the disk file (hardening (b)): an evicted entry's
                 // disk file must not survive, or invalidate() — which only scans
                 // in-memory entries — would miss it and allow a stale disk hit.
-                self.remove_from_disk(k);
+                self.remove_from_disk(key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod result_cache_lru_tests {
+    use super::*;
+
+    fn row_entry(row_id: u64) -> CachedEntry {
+        CachedEntry {
+            data: CachedData::Rows(Arc::new(vec![Row::new(RowId(row_id), Epoch(1))])),
+            footprint: std::iter::once(row_id as u32).collect(),
+            condition_cols: vec![1],
+        }
+    }
+
+    #[test]
+    fn hits_update_recency_without_growing_an_order_queue() {
+        let mut cache = ResultCache::with_max_bytes(u64::MAX);
+        cache.insert(1, row_entry(1));
+        cache.insert(2, row_entry(2));
+        assert_eq!(cache.order.len(), cache.entries.len());
+
+        for _ in 0..1_000 {
+            assert!(cache.get_rows(1).is_some());
+        }
+
+        assert_eq!(cache.order.len(), cache.entries.len());
+        assert_eq!(cache.order.first().map(|(_, key)| *key), Some(2));
+
+        let one_entry = cache.entries[&1].data.approx_bytes();
+        cache.set_max_bytes(one_entry);
+        assert!(cache.entries.contains_key(&1));
+        assert!(!cache.entries.contains_key(&2));
+        assert_eq!(cache.order.len(), cache.entries.len());
+    }
+
+    #[test]
+    fn insert_invalidation_uses_the_condition_reverse_index() {
+        let mut cache = ResultCache::with_max_bytes(u64::MAX);
+        let mut first = row_entry(1);
+        first.condition_cols = vec![1];
+        let mut second = row_entry(2);
+        second.condition_cols = vec![2];
+        cache.insert(1, first);
+        cache.insert(2, second);
+
+        let put_cols = std::iter::once(1_u16).collect();
+        cache.invalidate(&roaring::RoaringBitmap::new(), &put_cols);
+
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&2));
+        assert!(!cache
+            .condition_index
+            .get(&1)
+            .is_some_and(|keys| keys.contains(&1)));
+        assert!(cache
+            .condition_index
+            .get(&2)
+            .is_some_and(|keys| keys.contains(&2)));
+        assert_eq!(cache.order.len(), cache.entries.len());
+    }
+
+    #[test]
+    fn delete_invalidation_preserves_known_and_unknown_footprint_semantics() {
+        let mut cache = ResultCache::with_max_bytes(u64::MAX);
+        cache.insert(1, row_entry(1));
+        cache.insert(2, row_entry(2));
+        let mut unknown = row_entry(3);
+        unknown.footprint.clear();
+        cache.insert(3, unknown);
+
+        let delete_rids: roaring::RoaringBitmap = std::iter::once(1_u32).collect();
+        cache.invalidate(&delete_rids, &HashSet::new());
+
+        assert!(!cache.entries.contains_key(&1));
+        assert!(cache.entries.contains_key(&2));
+        assert!(!cache.entries.contains_key(&3));
+        assert!(cache.empty_footprint_entries.is_empty());
+        assert_eq!(cache.order.len(), cache.entries.len());
+    }
+
+    #[test]
+    fn borrowed_persistence_encoding_matches_the_existing_owned_format() {
+        let entry = row_entry(7);
+        let borrowed = bincode::serialize(&SerializedEntryRef::from_entry(&entry)).unwrap();
+        let owned = bincode::serialize(&SerializedEntry {
+            condition_cols: entry.condition_cols.clone(),
+            footprint_bits: entry.footprint.iter().collect(),
+            data: match &entry.data {
+                CachedData::Rows(rows) => SerializedData::Rows((**rows).clone()),
+                CachedData::Columns(columns) => SerializedData::Columns((**columns).clone()),
+            },
+        })
+        .unwrap();
+        assert_eq!(borrowed, owned);
     }
 }
 
