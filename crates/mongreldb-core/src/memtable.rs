@@ -278,10 +278,7 @@ impl Memtable {
                 let Some(candidate) = segment.tree.get_version(row_id, snapshot.epoch) else {
                     continue;
                 };
-                if best
-                    .as_ref()
-                    .is_none_or(|(epoch, _)| candidate.0 > *epoch)
-                {
+                if best.as_ref().is_none_or(|(epoch, _)| candidate.0 > *epoch) {
                     best = Some(candidate);
                 }
             }
