@@ -18,6 +18,7 @@ env:
 
 jobs:
   ablate:
+    # Every variant is built from the exact investigated HEAD in a detached worktree.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
