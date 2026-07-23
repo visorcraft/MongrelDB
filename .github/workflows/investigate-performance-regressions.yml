@@ -18,52 +18,14 @@ concurrency:
 
 env:
   HEAD_SHA: bb59eb8d7071a2c08e2d0084b11c1c82cb12a521
-  RUST_NEW: "1.97.1"
+  CORE_BASE: eecb39fcbe9d8da7c0921db871f032a3e59e0762
+  QUAL_BASE: edb690b115846681f5149b2bd56fc92b05ff6166
   RUST_OLD: "1.96.1"
+  RUST_NEW: "1.97.1"
 
 jobs:
-  metadata:
-    runs-on: ubuntu-latest
-    outputs:
-      core_base: ${{ steps.refs.outputs.core_base }}
-      qual_base: ${{ steps.refs.outputs.qual_base }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - id: refs
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
-          core_base=$(git rev-list -1 --first-parent --before='2026-07-16T00:00:00-05:00' origin/master)
-          qual_base=$(git rev-list -1 --before='2026-07-18T00:00:00-05:00' origin/architecture_expansion 2>/dev/null || true)
-          if [[ -z "$qual_base" ]]; then
-            qual_base=$(git rev-list -1 --first-parent --before='2026-07-18T00:00:00-05:00' origin/master)
-          fi
-          printf 'core_base=%s\nqual_base=%s\n' "$core_base" "$qual_base" | tee /tmp/refs.txt
-          echo "core_base=$core_base" >> "$GITHUB_OUTPUT"
-          echo "qual_base=$qual_base" >> "$GITHUB_OUTPUT"
-          {
-            echo
-            echo '=== commits around measurement window ==='
-            git log --all --since='2026-07-13T00:00:00-05:00' --until='2026-07-19T23:59:59-05:00' \
-              --date=iso-strict --pretty='%H %ad %D%n    %s'
-            echo
-            echo '=== BENCHMARKS.md history ==='
-            git log --all --follow --date=iso-strict --pretty='%H %ad %D%n    %s' -- BENCHMARKS.md
-            echo
-            echo '=== selected base summaries ==='
-            git show -s --date=iso-strict --format='%H%n%ad%n%s%n' "$core_base"
-            git show -s --date=iso-strict --format='%H%n%ad%n%s%n' "$qual_base"
-          } | tee -a /tmp/refs.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: perf-investigation-metadata
-          path: /tmp/refs.txt
-
-  p0-put:
-    needs: metadata
+  p0-ablation:
+    name: P0 hardening-cost ablation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -71,50 +33,124 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ env.RUST_NEW }}
+          toolchain: ${{ env.RUST_OLD }}
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: rustup toolchain install "${RUST_OLD}" --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
-      - name: Compare put_no_fsync across code and toolchain
-        shell: bash
-        env:
-          CORE_BASE: ${{ needs.metadata.outputs.core_base }}
+      - shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/perf-results
-          git worktree add --detach /tmp/core-base "$CORE_BASE"
-          git worktree add --detach /tmp/core-head "$HEAD_SHA"
+          out=/tmp/p0-ablation
+          mkdir -p "$out"
 
-          run_one() {
-            local dir=$1 label=$2 toolchain=$3
-            local target="/tmp/target-p0-${label}-${toolchain//./_}"
-            local log="/tmp/perf-results/p0-${label}-${toolchain}.log"
-            echo "=== $label $toolchain $(git -C "$dir" rev-parse HEAD) ===" | tee "$log"
-            (
-              cd "$dir"
-              CARGO_TARGET_DIR="$target" cargo "+$toolchain" bench -p mongreldb-core \
-                --bench write_path -- write_path/put_no_fsync \
-                --noplot --sample-size 80 --measurement-time 5 --warm-up-time 2
-            ) 2>&1 | tee -a "$log"
-            estimate=$(find "$target/criterion" -path '*/write_path/put_no_fsync/new/estimates.json' -print -quit)
-            jq -c --arg label "$label" --arg toolchain "$toolchain" \
-              '{label:$label,toolchain:$toolchain,mean_ns:.mean.point_estimate,median_ns:.median.point_estimate,slope_ns:(.slope.point_estimate // null)}' \
-              "$estimate" | tee -a /tmp/perf-results/p0-summary.jsonl
+          make_variant() {
+            local name=$1 mode=$2 dir="/tmp/p0-$name"
+            git worktree add --detach "$dir" "$HEAD_SHA"
+            python3 - "$dir" "$mode" <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          modes = set(sys.argv[2].split('+'))
+
+          def replace(path, old, new):
+              text = path.read_text()
+              if old not in text:
+                  raise SystemExit(f"missing replacement in {path}: {old[:80]!r}")
+              path.write_text(text.replace(old, new, 1))
+
+          if "no_typecheck" in modes:
+              replace(
+                  root / "crates/mongreldb-core/src/schema.rs",
+                  '''            if !value_matches_type(value, column.ty.clone()) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "column '{}' ({}) value {value:?} does not match type {:?}",
+                    column.name, column.id, column.ty
+                )));
+            }
+''',
+                  ''
+              )
+
+          if "unchecked_rowid" in modes:
+              replace(
+                  root / "crates/mongreldb-core/src/rowid.rs",
+                  '''        self.next = self
+            .next
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or_else(row_id_exhausted)?;
+        Ok(RowId(id))
+''',
+                  '''        self.next = self.next.wrapping_add(1);
+        Ok(RowId(id))
+'''
+              )
+
+          if "no_private_flags" in modes:
+              engine = root / "crates/mongreldb-core/src/engine.rs"
+              replace(engine, '''                w.append_txn(txn_id, op)?;
+                self.pending_private_mutations = true;
+''', '''                w.append_txn(txn_id, op)?;
+''')
+              replace(engine, '''        if self.durable_commit_failed {
+            return Err(MongrelError::Other(
+                "table poisoned by post-commit failure; reopen required".into(),
+            ));
+        }
+''', '')
+
+          if "unchecked_wal_seq" in modes:
+              replace(
+                  root / "crates/mongreldb-core/src/wal.rs",
+                  '''        let next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("WAL sequence namespace exhausted".into()))?;
+''',
+                  '''        let next_seq = self.next_seq.wrapping_add(1);
+'''
+              )
+          PY
+            cargo "+$RUST_OLD" fmt --manifest-path "$dir/Cargo.toml"
           }
 
-          run_one /tmp/core-base base "$RUST_OLD"
-          run_one /tmp/core-head head "$RUST_OLD"
-          run_one /tmp/core-base base "$RUST_NEW"
-          run_one /tmp/core-head head "$RUST_NEW"
-          cat /tmp/perf-results/p0-summary.jsonl
+          make_variant normal none
+          make_variant no-typecheck no_typecheck
+          make_variant unchecked-rowid unchecked_rowid
+          make_variant no-private-flags no_private_flags
+          make_variant unchecked-wal-seq unchecked_wal_seq
+          make_variant combined no_typecheck+unchecked_rowid+no_private_flags+unchecked_wal_seq
+
+          run_one() {
+            local name=$1 dir="/tmp/p0-$name" target="/tmp/target-p0-ablate-$name"
+            (
+              cd "$dir"
+              CARGO_TARGET_DIR="$target" cargo "+$RUST_OLD" bench -p mongreldb-core \
+                --bench write_path -- write_path/put_no_fsync \
+                --noplot --sample-size 80 --measurement-time 5 --warm-up-time 2
+            ) 2>&1 | tee "$out/$name.log"
+            estimate=$(find "$target/criterion" -path '*/write_path/put_no_fsync/new/estimates.json' -print -quit)
+            jq -c --arg variant "$name" \
+              '{variant:$variant,mean_ns:.mean.point_estimate,median_ns:.median.point_estimate,slope_ns:(.slope.point_estimate // null)}' \
+              "$estimate" | tee -a "$out/summary.jsonl"
+          }
+
+          run_one normal
+          run_one no-typecheck
+          run_one unchecked-rowid
+          run_one no-private-flags
+          run_one unchecked-wal-seq
+          run_one combined
+          cat "$out/summary.jsonl"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-investigation-p0
-          path: /tmp/perf-results
+          name: p0-put-ablation
+          path: /tmp/p0-ablation
+          if-no-files-found: error
 
-  p1-bulk:
-    needs: metadata
+  p1-ablation:
+    name: P1 validation-cost ablation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -122,58 +158,91 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ env.RUST_NEW }}
+          toolchain: ${{ env.RUST_OLD }}
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: rustup toolchain install "${RUST_OLD}" --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
-      - name: Compare 1M bulk-load family
-        shell: bash
-        env:
-          CORE_BASE: ${{ needs.metadata.outputs.core_base }}
+      - shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/perf-results
-          git worktree add --detach /tmp/core-base "$CORE_BASE"
-          git worktree add --detach /tmp/core-head "$HEAD_SHA"
+          out=/tmp/p1-ablation
+          mkdir -p "$out"
+
+          make_variant() {
+            local name=$1 mode=$2 dir="/tmp/p1-$name"
+            git worktree add --detach "$dir" "$HEAD_SHA"
+            python3 - "$dir" "$mode" <<'PY'
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          modes = set(sys.argv[2].split('+'))
+          path = root / 'crates/mongreldb-core/src/engine.rs'
+          text = path.read_text()
+          if 'no_notnull' in modes:
+              needle = '''    fn validate_columns_not_null(
+        &self,
+        columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+    ) -> Result<()> {
+'''
+              if needle not in text:
+                  raise SystemExit('validate_columns_not_null signature missing')
+              text = text.replace(needle, needle + '        return Ok(());\n', 1)
+          if 'no_pk' in modes:
+              needle = '''    fn bulk_pk_winner_indices(
+        &self,
+        columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+    ) -> Option<Vec<usize>> {
+'''
+              if needle not in text:
+                  raise SystemExit('bulk_pk_winner_indices signature missing')
+              text = text.replace(needle, needle + '        return None;\n', 1)
+          path.write_text(text)
+          PY
+            cargo "+$RUST_OLD" fmt --manifest-path "$dir/Cargo.toml"
+          }
+
+          make_variant normal none
+          make_variant no-notnull no_notnull
+          make_variant no-pk no_pk
+          make_variant no-validation no_notnull+no_pk
 
           run_one() {
-            local dir=$1 label=$2 toolchain=$3
-            local target="/tmp/target-p1-${label}-${toolchain//./_}"
-            local log="/tmp/perf-results/p1-${label}-${toolchain}.log"
-            echo "=== $label $toolchain $(git -C "$dir" rev-parse HEAD) ===" | tee "$log"
+            local name=$1 dir="/tmp/p1-$name" target="/tmp/target-p1-ablate-$name"
             (
               cd "$dir"
-              CARGO_TARGET_DIR="$target" cargo "+$toolchain" bench -p mongreldb-core \
+              CARGO_TARGET_DIR="$target" cargo "+$RUST_OLD" bench -p mongreldb-core \
                 --bench scale -- 'scale/(bulk_load|bulk_load_columns|bulk_load_fast)/1000000' \
                 --noplot --sample-size 10 --measurement-time 4 --warm-up-time 1
-            ) 2>&1 | tee -a "$log"
+            ) 2>&1 | tee "$out/$name.log"
             while IFS= read -r estimate; do
               bench=$(python3 - "$estimate" <<'PY'
           import pathlib, sys
-          p = pathlib.Path(sys.argv[1])
-          parts = p.parts
-          i = parts.index('criterion')
-          print('/'.join(parts[i+1:-2]))
+          path = pathlib.Path(sys.argv[1]); parts = path.parts; index = parts.index('criterion')
+          print('/'.join(parts[index + 1:-2]))
           PY
               )
-              jq -c --arg label "$label" --arg toolchain "$toolchain" --arg bench "$bench" \
-                '{label:$label,toolchain:$toolchain,bench:$bench,mean_ns:.mean.point_estimate,median_ns:.median.point_estimate,slope_ns:(.slope.point_estimate // null)}' \
-                "$estimate" >> /tmp/perf-results/p1-summary.jsonl
+              jq -c --arg variant "$name" --arg bench "$bench" \
+                '{variant:$variant,bench:$bench,mean_ns:.mean.point_estimate,median_ns:.median.point_estimate}' \
+                "$estimate" >> "$out/summary.jsonl"
             done < <(find "$target/criterion/scale" -path '*/1000000/new/estimates.json' | sort)
           }
 
-          run_one /tmp/core-base base "$RUST_OLD"
-          run_one /tmp/core-head head "$RUST_OLD"
-          run_one /tmp/core-head head "$RUST_NEW"
-          cat /tmp/perf-results/p1-summary.jsonl
+          run_one normal
+          run_one no-notnull
+          run_one no-pk
+          run_one no-validation
+          cat "$out/summary.jsonl"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-investigation-p1
-          path: /tmp/perf-results
+          name: p1-bulk-ablation
+          path: /tmp/p1-ablation
+          if-no-files-found: error
 
-  p2-http:
-    needs: metadata
+  p2-exact:
+    name: Exact P2 HTTP comparison
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -183,42 +252,37 @@ jobs:
         with:
           toolchain: ${{ env.RUST_NEW }}
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: rustup toolchain install "${RUST_OLD}" --profile minimal
+      - run: rustup toolchain install "$RUST_OLD" --profile minimal
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Compare loopback HTTP point query
-        shell: bash
-        env:
-          QUAL_BASE: ${{ needs.metadata.outputs.qual_base }}
+      - shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/perf-results
-          git worktree add --detach /tmp/qual-base "$QUAL_BASE"
-          git worktree add --detach /tmp/qual-head "$HEAD_SHA"
+          out=/tmp/p2-exact
+          mkdir -p "$out"
+          git worktree add --detach /tmp/p2-base "$QUAL_BASE"
+          git worktree add --detach /tmp/p2-head "$HEAD_SHA"
 
           run_one() {
-            local dir=$1 label=$2 toolchain=$3
-            local target="/tmp/target-p2-${label}-${toolchain//./_}"
-            local log="/tmp/perf-results/p2-${label}-${toolchain}.log"
-            echo "=== $label $toolchain $(git -C "$dir" rev-parse HEAD) ===" | tee "$log"
+            local dir=$1 label=$2 toolchain=$3 target="/tmp/target-p2-${label}-${toolchain//./_}"
+            local log="$out/${label}-${toolchain}.log"
             for repetition in 1 2 3; do
-              echo "--- repetition $repetition ---" | tee -a "$log"
+              echo "=== repetition $repetition ===" | tee -a "$log"
               (
                 cd "$dir/crates/mongreldb-server"
                 CARGO_TARGET_DIR="$target" cargo "+$toolchain" test --release \
                   --test scale_test loopback_point_query_p95_baseline -- --nocapture
               ) 2>&1 | tee -a "$log"
             done
-            grep '"test":"loopback_point_query"' "$log" | sed \
-              "s/^/{\"label\":\"$label\",\"toolchain\":\"$toolchain\",\"result\":/; s/$/}/" \
-              >> /tmp/perf-results/p2-summary.jsonl || true
+            grep '"test":"loopback_point_query"' "$log" > "$out/${label}-${toolchain}.jsonl" || true
           }
 
-          run_one /tmp/qual-base base "$RUST_OLD"
-          run_one /tmp/qual-head head "$RUST_OLD"
-          run_one /tmp/qual-head head "$RUST_NEW"
-          cat /tmp/perf-results/p2-summary.jsonl
+          run_one /tmp/p2-base base "$RUST_OLD"
+          run_one /tmp/p2-head head "$RUST_OLD"
+          run_one /tmp/p2-head head "$RUST_NEW"
+          cat "$out"/*.jsonl
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-investigation-p2
-          path: /tmp/perf-results
+          name: p2-exact-comparison
+          path: /tmp/p2-exact
+          if-no-files-found: error
