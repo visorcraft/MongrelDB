@@ -7,11 +7,15 @@ set -euo pipefail
 : "${RUST_NEW:?}"
 out=/tmp/p2-exact
 mkdir -p "$out"
+exec > >(tee "$out/driver.log") 2>&1
 git worktree add --detach /tmp/p2-base "$QUAL_BASE"
 git worktree add --detach /tmp/p2-head "$HEAD_SHA"
 
 run_one() {
-  local dir=$1 label=$2 toolchain=$3 target="/tmp/target-p2-${label}-${toolchain//./_}"
+  local dir=$1
+  local label=$2
+  local toolchain=$3
+  local target="/tmp/target-p2-${label}-${toolchain//./_}"
   local log="$out/${label}-${toolchain}.log"
   for repetition in 1 2 3; do
     echo "=== repetition $repetition ===" | tee -a "$log"
