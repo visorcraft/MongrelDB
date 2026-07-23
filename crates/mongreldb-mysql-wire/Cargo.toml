@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-mysql-wire"
-version = "0.64.4"
+version = "0.64.5"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -10,8 +10,8 @@ repository = "https://github.com/visorcraft/MongrelDB"
 [dependencies]
 arrow = "58"
 async-trait = "0.1"
-mongreldb-client = { path = "../mongreldb-client", version = "0.64.4" }
-mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.4" }
+mongreldb-client = { path = "../mongreldb-client", version = "0.64.5" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.5" }
 opensrv-mysql = { version = "0.7", features = ["tls"] }
 rustls-pemfile = "2"
 thiserror = "2"
@@ -19,8 +19,8 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-rustls = "0.25"
 
 [dev-dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.4" }
-mongreldb-server = { path = "../mongreldb-server", version = "0.64.4" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.5" }
+mongreldb-server = { path = "../mongreldb-server", version = "0.64.5" }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 rcgen = "0.13"
 tempfile = "3"

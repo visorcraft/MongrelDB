@@ -8,7 +8,7 @@ repository.workspace = true
 description = "MongrelDB commit-log abstraction and versioned command envelope."
 
 [dependencies]
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.4" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.5" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "1"
