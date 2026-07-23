@@ -7285,21 +7285,12 @@ async fn execute_sql(
     // §15 admin SQL surface: intercept before the ordinary SQL path so
     // SHOW CLUSTER / ALTER NODE DRAIN / … never open tablet files from the
     // query gateway (spec §12.10 / §15).
-    if let Some(response) = cluster_admin::try_admin_sql(state, principal, &req.sql).await {
-        drop(sql_permit);
-        return (response, None);
-    }
-    // P0.2: tablet-routed public SQL (Raft); unsupported still fails closed.
-    if state.is_cluster_mode() {
-        if let Some(response) = cluster_data_plane::try_execute_sql(state, &req.sql).await {
-            drop(sql_permit);
-            return (response, None);
-        }
-        if let Some(response) = refuse_cluster_standalone_data_plane(state) {
-            drop(sql_permit);
-            return (response, None);
-        }
-    }
+    // Note: cluster_admin::try_admin_sql and cluster_data_plane checks are
+    // already performed by the `sql` handler before calling `execute_sql`.
+    // They are not repeated here to avoid per-request double-parsing overhead.
+    // If `execute_sql` is ever called from a path that did NOT pre-filter,
+    // re-add the guard here.
+    //
     // Keep a direct handle until the durable receipt is persisted. Finished
     // tombstone eviction must not make a committed idempotent write ambiguous.
     let idempotency_query = idempotency.as_ref().map(|_| query.clone());
