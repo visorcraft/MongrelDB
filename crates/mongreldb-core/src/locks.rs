@@ -89,7 +89,7 @@
 //! a sole holder's Shared → Exclusive upgrade succeeds immediately. Re-issued
 //! acquisitions therefore can never deadlock a transaction against itself.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
@@ -363,6 +363,13 @@ impl Fate {
 #[derive(Debug, Default)]
 struct Inner {
     locks: HashMap<LockKey, LockState>,
+    /// Keys currently held or awaited by each transaction. This makes
+    /// `release_all` proportional to one transaction's footprint rather than
+    /// the global lock-table size.
+    txn_keys: HashMap<u64, HashSet<LockKey>>,
+    /// Exact number of entries across every per-key wait queue. Deadlock
+    /// detection can skip graph construction entirely when this is zero.
+    queued_waiters: usize,
     /// Wait outcomes for entries already removed from a queue (deadlock
     /// victims, waiters purged by a grant pass). Keyed by transaction: a
     /// transaction waits on at most one key at a time.
@@ -370,6 +377,10 @@ struct Inner {
     /// Latest stated deadlock-victim priority per transaction; registered on
     /// every acquire so holders that later join a cycle are covered too.
     priorities: HashMap<u64, u64>,
+    #[cfg(test)]
+    deadlock_graph_builds: usize,
+    #[cfg(test)]
+    release_all_key_visits: usize,
 }
 
 /// The key and predicate lock manager. Cheap to share: all state lives
@@ -411,6 +422,11 @@ impl LockManager {
         if let Some(priority) = priority {
             inner.priorities.insert(txn_id, priority);
         }
+        inner
+            .txn_keys
+            .entry(txn_id)
+            .or_default()
+            .insert(key.clone());
 
         {
             let state = inner.locks.entry(key.clone()).or_default();
@@ -453,6 +469,7 @@ impl LockManager {
                 mode,
             });
         }
+        inner.queued_waiters = inner.queued_waiters.saturating_add(1);
 
         // Spec section 10.2: check the wait-for graph on enqueue. If this
         // requester is the victim its fate is already recorded and the first
@@ -465,6 +482,7 @@ impl LockManager {
             // A departed waiter may unblock the queue behind it.
             process_key(&mut inner, &key);
             detect_deadlocks(&mut inner);
+            untrack_transaction_key_if_unused(&mut inner, &key, txn_id);
             self.wake.notify_all();
         }
         prune_if_idle(&mut inner, &key);
@@ -486,6 +504,7 @@ impl LockManager {
             process_key(&mut inner, key);
             // Spec section 10.2: check the wait-for graph on grant.
             detect_deadlocks(&mut inner);
+            untrack_transaction_key_if_unused(&mut inner, key, txn_id);
             prune_if_idle(&mut inner, key);
         }
         drop(inner);
@@ -498,23 +517,34 @@ impl LockManager {
         let mut inner = self.inner.lock();
         inner.fates.remove(&txn_id);
         inner.priorities.remove(&txn_id);
-        let mut affected = Vec::new();
-        for (key, state) in inner.locks.iter_mut() {
-            let touched = state.holders.iter().any(|h| h.txn_id == txn_id)
-                || state.queue.iter().any(|w| w.txn_id == txn_id);
-            if touched {
-                state.holders.retain(|h| h.txn_id != txn_id);
-                state.queue.retain(|w| w.txn_id != txn_id);
-                affected.push(key.clone());
-            }
+        let Some(keys) = inner.txn_keys.remove(&txn_id) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            inner.release_all_key_visits = inner.release_all_key_visits.saturating_add(keys.len());
+        }
+
+        let mut affected = Vec::with_capacity(keys.len());
+        for key in keys {
+            let removed_waiters = if let Some(state) = inner.locks.get_mut(&key) {
+                state.holders.retain(|holder| holder.txn_id != txn_id);
+                let before = state.queue.len();
+                state.queue.retain(|waiter| waiter.txn_id != txn_id);
+                before - state.queue.len()
+            } else {
+                0
+            };
+            inner.queued_waiters = inner.queued_waiters.saturating_sub(removed_waiters);
+            affected.push(key);
         }
         for key in &affected {
             process_key(&mut inner, key);
         }
         detect_deadlocks(&mut inner);
-        inner
-            .locks
-            .retain(|_, state| !(state.holders.is_empty() && state.queue.is_empty()));
+        for key in &affected {
+            prune_if_idle(&mut inner, key);
+        }
         drop(inner);
         self.wake.notify_all();
     }
@@ -537,6 +567,30 @@ impl LockManager {
             .locks
             .get(key)
             .map_or(0, |state| state.queue.len())
+    }
+
+    #[cfg(test)]
+    fn total_queued_waiters(&self) -> usize {
+        self.inner.lock().queued_waiters
+    }
+
+    #[cfg(test)]
+    fn tracked_key_count(&self, txn_id: u64) -> usize {
+        self.inner
+            .lock()
+            .txn_keys
+            .get(&txn_id)
+            .map_or(0, HashSet::len)
+    }
+
+    #[cfg(test)]
+    fn deadlock_graph_builds(&self) -> usize {
+        self.inner.lock().deadlock_graph_builds
+    }
+
+    #[cfg(test)]
+    fn release_all_key_visits(&self) -> usize {
+        self.inner.lock().release_all_key_visits
     }
 
     /// Blocks until this waiter is granted or leaves the queue with an error.
@@ -604,8 +658,42 @@ fn check_request_live(
 }
 
 fn remove_waiter(inner: &mut Inner, key: &LockKey, txn_id: u64) {
-    if let Some(state) = inner.locks.get_mut(key) {
-        state.queue.retain(|w| w.txn_id != txn_id);
+    let removed = if let Some(state) = inner.locks.get_mut(key) {
+        let Some(position) = state
+            .queue
+            .iter()
+            .position(|waiter| waiter.txn_id == txn_id)
+        else {
+            return;
+        };
+        state.queue.remove(position);
+        true
+    } else {
+        false
+    };
+    if removed {
+        inner.queued_waiters = inner.queued_waiters.saturating_sub(1);
+        untrack_transaction_key_if_unused(inner, key, txn_id);
+    }
+}
+
+fn transaction_touches_key(inner: &Inner, key: &LockKey, txn_id: u64) -> bool {
+    inner.locks.get(key).is_some_and(|state| {
+        state.holders.iter().any(|holder| holder.txn_id == txn_id)
+            || state.queue.iter().any(|waiter| waiter.txn_id == txn_id)
+    })
+}
+
+fn untrack_transaction_key_if_unused(inner: &mut Inner, key: &LockKey, txn_id: u64) {
+    if transaction_touches_key(inner, key, txn_id) {
+        return;
+    }
+    let remove_transaction = inner.txn_keys.get_mut(&txn_id).is_some_and(|keys| {
+        keys.remove(key);
+        keys.is_empty()
+    });
+    if remove_transaction {
+        inner.txn_keys.remove(&txn_id);
     }
 }
 
@@ -634,10 +722,12 @@ fn process_key(inner: &mut Inner, key: &LockKey) {
             .collect(),
         None => return,
     };
+    let mut removed = Vec::new();
     for txn_id in dead {
         if let Some(state) = inner.locks.get_mut(key) {
             if let Some(position) = state.queue.iter().position(|w| w.txn_id == txn_id) {
                 let waiter = state.queue.remove(position).expect("position found above");
+                inner.queued_waiters = inner.queued_waiters.saturating_sub(1);
                 let fate = match waiter.control.checkpoint() {
                     Err(MongrelError::DeadlineExceeded) => Fate::DeadlineExceeded,
                     Err(_) => Fate::Cancelled,
@@ -645,16 +735,14 @@ fn process_key(inner: &mut Inner, key: &LockKey) {
                     Ok(()) => Fate::DeadlineExceeded,
                 };
                 inner.fates.entry(txn_id).or_insert(fate);
+                removed.push(txn_id);
             }
         }
     }
 
-    loop {
-        let Some(state) = inner.locks.get_mut(key) else {
-            return;
-        };
+    while let Some(state) = inner.locks.get_mut(key) {
         let Some(front) = state.queue.front() else {
-            return;
+            break;
         };
         // The waiter's own existing hold never blocks it: that is what lets a
         // queued Shared → Exclusive upgrade complete once other holds drain.
@@ -663,9 +751,10 @@ fn process_key(inner: &mut Inner, key: &LockKey) {
             .iter()
             .all(|h| h.txn_id == front.txn_id || front.mode.compatible(h.mode));
         if !grantable {
-            return;
+            break;
         }
         let waiter = state.queue.pop_front().expect("front checked above");
+        inner.queued_waiters = inner.queued_waiters.saturating_sub(1);
         match state.holders.iter_mut().find(|h| h.txn_id == waiter.txn_id) {
             Some(holder) => holder.mode = LockMode::Exclusive,
             None => state.holders.push(Holder {
@@ -673,6 +762,9 @@ fn process_key(inner: &mut Inner, key: &LockKey) {
                 mode: waiter.mode,
             }),
         }
+    }
+    for txn_id in removed {
+        untrack_transaction_key_if_unused(inner, key, txn_id);
     }
 }
 
@@ -775,7 +867,11 @@ fn choose_victim(cycle: &[u64], priorities: &HashMap<u64, u64>) -> u64 {
 /// removed from its queue and its [`Fate::Deadlock`] recorded, so every
 /// iteration strictly shrinks the waiter set and the loop terminates.
 fn detect_deadlocks(inner: &mut Inner) {
-    loop {
+    while inner.queued_waiters != 0 {
+        #[cfg(test)]
+        {
+            inner.deadlock_graph_builds = inner.deadlock_graph_builds.saturating_add(1);
+        }
         let graph = build_wait_for_graph(inner);
         let Some(cycle) = find_cycle(&graph) else {
             return;
@@ -795,8 +891,20 @@ fn detect_deadlocks(inner: &mut Inner) {
             // doom. Nothing to kill; re-detect on the next state change.
             return;
         };
-        if let Some(state) = inner.locks.get_mut(&victim_key) {
-            state.queue.retain(|w| w.txn_id != victim);
+        let removed = inner.locks.get_mut(&victim_key).is_some_and(|state| {
+            let Some(position) = state
+                .queue
+                .iter()
+                .position(|waiter| waiter.txn_id == victim)
+            else {
+                return false;
+            };
+            state.queue.remove(position);
+            true
+        });
+        if removed {
+            inner.queued_waiters = inner.queued_waiters.saturating_sub(1);
+            untrack_transaction_key_if_unused(inner, &victim_key, victim);
         }
         let cycle = cycle
             .iter()
@@ -1424,6 +1532,105 @@ mod tests {
             MongrelError::from(LockError::InvalidRequest("x".to_string())),
             MongrelError::InvalidArgument(_)
         ));
+    }
+
+    #[test]
+    fn release_all_visits_only_the_transactions_tracked_keys() {
+        let manager = LockManager::new();
+        for txn_id in 1..=128 {
+            manager
+                .acquire(row_key(txn_id), request(txn_id, Exclusive))
+                .unwrap();
+        }
+        assert_eq!(manager.release_all_key_visits(), 0);
+
+        manager.release_all(999);
+        assert_eq!(manager.release_all_key_visits(), 0);
+
+        manager.release_all(64);
+        assert_eq!(manager.release_all_key_visits(), 1);
+        assert!(!manager.holds(64, &row_key(64)));
+        assert!(manager.holds(63, &row_key(63)));
+        assert!(manager.holds(65, &row_key(65)));
+    }
+
+    #[test]
+    fn uncontended_release_skips_deadlock_graph_construction() {
+        let manager = LockManager::new();
+        for txn_id in 1..=128 {
+            manager
+                .acquire(row_key(txn_id), request(txn_id, Exclusive))
+                .unwrap();
+            manager.release_all(txn_id);
+        }
+        assert_eq!(manager.deadlock_graph_builds(), 0);
+        assert_eq!(manager.total_queued_waiters(), 0);
+    }
+
+    #[test]
+    fn waiter_accounting_covers_grant_cancel_and_deadlock() {
+        let manager = manager();
+
+        let grant_key = row_key(200);
+        manager
+            .acquire(grant_key.clone(), request(1, Exclusive))
+            .unwrap();
+        let granted = spawn_acquire(&manager, grant_key.clone(), request(2, Exclusive));
+        wait_for_queue(&manager, &grant_key, 1);
+        assert_eq!(manager.total_queued_waiters(), 1);
+        assert_eq!(manager.tracked_key_count(2), 1);
+        manager.release_all(1);
+        assert_eq!(
+            granted.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(manager.total_queued_waiters(), 0);
+        manager.release_all(2);
+
+        let cancel_key = row_key(201);
+        manager
+            .acquire(cancel_key.clone(), request(3, Exclusive))
+            .unwrap();
+        let control = ExecutionControl::new(None);
+        let cancelled = spawn_acquire(
+            &manager,
+            cancel_key.clone(),
+            LockRequest::new(4, Exclusive, control.clone()),
+        );
+        wait_for_queue(&manager, &cancel_key, 1);
+        assert_eq!(manager.total_queued_waiters(), 1);
+        control.cancel(CancellationReason::ClientRequest);
+        assert_eq!(
+            cancelled.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(LockError::Cancelled)
+        );
+        assert_eq!(manager.total_queued_waiters(), 0);
+        assert_eq!(manager.tracked_key_count(4), 0);
+        manager.release_all(3);
+
+        let key_a = row_key(202);
+        let key_b = row_key(203);
+        manager
+            .acquire(key_a.clone(), request(10, Exclusive))
+            .unwrap();
+        manager
+            .acquire(key_b.clone(), request(11, Exclusive))
+            .unwrap();
+        let survivor = spawn_acquire(&manager, key_b.clone(), request(10, Exclusive));
+        wait_for_queue(&manager, &key_b, 1);
+        assert_eq!(manager.total_queued_waiters(), 1);
+        assert!(matches!(
+            manager.acquire(key_a, request(11, Exclusive)),
+            Err(LockError::Deadlock { victim: 11, .. })
+        ));
+        assert_eq!(manager.total_queued_waiters(), 1);
+        manager.release_all(11);
+        assert_eq!(
+            survivor.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(manager.total_queued_waiters(), 0);
+        manager.release_all(10);
     }
 
     #[test]

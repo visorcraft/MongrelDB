@@ -31,7 +31,7 @@ use crate::trigger::{
 };
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1225,10 +1225,17 @@ fn cdc_rows_json_bytes(rows: &[crate::memtable::Row]) -> usize {
     })
 }
 
+struct RlsCacheEntry {
+    value: Arc<HashSet<RowId>>,
+    bytes: usize,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct RlsCache {
-    entries: HashMap<RlsCacheKey, (Arc<HashSet<RowId>>, usize)>,
-    lru: VecDeque<RlsCacheKey>,
+    entries: HashMap<RlsCacheKey, RlsCacheEntry>,
+    lru: BTreeSet<(u64, RlsCacheKey)>,
+    next_generation: u64,
     bytes: usize,
     hits: u64,
     misses: u64,
@@ -1239,7 +1246,7 @@ struct RlsCache {
 
 impl RlsCache {
     fn get(&mut self, key: &RlsCacheKey) -> Option<Arc<HashSet<RowId>>> {
-        let value = self.entries.get(key).map(|(value, _)| Arc::clone(value));
+        let value = self.entries.get(key).map(|entry| Arc::clone(&entry.value));
         if value.is_some() {
             self.hits = self.hits.saturating_add(1);
             self.touch(key);
@@ -1263,27 +1270,63 @@ impl RlsCache {
         if bytes > RLS_CACHE_MAX_BYTES {
             return;
         }
-        if let Some((_, old_bytes)) = self.entries.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(old_bytes);
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+            self.lru.remove(&(old.generation, key.clone()));
         }
-        self.lru.retain(|candidate| candidate != &key);
         while self.bytes.saturating_add(bytes) > RLS_CACHE_MAX_BYTES {
-            let Some(oldest) = self.lru.pop_front() else {
+            let Some((_, oldest)) = self.lru.pop_first() else {
                 break;
             };
-            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(old_bytes);
+            if let Some(old) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old.bytes);
                 self.evictions = self.evictions.saturating_add(1);
             }
         }
+        let generation = self.allocate_generation();
         self.bytes = self.bytes.saturating_add(bytes);
-        self.lru.push_back(key.clone());
-        self.entries.insert(key, (value, bytes));
+        self.lru.insert((generation, key.clone()));
+        self.entries.insert(
+            key,
+            RlsCacheEntry {
+                value,
+                bytes,
+                generation,
+            },
+        );
     }
 
     fn touch(&mut self, key: &RlsCacheKey) {
-        self.lru.retain(|candidate| candidate != key);
-        self.lru.push_back(key.clone());
+        let Some(previous) = self.entries.get(key).map(|entry| entry.generation) else {
+            return;
+        };
+        self.lru.remove(&(previous, key.clone()));
+        let generation = self.allocate_generation();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.generation = generation;
+        }
+        self.lru.insert((generation, key.clone()));
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        if self.next_generation == u64::MAX {
+            self.rebase_generations();
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        generation
+    }
+
+    fn rebase_generations(&mut self) {
+        let ordered = std::mem::take(&mut self.lru);
+        for (generation, (_, key)) in ordered.into_iter().enumerate() {
+            let generation = generation as u64;
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.generation = generation;
+                self.lru.insert((generation, key));
+            }
+        }
+        self.next_generation = self.lru.len() as u64;
     }
 
     fn stats(&self) -> RlsCacheStats {
@@ -1296,6 +1339,45 @@ impl RlsCache {
             build_nanos: self.build_nanos,
             rows_evaluated: self.rows_evaluated,
         }
+    }
+}
+
+#[cfg(test)]
+mod rls_cache_tests {
+    use super::*;
+
+    fn key(principal: &str) -> RlsCacheKey {
+        ("table".into(), 1, 1, principal.into())
+    }
+
+    fn rows(row_id: u64) -> Arc<HashSet<RowId>> {
+        Arc::new(std::iter::once(RowId(row_id)).collect())
+    }
+
+    #[test]
+    fn hits_update_recency_without_growing_the_order_index() {
+        let mut cache = RlsCache::default();
+        let first = key("first");
+        let second = key("second");
+        cache.insert(first.clone(), rows(1));
+        cache.insert(second.clone(), rows(2));
+        assert_eq!(cache.lru.len(), cache.entries.len());
+
+        for _ in 0..1_000 {
+            assert!(cache.get(&first).is_some());
+        }
+
+        assert_eq!(cache.lru.len(), cache.entries.len());
+        assert_eq!(
+            cache.lru.first().map(|(_, candidate)| candidate),
+            Some(&second)
+        );
+
+        cache.insert(first.clone(), rows(3));
+        assert_eq!(cache.lru.len(), cache.entries.len());
+        let replacement = cache.get(&first).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert!(replacement.contains(&RowId(3)));
     }
 }
 
@@ -11795,35 +11877,49 @@ impl Database {
         // P0.5: constraint checks must use an HLC-pinned snapshot so parent /
         // unique rows stamped with commit_ts remain visible.
         let snapshot = self.snapshot_for_epoch(read_epoch);
-        let cat = self.catalog.read().clone();
+        // Check the no-constraint fast path while borrowing the catalog. The
+        // previous path cloned the complete catalog and every live schema before
+        // discovering there was no constraint work to do.
+        let (live, table_ids_by_name) = {
+            let catalog = self.catalog.read();
+            let any_constraints = catalog.tables.iter().any(|entry| {
+                matches!(entry.state, TableState::Live | TableState::Building { .. })
+                    && !entry.schema.constraints.is_empty()
+            });
+            if !any_constraints {
+                drop(catalog);
+                self.materialize_generated_embeddings(staging, control)?;
+                return Ok(());
+            }
+            let live: Vec<(u64, String, crate::schema::Schema)> = catalog
+                .tables
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.state, TableState::Live | TableState::Building { .. })
+                })
+                .map(|entry| (entry.table_id, entry.name.clone(), entry.schema.clone()))
+                .collect();
+            let table_ids_by_name: HashMap<String, u64> = catalog
+                .tables
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.table_id))
+                .collect();
+            (live, table_ids_by_name)
+        };
 
-        // Collect live (id, name, constraints-bearing?) for staged tables.
-        let live: Vec<(u64, String, crate::schema::Schema)> = cat
-            .tables
-            .iter()
-            .filter(|entry| matches!(entry.state, TableState::Live | TableState::Building { .. }))
-            .map(|e| (e.table_id, e.name.clone(), e.schema.clone()))
-            .collect();
-
-        // Fast path: bail if no live table declares any constraints at all.
-        let any_constraints = live.iter().any(|(_, _, s)| !s.constraints.is_empty());
-        if !any_constraints {
-            self.materialize_generated_embeddings(staging, control)?;
-            return Ok(());
-        }
-
-        // Lazily-loaded visible rows per table, shared across checks.
-        let mut rows_cache: HashMap<u64, Vec<Row>> = HashMap::new();
-        let mut load_rows = |table_id: u64| -> Result<Vec<Row>> {
-            if let Some(r) = rows_cache.get(&table_id) {
-                return Ok(r.clone());
+        // Lazily-loaded visible rows per table, shared across checks. Cache hits
+        // clone only the `Arc`, not every row and its column values.
+        let mut rows_cache: HashMap<u64, Arc<Vec<Row>>> = HashMap::new();
+        let mut load_rows = |table_id: u64| -> Result<Arc<Vec<Row>>> {
+            if let Some(rows) = rows_cache.get(&table_id) {
+                return Ok(Arc::clone(rows));
             }
             let handle = self.table_by_id(table_id)?;
-            let rows = match control {
+            let rows = Arc::new(match control {
                 Some(control) => handle.lock().visible_rows_controlled(snapshot, control)?,
                 None => handle.lock().visible_rows(snapshot)?,
-            };
-            rows_cache.insert(table_id, rows.clone());
+            });
+            rows_cache.insert(table_id, Arc::clone(&rows));
             Ok(rows)
         };
 
@@ -11900,7 +11996,7 @@ impl Database {
                             control,
                         )?;
                         let child_rows = load_rows(*child_id)?;
-                        for (child_index, child) in child_rows.into_iter().enumerate() {
+                        for (child_index, child) in child_rows.iter().enumerate() {
                             commit_prepare_checkpoint(control, child_index)?;
                             if encode_composite_key(&fk.columns, &child.columns).as_deref()
                                 != Some(old_key.as_slice())
@@ -12177,12 +12273,7 @@ impl Database {
                         let Some(child_key) = encode_composite_key(&fk.columns, &cells_map) else {
                             continue; // NULL FK component → not checked (SQL).
                         };
-                        let Some(parent_id) = cat
-                            .tables
-                            .iter()
-                            .find(|t| t.name == fk.ref_table)
-                            .map(|t| t.table_id)
-                        else {
+                        let Some(parent_id) = table_ids_by_name.get(&fk.ref_table).copied() else {
                             return Err(MongrelError::InvalidArgument(format!(
                                 "FOREIGN KEY '{}' references unknown table '{}'",
                                 fk.name, fk.ref_table
@@ -12285,8 +12376,7 @@ impl Database {
                                     crate::locks::LockMode::Exclusive,
                                     control,
                                 )?;
-                                for (child_index, child) in
-                                    load_rows(*child_id)?.into_iter().enumerate()
+                                for (child_index, child) in load_rows(*child_id)?.iter().enumerate()
                                 {
                                     commit_prepare_checkpoint(control, child_index)?;
                                     if encode_composite_key(&fk.columns, &child.columns).as_deref()
@@ -12878,18 +12968,22 @@ impl Database {
                             // concurrent transactions inserting the same key
                             // cannot both commit. Rows with any NULL constrained
                             // column are skipped (SQL semantics).
-                            for uc in &entry.schema.constraints.uniques {
-                                if let Some(key_bytes) = crate::constraint::encode_composite_key(
-                                    &uc.columns,
-                                    &cells.iter().cloned().collect(),
-                                ) {
-                                    let mut h = DefaultHasher::new();
-                                    key_bytes.hash(&mut h);
-                                    keys.push(WriteKey::Unique {
-                                        table_id: *table_id,
-                                        index_id: uc.id | 0x8000,
-                                        key_hash: h.finish(),
-                                    });
+                            if !entry.schema.constraints.uniques.is_empty() {
+                                let cells_map: HashMap<u16, Value> =
+                                    cells.iter().cloned().collect();
+                                for uc in &entry.schema.constraints.uniques {
+                                    if let Some(key_bytes) = crate::constraint::encode_composite_key(
+                                        &uc.columns,
+                                        &cells_map,
+                                    ) {
+                                        let mut h = DefaultHasher::new();
+                                        key_bytes.hash(&mut h);
+                                        keys.push(WriteKey::Unique {
+                                            table_id: *table_id,
+                                            index_id: uc.id | 0x8000,
+                                            key_hash: h.finish(),
+                                        });
+                                    }
                                 }
                             }
                         }
