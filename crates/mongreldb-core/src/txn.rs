@@ -1389,6 +1389,12 @@ pub struct ConflictIndex {
     /// commits arrived between the pre-check and the sequencer (spec §8.5,
     /// review fix #17).
     version: std::sync::atomic::AtomicU64,
+    /// Highest active-reader floor already applied to every shard. Commit
+    /// epochs only advance within one open, so no write recorded after a prune
+    /// can fall below an unchanged floor.
+    last_prune_floor: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    prune_passes: std::sync::atomic::AtomicU64,
 }
 
 impl ConflictIndex {
@@ -1398,6 +1404,9 @@ impl ConflictIndex {
             table_truncate_epochs: parking_lot::Mutex::new(HashMap::new()),
             table_write_epochs: parking_lot::Mutex::new(HashMap::new()),
             version: std::sync::atomic::AtomicU64::new(0),
+            last_prune_floor: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            prune_passes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1476,6 +1485,16 @@ impl ConflictIndex {
     /// Drop entries whose `commit_epoch < min_active` (they can never cause a
     /// future conflict once no live txn reads below `min_active`).
     pub fn prune_below(&self, min_active: Epoch) {
+        let previous = self
+            .last_prune_floor
+            .fetch_max(min_active.0, std::sync::atomic::Ordering::AcqRel);
+        if min_active.0 <= previous {
+            return;
+        }
+        #[cfg(test)]
+        self.prune_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         for s in &self.shards {
             s.lock().retain(|_, ce| *ce >= min_active.0);
         }
@@ -1485,6 +1504,11 @@ impl ConflictIndex {
         self.table_write_epochs
             .lock()
             .retain(|_, ce| *ce >= min_active.0);
+    }
+
+    #[cfg(test)]
+    fn prune_passes(&self) -> u64 {
+        self.prune_passes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1679,6 +1703,35 @@ mod tests {
         assert!(!ci.conflicts(&k, Epoch(6)));
         ci.prune_below(Epoch(7));
         assert!(!ci.conflicts(&k, Epoch(5)));
+    }
+
+    #[test]
+    fn conflict_index_skips_repeated_unchanged_prune_floor() {
+        let ci = ConflictIndex::new();
+        let first = WriteKey::Row {
+            table_id: 1,
+            row_id: 7,
+        };
+        let second = WriteKey::Row {
+            table_id: 1,
+            row_id: 8,
+        };
+
+        ci.record(std::slice::from_ref(&first), Epoch(6));
+        ci.prune_below(Epoch(5));
+        assert_eq!(ci.prune_passes(), 1);
+
+        // A later commit cannot be below the unchanged active-reader floor, so
+        // rescanning every accumulated shard would retain every entry again.
+        ci.record(std::slice::from_ref(&second), Epoch(7));
+        ci.prune_below(Epoch(5));
+        assert_eq!(ci.prune_passes(), 1);
+        assert!(ci.conflicts(std::slice::from_ref(&first), Epoch(4)));
+        assert!(ci.conflicts(std::slice::from_ref(&second), Epoch(4)));
+
+        ci.prune_below(Epoch(8));
+        assert_eq!(ci.prune_passes(), 2);
+        assert!(!ci.conflicts(&[first, second], Epoch(4)));
     }
 
     #[test]
