@@ -1,0 +1,119 @@
+name: Export performance follow-up patches
+
+on:
+  push:
+    branches:
+      - agent/export-performance-patches-5858a33
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: "5858a33dc9da0108ebdc78b8f368fc9f3938d2f8"
+  HEAD_SHA: "1c96fd09bcb83855b4904c575d6c63d79aef196f"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Generate canonical patches and verify both application modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=/tmp/mongreldb-performance-followups-5858a33
+          verify_am=/tmp/verify-am
+          verify_apply=/tmp/verify-apply
+          mkdir -p "$out"
+
+          mapfile -t generated < <(
+            git format-patch \
+              --no-signature \
+              --full-index \
+              --binary \
+              --output-directory "$out" \
+              "$BASE_SHA..$HEAD_SHA"
+          )
+          test "${#generated[@]}" -eq 5
+
+          mv "${generated[0]}" "$out/02-conflict-prune-floor.patch"
+          mv "${generated[1]}" "$out/03-lock-release-index.patch"
+          mv "${generated[2]}" "$out/04-constraint-cache-sharing.patch"
+          mv "${generated[3]}" "$out/05-rls-cache-logarithmic-lru.patch"
+          mv "${generated[4]}" "$out/06-result-cache-logarithmic-lru.patch"
+
+          git diff --full-index --binary "$BASE_SHA" "$HEAD_SHA" \
+            > "$out/combined-5858a33-to-1c96fd0.patch"
+
+          cat > "$out/README.md" <<EOF
+          # MongrelDB performance follow-ups 2–6
+
+          These patches are generated directly from the validated five-commit
+          series between:
+
+          - base: \`$BASE_SHA\`
+          - head: \`$HEAD_SHA\`
+          - draft PR: https://github.com/visorcraft/MongrelDB/pull/1
+
+          ## Apply as commits
+
+          From a clean checkout at the base SHA:
+
+          \`\`\`bash
+          git am \\
+            02-conflict-prune-floor.patch \\
+            03-lock-release-index.patch \\
+            04-constraint-cache-sharing.patch \\
+            05-rls-cache-logarithmic-lru.patch \\
+            06-result-cache-logarithmic-lru.patch
+          \`\`\`
+
+          ## Apply as one uncommitted working-tree change
+
+          \`\`\`bash
+          git apply --check combined-5858a33-to-1c96fd0.patch
+          git apply combined-5858a33-to-1c96fd0.patch
+          \`\`\`
+
+          The export job verifies both application modes reconstruct the exact
+          tree at \`$HEAD_SHA\`.
+          EOF
+
+          git worktree add --detach "$verify_am" "$BASE_SHA"
+          git -C "$verify_am" am \
+            "$out/02-conflict-prune-floor.patch" \
+            "$out/03-lock-release-index.patch" \
+            "$out/04-constraint-cache-sharing.patch" \
+            "$out/05-rls-cache-logarithmic-lru.patch" \
+            "$out/06-result-cache-logarithmic-lru.patch"
+          test "$(git -C "$verify_am" rev-parse HEAD^{tree})" = \
+               "$(git rev-parse "$HEAD_SHA^{tree}")"
+
+          git worktree add --detach "$verify_apply" "$BASE_SHA"
+          git -C "$verify_apply" apply --check \
+            "$out/combined-5858a33-to-1c96fd0.patch"
+          git -C "$verify_apply" apply \
+            "$out/combined-5858a33-to-1c96fd0.patch"
+          git -C "$verify_apply" add -A
+          test "$(git -C "$verify_apply" write-tree)" = \
+               "$(git rev-parse "$HEAD_SHA^{tree}")"
+
+          (
+            cd "$out"
+            sha256sum \
+              02-conflict-prune-floor.patch \
+              03-lock-release-index.patch \
+              04-constraint-cache-sharing.patch \
+              05-rls-cache-logarithmic-lru.patch \
+              06-result-cache-logarithmic-lru.patch \
+              combined-5858a33-to-1c96fd0.patch \
+              README.md \
+              > SHA256SUMS
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mongreldb-performance-followups-5858a33
+          path: /tmp/mongreldb-performance-followups-5858a33
+          if-no-files-found: error
