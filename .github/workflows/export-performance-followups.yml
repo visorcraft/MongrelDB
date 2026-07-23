@@ -1,9 +1,9 @@
 name: Export performance follow-up patches
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/export-performance-patches-5858a33
+      - master
 
 permissions:
   contents: read
