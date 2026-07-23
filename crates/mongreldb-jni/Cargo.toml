@@ -17,11 +17,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The Kit crate wraps the engine with schema model, migrations, and query
-# builder execution. Kit stays on its own 0.64.4 train until the matching Kit
+# builder execution. Kit stays on its own 0.64.5 train until the matching Kit
 # release lands; engine types track this monorepo release so the adapter can
 # pick up core/query fixes after publish.
-mongreldb-kit = "=0.64.4"
-mongreldb-kit-core = "=0.64.4"
+mongreldb-kit = "=0.64.5"
+mongreldb-kit-core = "=0.64.5"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
 mongreldb-types = "0.64.5"
 # The jni crate provides Rust bindings to the JNI API.
