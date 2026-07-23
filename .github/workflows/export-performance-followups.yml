@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          exec > >(tee /tmp/performance-patch-export.log) 2>&1
           out=/tmp/mongreldb-performance-followups-5858a33
           verify_am=/tmp/verify-am
           verify_apply=/tmp/verify-apply
@@ -82,7 +83,10 @@ jobs:
           EOF
 
           git worktree add --detach "$verify_am" "$BASE_SHA"
-          git -C "$verify_am" am \
+          git -C "$verify_am" \
+            -c user.name="patch verifier" \
+            -c user.email="patch-verifier@example.invalid" \
+            am \
             "$out/02-conflict-prune-floor.patch" \
             "$out/03-lock-release-index.patch" \
             "$out/04-constraint-cache-sharing.patch" \
@@ -116,4 +120,11 @@ jobs:
         with:
           name: mongreldb-performance-followups-5858a33
           path: /tmp/mongreldb-performance-followups-5858a33
+          if-no-files-found: error
+      - name: Upload export diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-patch-export-log
+          path: /tmp/performance-patch-export.log
           if-no-files-found: error
