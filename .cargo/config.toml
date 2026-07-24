@@ -1,0 +1,7 @@
+# .cargo/config.toml
+# Uncomment to build with PGO (requires merged.profdata):
+# [build]
+# rustflags = ["-Cprofile-use=/tmp/pgo-data/merged.profdata"]
+#
+# For the full instrument → collect → merge → rebuild pipeline, use
+# scripts/pgo-build.sh (PLAN.md work-stream B).
