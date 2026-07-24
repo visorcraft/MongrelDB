@@ -14,7 +14,9 @@ trap 'status=$?; echo "P0 harness failed at line $LINENO: $BASH_COMMAND (status 
 set -x
 
 prepare_variant() {
-  local label=$1 sha=$2 dir="/tmp/e775-p0-$label"
+  local label=$1
+  local sha=$2
+  local dir="/tmp/e775-p0-$label"
   git worktree add --detach "$dir" "$sha"
   python3 - "$dir/crates/mongreldb-core/benches/write_path.rs" <<'PY'
 from pathlib import Path
@@ -63,7 +65,9 @@ prepare_variant fix "$FIX_SHA"
 prepare_variant final "$TARGET_SHA"
 
 run_variant() {
-  local label=$1 dir="/tmp/e775-p0-$label" target="/tmp/target-e775-p0-$label"
+  local label=$1
+  local dir="/tmp/e775-p0-$label"
+  local target="/tmp/target-e775-p0-$label"
   local log="$OUT/$label.log"
   : > "$log"
   for bench in put_no_fsync table_create_only put_steady_state; do
