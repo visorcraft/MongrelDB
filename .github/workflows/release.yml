@@ -271,12 +271,18 @@ jobs:
 
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # The toolchain floats on `stable`, so fold its fingerprint into the
+      # cache key: a rustc bump must not reuse a stale merged.profdata.
+      - name: Fingerprint the toolchain
+        id: toolchain
+        run: echo "rustc=$(rustc -vV | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: Restore cached PGO profile
         id: pgo-profile
         uses: actions/cache@v4
         with:
           path: target/pgo/merged.profdata
-          key: pgo-profile-x86_64-linux-${{ hashFiles('crates/mongreldb-server/**', 'crates/mongreldb-core/**', 'crates/mongreldb-query/**') }}
+          key: pgo-profile-x86_64-linux-${{ steps.toolchain.outputs.rustc }}-${{ hashFiles('crates/mongreldb-server/**', 'crates/mongreldb-core/**', 'crates/mongreldb-query/**') }}
 
       - name: Build PGO-optimized server
         shell: bash
@@ -316,10 +322,12 @@ jobs:
 
       - run: brew install protobuf
 
-      - run: cargo build --release --bin mongreldb-server --target x86_64-apple-darwin
+      # Same feature opt-in as the Linux matrix above: packaged binaries ship
+      # the full cluster/native/OIDC/vault/embedding surface.
+      - run: cargo build --release --bin mongreldb-server --target x86_64-apple-darwin --features cluster,native-rpc,oidc,vault-kms,remote-embedding
         working-directory: crates/mongreldb-server
 
-      - run: cargo build --release --bin mongreldb-server --target aarch64-apple-darwin
+      - run: cargo build --release --bin mongreldb-server --target aarch64-apple-darwin --features cluster,native-rpc,oidc,vault-kms,remote-embedding
         working-directory: crates/mongreldb-server
 
       - run: |
