@@ -15,7 +15,7 @@
 #
 # Job graph (max parallelism, native arch runners — no QEMU):
 #   wave 1 (parallel): publish-crate · image-amd64 · image-arm64
-#   wave 2 (parallel): server binaries · image-manifest
+#   wave 2 (parallel): server binaries · x64 PGO binary · image-manifest
 # The arm64 addon .node and arm64 server image build on ubuntu-24.04-arm
 # (native, free for public repos), avoiding hours of QEMU emulation.
 #
@@ -246,6 +246,56 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/${{ matrix.asset }}
+
+  # PGO-optimized x86_64 Linux build (PLAN.md work-stream B, Option 1):
+  # instrument, collect the profile from the P0 + P2 benchmarks, merge, and
+  # rebuild with -Cprofile-use. Ships as an additional asset alongside the
+  # plain matrix binaries — the profile can only be collected on the native
+  # arch, so the musl/arm64/darwin legs keep the plain build. The merged
+  # profile is cached across runs and only re-collected when the hot-path
+  # sources change.
+  release-linux-x64-pgo:
+    needs: publish-crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Restore cached PGO profile
+        id: pgo-profile
+        uses: actions/cache@v4
+        with:
+          path: target/pgo/merged.profdata
+          key: pgo-profile-x86_64-linux-${{ hashFiles('crates/mongreldb-server/**', 'crates/mongreldb-core/**', 'crates/mongreldb-query/**') }}
+
+      - name: Build PGO-optimized server
+        shell: bash
+        run: |
+          args=()
+          if [ "${{ steps.pgo-profile.outputs.cache-hit }}" = "true" ]; then
+            args+=(--skip-collect)
+          fi
+          scripts/pgo-build.sh "${args[@]}"
+
+      - run: |
+          mkdir -p dist
+          cp target/release/mongreldb-server dist/mongreldb-server-linux-x64-pgo
+          chmod +x dist/mongreldb-server-linux-x64-pgo
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/mongreldb-server-linux-x64-pgo
 
   release-darwin-binaries:
     needs: publish-crate
