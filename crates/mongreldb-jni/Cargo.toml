@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-jni"
-version = "0.64.6"
+version = "0.64.7"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -17,13 +17,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The Kit crate wraps the engine with schema model, migrations, and query
-# builder execution. Kit stays on its own 0.64.6 train until the matching Kit
-# release lands; engine types track this monorepo release so the adapter can
-# pick up core/query fixes after publish.
+# builder execution. Kit stays on crates.io 0.64.6 until the matching Kit
+# release (0.64.7) lands; engine types track this monorepo release so the
+# adapter can pick up core/query fixes after publish.
 mongreldb-kit = "=0.64.6"
 mongreldb-kit-core = "=0.64.6"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
-mongreldb-types = "0.64.6"
+mongreldb-types = "0.64.7"
 # The jni crate provides Rust bindings to the JNI API.
 jni = { version = "0.21", features = ["invocation"] }
 serde_json = { version = "1", features = ["preserve_order"] }

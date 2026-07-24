@@ -25,6 +25,30 @@ ANN / FM / Sparse / MinHash / LearnedRange keep their existing full reindex
 paths; Bitmap is the first family on the delta planner so equality/FK-style
 indexes stay correct under high update volume.
 
+### RangeInt point equality dual-sources Bitmap
+
+Product clients (TypeScript Kit) push **int64 `eq()` as `RangeInt`**, not
+`BitmapEq`. Range plans use LearnedRange / run scans + overlay. When `lo == hi`
+and a Bitmap secondary exists on that column, the engine **also unions** the
+Bitmap membership (then re-merges overlay). That way Bitmap maintenance on
+update keeps product listing-by-FK / listing-by-owner correct even if a
+run/LearnedRange plan would otherwise miss a live row.
+
+### Delete removes Bitmap membership
+
+Live deletes capture the pre-image and drop the row-id from every Bitmap key
+before the tombstone lands (HOT was already cleaned). Flush rebuild remains
+the full authority for sealed runs.
+
+### Rebuild after desync
+
+`Database::rebuild_indexes(table)` / `rebuild_all_indexes()` reconstruct HOT
+and every secondary from runs + mutable run + memtable. Use when a fullscan
+still finds a row that PK or equality listing misses.
+
+Primary-key lookup also **falls back** to a targeted PK-column scan when the
+HOT map misses a key that may still be live (self-heal for rare desync).
+
 ## How to Declare Indexes
 
 Indexes are defined in the schema when you create a table:

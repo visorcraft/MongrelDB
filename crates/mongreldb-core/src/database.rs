@@ -14050,6 +14050,27 @@ impl Database {
             .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not mounted")))
     }
 
+    /// Rebuild HOT + secondary indexes for one live table from durable runs,
+    /// the mutable run, and the memtable. Use after an index desync (rows
+    /// visible on fullscan but missing from PK / equality lookups).
+    pub fn rebuild_indexes(&self, table: &str) -> Result<()> {
+        let handle = self.table(table)?;
+        let mut guard = handle.lock();
+        guard.rebuild_indexes()
+    }
+
+    /// Rebuild indexes for every live mounted table. Returns the number of
+    /// tables rebuilt.
+    pub fn rebuild_all_indexes(&self) -> Result<usize> {
+        let handles: Vec<_> = self.tables.read().values().cloned().collect();
+        let mut n = 0usize;
+        for handle in handles {
+            handle.lock().rebuild_indexes()?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// Whether any mounted table has wall-clock TTL retention. SQL sessions
     /// use this to avoid epoch-keyed result caches that can outlive a cutoff.
     pub fn has_ttl_tables(&self) -> bool {

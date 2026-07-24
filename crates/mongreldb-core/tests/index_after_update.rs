@@ -105,6 +105,20 @@ fn trip_index_query(trip_id: i64) -> Query {
     })
 }
 
+/// Kit int64 `eq()` always pushes RangeInt — the product path for trip_id /
+/// owner_id listing. Must stay correct under delete+put updates.
+fn trip_range_eq_query(trip_id: i64) -> Query {
+    Query::new().and(Condition::Range {
+        column_id: 2,
+        lo: trip_id,
+        hi: trip_id,
+    })
+}
+
+fn pk_query(pk: i64) -> Query {
+    Query::new().and(Condition::Pk(Value::Int64(pk).encode_key()))
+}
+
 fn tag_index_query(tag: &[u8]) -> Query {
     Query::new().and(Condition::BitmapEq {
         column_id: 2,
@@ -157,6 +171,39 @@ fn assert_listed_by_trip(db: &Database, table: &str, trip_id: i64, expect_pks: &
         pks, expected,
         "secondary-index trip_id={trip_id} listing mismatch"
     );
+}
+
+fn assert_listed_by_trip_range(db: &Database, table: &str, trip_id: i64, expect_pks: &[i64]) {
+    let handle = db.table(table).unwrap();
+    let mut guard = handle.lock();
+    let rows = guard.query(&trip_range_eq_query(trip_id)).unwrap();
+    let mut pks: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.columns.get(&1) {
+            Some(Value::Int64(n)) => *n,
+            other => panic!("expected Int64 pk, got {other:?}"),
+        })
+        .collect();
+    pks.sort_unstable();
+    let mut expected = expect_pks.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        pks, expected,
+        "RangeInt trip_id={trip_id} listing mismatch (Kit eq path)"
+    );
+}
+
+fn assert_pk_finds(db: &Database, table: &str, pk: i64) {
+    let handle = db.table(table).unwrap();
+    let mut guard = handle.lock();
+    let rows = guard.query(&pk_query(pk)).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "PK query for {pk} expected 1 row, got {}",
+        rows.len()
+    );
+    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(pk)));
 }
 
 #[test]
@@ -454,4 +501,192 @@ fn title_only_update_does_not_leave_stale_bitmap_row_id() {
     }
     // No duplicate / ghost rows for the same trip from the tombstoned rid.
     assert_listed_by_trip(&db, "segments", 5, &[1]);
+}
+
+#[test]
+fn range_int_point_query_survives_delete_put_like_kit() {
+    // Product Kit always uses RangeInt for int64 eq (trip_id / owner_id lists),
+    // never BitmapEq. After Kit applyUpdateInTxn (delete+put) the row must
+    // remain listable via RangeInt.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("segments", segments_like_schema()).unwrap();
+
+    db.transaction(|tx| {
+        tx.put(
+            "segments",
+            vec![
+                (1, Value::Int64(10)),
+                (2, Value::Int64(42)),
+                (3, Value::Bytes(b"hotel".to_vec())),
+            ],
+        )?;
+        tx.put(
+            "segments",
+            vec![
+                (1, Value::Int64(11)),
+                (2, Value::Int64(42)),
+                (3, Value::Bytes(b"flight".to_vec())),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_listed_by_trip_range(&db, "segments", 42, &[10, 11]);
+
+    let rid = lookup_pk(&db, "segments", 10);
+    db.transaction(|tx| {
+        tx.delete("segments", rid)?;
+        tx.put(
+            "segments",
+            vec![
+                (1, Value::Int64(10)),
+                (2, Value::Int64(42)),
+                (3, Value::Bytes(b"hotel updated".to_vec())),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_row_by_pk(&db, "segments", 10, Some(b"hotel updated"));
+    assert_listed_by_trip_range(&db, "segments", 42, &[10, 11]);
+    assert_listed_by_trip(&db, "segments", 42, &[10, 11]);
+    assert_pk_finds(&db, "segments", 10);
+    assert_pk_finds(&db, "segments", 11);
+}
+
+#[test]
+fn trips_owner_range_lists_both_after_partial_updates() {
+    // Trips-like: owner_id Bitmap secondary + title payload. Multiple partial
+    // updates must not hide either trip from owner_id=1 RangeInt listing
+    // (dashboard / trip list).
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    let schema = Schema {
+        schema_id: 9,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "owner_id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "name".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "trips_owner_idx".into(),
+            column_id: 2,
+            kind: IndexKind::Bitmap,
+            predicate: None,
+            options: Default::default(),
+        }],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    };
+    db.create_table("trips", schema).unwrap();
+    db.transaction(|tx| {
+        tx.put(
+            "trips",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Int64(1)),
+                (3, Value::Bytes(b"August".to_vec())),
+            ],
+        )?;
+        tx.put(
+            "trips",
+            vec![
+                (1, Value::Int64(2)),
+                (2, Value::Int64(1)),
+                (3, Value::Bytes(b"December".to_vec())),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let owner_q = Query::new().and(Condition::Range {
+        column_id: 2,
+        lo: 1,
+        hi: 1,
+    });
+    {
+        let handle = db.table("trips").unwrap();
+        let mut guard = handle.lock();
+        let rows = guard.query(&owner_q).unwrap();
+        assert_eq!(rows.len(), 2, "both trips visible for owner before updates");
+    }
+
+    let rid1 = lookup_pk(&db, "trips", 1);
+    for title in [b"August v2".as_slice(), b"August v3", b"August final"] {
+        let rid = lookup_pk(&db, "trips", 1);
+        db.transaction(|tx| {
+            tx.update_many(
+                "trips",
+                vec![(rid, vec![(3, Value::Bytes(title.to_vec()))])],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let _ = rid1;
+
+    {
+        let handle = db.table("trips").unwrap();
+        let mut guard = handle.lock();
+        let rows = guard.query(&owner_q).unwrap();
+        let mut pks: Vec<i64> = rows
+            .iter()
+            .map(|r| match r.columns.get(&1) {
+                Some(Value::Int64(n)) => *n,
+                _ => panic!("bad pk"),
+            })
+            .collect();
+        pks.sort_unstable();
+        assert_eq!(pks, vec![1, 2], "both trips still listed after updates");
+    }
+    assert_pk_finds(&db, "trips", 1);
+    assert_pk_finds(&db, "trips", 2);
+}
+
+#[test]
+fn rebuild_indexes_restores_pk_and_owner_list() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("segments", segments_like_schema()).unwrap();
+    db.transaction(|tx| {
+        tx.put(
+            "segments",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Int64(7)),
+                (3, Value::Bytes(b"seg".to_vec())),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.rebuild_indexes("segments").unwrap();
+    assert_pk_finds(&db, "segments", 1);
+    assert_listed_by_trip_range(&db, "segments", 7, &[1]);
+    assert_listed_by_trip(&db, "segments", 7, &[1]);
 }

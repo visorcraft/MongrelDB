@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-server"
-version = "0.64.6"
+version = "0.64.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP daemon for MongrelDB — serves SQL, native queries, and typed Kit API over HTTP for multi-process access."
@@ -44,26 +44,26 @@ vault-kms = []
 dangerous-test-transport = ["cluster", "mongreldb-cluster/dangerous-test-transport"]
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.6" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.64.6" }
-mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.6" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.7" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.64.7" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.7" }
 # The protocol crate's public API is parameterized over these shared ids/HLC
 # types (DatabaseId, TransactionId, HlcTimestamp, MetadataVersion, ...); the
 # server must name them to build protocol records.
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.6" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.7" }
 # Commit receipts surfaced by the core's idempotent-commit path are typed over
 # the commit log's `CommitReceipt`/`DurabilityLevel`; the server names them
 # when echoing receipt fields back in idempotent-write responses (S1B-005).
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.6" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.7" }
 # Cluster bootstrap workflows (spec section 11.1, S2A-002): the `cluster`/`node`
 # CLI subcommands and the `/admin/cluster/*` endpoints map onto this crate's
 # node-identity and membership functions. Optional: standalone builds omit all
 # cluster code (see the `cluster` feature).
-mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.64.6", optional = true }
+mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.64.7", optional = true }
 # Tablet engine sinks for production fragment/AI workers (P0.2): resolve the
 # applied ClusterReplica core for a hosted tablet without dual-root opens.
 # Optional: only referenced from cluster-gated modules.
-mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.64.6", optional = true }
+mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.64.7", optional = true }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -91,6 +91,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 tower = "0.5"
 tempfile = "3"
-mongreldb-client = { path = "../mongreldb-client", version = "0.64.6" }
+mongreldb-client = { path = "../mongreldb-client", version = "0.64.7" }
 datafusion = "54.0.0"
 rcgen = "0.13"

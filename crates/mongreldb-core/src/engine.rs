@@ -2590,8 +2590,72 @@ impl Table {
         Ok(())
     }
 
+    /// Rebuild HOT + every secondary index from durable runs, the mutable run,
+    /// and the memtable. Safe to call online; used by recovery tooling and the
+    /// public [`crate::Database::rebuild_indexes`] path after index desync.
+    pub fn rebuild_indexes(&mut self) -> Result<()> {
+        self.rebuild_indexes_from_runs_inner(None)
+    }
+
     pub(crate) fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.rebuild_indexes_from_runs_inner(None)
+    }
+
+    /// Scan overlay + runs for a live row whose PK encode matches `lookup`.
+    /// Used when the HOT map misses a key that may still exist on disk.
+    fn pk_equality_fallback(
+        &self,
+        pk_column_id: u16,
+        lookup: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<RowIdSet> {
+        // Overlay first (newest versions).
+        for row in self.memtable.visible_versions_at(snapshot) {
+            if row.deleted {
+                continue;
+            }
+            if let Some(pk_val) = row.columns.get(&pk_column_id) {
+                if self.index_lookup_key(pk_column_id, pk_val) == lookup {
+                    return Ok(RowIdSet::one(row.row_id.0));
+                }
+            }
+        }
+        for row in self.mutable_run.visible_versions_at(snapshot) {
+            if row.deleted {
+                continue;
+            }
+            if let Some(pk_val) = row.columns.get(&pk_column_id) {
+                if self.index_lookup_key(pk_column_id, pk_val) == lookup {
+                    return Ok(RowIdSet::one(row.row_id.0));
+                }
+            }
+        }
+        // Durable runs: prefer int64 point range when the encoded key is 8
+        // bytes of big-endian i64 (the common Kit PK shape).
+        if lookup.len() == 8 {
+            if let Ok(arr) = <[u8; 8]>::try_from(lookup) {
+                let n = i64::from_be_bytes(arr);
+                return self.range_scan_i64(pk_column_id, n, n, snapshot);
+            }
+        }
+        // Bytes / other PK types: linear visible scan of runs is expensive but
+        // correctness-first for rare HOT misses.
+        let mut found = Vec::new();
+        let overlay = self.overlay_rid_set(snapshot);
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            for row in reader.visible_rows(snapshot.epoch)? {
+                if overlay.contains(&row.row_id.0) || row.deleted {
+                    continue;
+                }
+                if let Some(pk_val) = row.columns.get(&pk_column_id) {
+                    if self.index_lookup_key(pk_column_id, pk_val) == lookup {
+                        found.push(row.row_id.0);
+                    }
+                }
+            }
+        }
+        Ok(RowIdSet::from_unsorted(found))
     }
 
     fn rebuild_indexes_from_runs_inner(
@@ -4008,9 +4072,63 @@ impl Table {
         epoch: Epoch,
         commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     ) {
+        // Capture the pre-image *before* the tombstone lands so Bitmap keys
+        // can be cleaned. Indexes are otherwise append-only across deletes
+        // (§5.1): without this, tombstoned row-ids linger under equality keys
+        // until a flush rebuild. Kit's update path is delete+put; leaving the
+        // old rid in the Bitmap and only re-pointing on put races with partial
+        // schema / failed puts and has shown up as "row gone from list".
+        let preimage = self.get(row_id, self.snapshot());
         self.remove_hot_for_row(row_id, epoch);
+        if let Some(row) = preimage.as_ref() {
+            self.unindex_bitmap_membership(row);
+        }
         self.tombstone_row(row_id, epoch, commit_ts, true);
         self.data_generation = self.data_generation.wrapping_add(1);
+    }
+
+    /// Drop this row's membership from every Bitmap secondary (best-effort).
+    /// Used on the live delete path so equality keys do not retain tombstoned
+    /// row-ids until the next flush rebuild.
+    fn unindex_bitmap_membership(&mut self, row: &Row) {
+        if row.deleted {
+            return;
+        }
+        for idef in &self.schema.indexes {
+            if idef.kind != crate::schema::IndexKind::Bitmap {
+                continue;
+            }
+            if let Some(key) = crate::index::maintain::bitmap_key_for_column(row, idef.column_id) {
+                if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
+                    b.remove(&key, row.row_id);
+                }
+            }
+        }
+    }
+
+    /// Union Bitmap membership for a point (`lo == hi`) int64 range query into
+    /// `set`, then re-merge overlay so pure-memtable rows still win. No-op when
+    /// the column has no Bitmap index.
+    fn union_bitmap_point_i64(
+        &self,
+        set: &mut RowIdSet,
+        column_id: u16,
+        value: i64,
+        snapshot: Snapshot,
+    ) {
+        let Some(b) = self.bitmap.get(&column_id) else {
+            return;
+        };
+        let encoded = Value::Int64(value).encode_key();
+        let lookup = self.index_lookup_key_bytes(column_id, &encoded);
+        for rid in b.get(&lookup).iter() {
+            set.insert(u64::from(rid));
+        }
+        // Drop rids whose newest overlay version is a tombstone (append-only
+        // leftovers). Live overlay versions for this value are re-inserted by
+        // the overlay range scan.
+        set.remove_many(self.overlay_tombstoned_rids(snapshot));
+        self.range_scan_overlay_i64(set, column_id, value, value, snapshot);
     }
 
     /// Tombstone `row_id` at `epoch`. When `adjust_live_count` is true the
@@ -7788,10 +7906,18 @@ impl Table {
                     .primary_key()
                     .map(|pk| self.index_lookup_key_bytes(pk.id, key))
                     .unwrap_or_else(|| key.clone());
-                self.hot
-                    .get(&lookup)
-                    .map(|r| RowIdSet::one(r.0))
-                    .unwrap_or_else(RowIdSet::empty)
+                if let Some(r) = self.hot.get(&lookup) {
+                    RowIdSet::one(r.0)
+                } else if let Some(pk_col) = self.schema.primary_key() {
+                    // HOT miss self-heal: the base row may still be live after
+                    // an index desync (observed: fullscan finds the row while
+                    // PK lookup returns empty). Fall back to a targeted
+                    // equality scan on the PK column and re-seed is left to
+                    // rebuild_indexes / the next put path.
+                    self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?
+                } else {
+                    RowIdSet::empty()
+                }
             }
             Condition::BitmapEq { column_id, value } => {
                 let lookup = self.index_lookup_key_bytes(*column_id, value);
@@ -7929,16 +8055,35 @@ impl Table {
                 // set and re-evaluated from the overlay directly. Without this
                 // merge, rows still in the memtable are invisible to a ranged
                 // read whenever a LearnedRange index is present.
+                //
+                // Point equality (`lo == hi`) additionally unions the Bitmap
+                // secondary when one exists on this column. The TypeScript Kit
+                // always pushes int64 `eq()` as RangeInt (not BitmapEq / Pk),
+                // so product listing-by-FK would never hit the Bitmap that
+                // `maintain_bitmap_secondary_on_replace` keeps correct after
+                // updates. Dual-sourcing Range + Bitmap closes that gap: a
+                // desynced run/LearnedRange plan can no longer hide a live row
+                // that still has a correct Bitmap membership (and vice versa
+                // the overlay merge still covers pure-memtable puts).
                 let mut set = if let Some(li) = self.learned_range.get(column_id) {
                     RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                 } else if self.run_refs.len() == 1 {
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
                     r.range_row_id_set_i64(*column_id, *lo, *hi)?
                 } else {
-                    return self.range_scan_i64(*column_id, *lo, *hi, snapshot);
+                    // Multi-run / no learned index: full range_scan already
+                    // merges overlay; union Bitmap for point queries below.
+                    let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                    if lo == hi {
+                        self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
+                    }
+                    return Ok(multi);
                 };
                 set.remove_many(self.overlay_rid_set(snapshot));
                 self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
+                if lo == hi {
+                    self.union_bitmap_point_i64(&mut set, *column_id, *lo, snapshot);
+                }
                 set
             }
             Condition::RangeF64 {
