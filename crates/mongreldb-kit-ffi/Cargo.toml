@@ -23,11 +23,11 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-# Engine 0.64.5 and Kit 0.64.5 are both published and aligned, so the adapter
+# Engine 0.64.6 and Kit 0.64.6 are both published and aligned, so the adapter
 # resolves everything from the registry. Re-add the [patch.crates-io] below
 # when a core/query fix must ship before the next engine release.
-kit = { package = "mongreldb-kit", version = "=0.64.5" }
-mongreldb-kit-core = "=0.64.5"
+kit = { package = "mongreldb-kit", version = "=0.64.6" }
+mongreldb-kit-core = "=0.64.6"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 
