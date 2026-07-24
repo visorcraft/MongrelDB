@@ -24,12 +24,11 @@ add_worktree gate-fix "$GATE_FIX_SHA"
 add_worktree final "$TARGET_SHA"
 
 run_variant() {
-  local label=$1 features=${2:-}
-  local dir="/tmp/e775-p2-${label%%-*}"
-  # Labels with a suffix (final-full) still run from the final worktree.
+  local label=$1 features=${2:-} worktree=$1
   if [[ "$label" == final-full ]]; then
-    dir=/tmp/e775-p2-final
+    worktree=final
   fi
+  local dir="/tmp/e775-p2-$worktree"
   local log="$OUT/$label.log"
   : > "$log"
   for repetition in 1 2 3; do
