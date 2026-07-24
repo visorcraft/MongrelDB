@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-jni"
-version = "0.64.7"
+version = "0.64.8"
 dependencies = [
  "jni",
  "mongreldb-kit",
@@ -2389,9 +2389,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.64.6"
+version = "0.64.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b02365b91769a1d957049c96f00976cf3bb7002203b44e379d3c7e04c52c8ca7"
+checksum = "35eef637684957e771a371f8eee92212119509068b928ac6b5c5575a0521df3b"
 dependencies = [
  "getrandom 0.2.17",
  "serde",

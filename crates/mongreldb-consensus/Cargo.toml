@@ -19,13 +19,13 @@ serde_json = "1"
 bincode = "1"
 sha2 = "0.10"
 thiserror = "1"
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.7" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.7" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.7" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.8" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.8" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.8" }
 # Stage 2E engine binding: the apply sink drives a core DatabaseCore through
 # the replicated apply path (engine_sink.rs).
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.7" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.8" }
 
 [dev-dependencies]
-mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.7" }
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.8" }
 tempfile = "3"
