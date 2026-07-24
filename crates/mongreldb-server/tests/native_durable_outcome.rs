@@ -1,3 +1,4 @@
+#![cfg(feature = "native-rpc")]
 //! P0.6 — native durable-outcome protocol parity.
 //!
 //! A native client must always determine whether an execution committed during

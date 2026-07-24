@@ -8,33 +8,53 @@
 //!   mongreldb-server snapshot <db_dir>   — checkpoint to a stable byte image
 //!   mongreldb-server restore  <db_dir>   — open + verify + checkpoint
 
+#[cfg(feature = "cluster")]
 use mongreldb_cluster::bootstrap::{
     cluster_init, cluster_join, node_drain, node_remove, removal_confirmation_token, InitRequest,
     JoinInvite, TrustConfig,
 };
+#[cfg(feature = "cluster")]
 use mongreldb_cluster::node::{Locality, NodeCapacity, NodeIdentity};
-use mongreldb_core::{
-    Database, EmbeddingNormalization, EmbeddingProviderRegistry, JwtAlgorithm, JwtValidationConfig,
-    ServiceToken,
-};
+use mongreldb_core::Database;
+#[cfg(feature = "native-rpc")]
+use mongreldb_core::ServiceToken;
+#[cfg(feature = "remote-embedding")]
+use mongreldb_core::{EmbeddingNormalization, EmbeddingProviderRegistry};
+#[cfg(all(feature = "oidc", feature = "native-rpc"))]
+use mongreldb_core::{JwtAlgorithm, JwtValidationConfig};
+#[cfg(feature = "native-rpc")]
 use mongreldb_protocol::native_transport::{
     NativeRpcServer, NativeRpcServerConfig, NativeRpcServices,
 };
+#[cfg(feature = "native-rpc")]
+use mongreldb_server::native::NativeExternalAuth;
+#[cfg(all(feature = "oidc", feature = "native-rpc"))]
+use mongreldb_server::oidc::HttpsJwksProvider;
+#[cfg(feature = "remote-embedding")]
 use mongreldb_server::remote_embedding::{
     EnvironmentSecretResolver, RemoteEmbeddingConfig, RemoteEmbeddingProvider,
 };
+#[cfg(feature = "vault-kms")]
 use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
-    build_app_with_storage, cluster_admin, cluster_runtime, fragment_rpc, spawn_auto_compactor,
-    spawn_session_reaper, ServerStorageRuntime, SessionStore,
+    build_app_with_storage, spawn_auto_compactor, spawn_session_reaper, ServerStorageRuntime,
+    SessionStore,
 };
-use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
+#[cfg(feature = "cluster")]
+use mongreldb_server::{cluster_admin, cluster_runtime, fragment_rpc};
+#[cfg(feature = "cluster")]
 use mongreldb_types::ids::{ClusterId, NodeId};
+#[cfg(feature = "remote-embedding")]
 use serde::Deserialize;
+#[cfg(feature = "cluster")]
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "cluster")]
+use std::collections::BTreeMap;
+#[cfg(any(feature = "native-rpc", feature = "remote-embedding"))]
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::net::SocketAddr;
+#[cfg(feature = "cluster")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -48,29 +68,47 @@ struct Args {
     max_connections: Option<usize>,
     max_sessions: usize,
     session_idle_timeout_secs: u64,
+    #[cfg(feature = "native-rpc")]
     native_port: Option<u16>,
+    #[cfg(feature = "native-rpc")]
     native_listen: Option<String>,
+    #[cfg(feature = "native-rpc")]
     native_advertise: Option<String>,
+    #[cfg(feature = "native-rpc")]
     tls_certificate: Option<String>,
+    #[cfg(feature = "native-rpc")]
     tls_private_key: Option<String>,
+    #[cfg(feature = "native-rpc")]
     tls_client_ca: Option<String>,
+    #[cfg(feature = "native-rpc")]
     require_client_cert: bool,
+    #[cfg(feature = "native-rpc")]
     service_token_file: Option<String>,
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     oidc_issuer: Option<String>,
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     oidc_audience: Option<String>,
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     oidc_allowed_hosts: BTreeSet<String>,
     passphrase: Option<String>,
+    #[cfg(feature = "vault-kms")]
     vault_url: Option<String>,
+    #[cfg(feature = "vault-kms")]
     vault_mount: Option<String>,
+    #[cfg(feature = "vault-kms")]
     vault_key: Option<String>,
+    #[cfg(feature = "vault-kms")]
     vault_ca_certificate: Option<String>,
     daemon: bool,
     pidfile: Option<String>,
     /// When set, start a live cluster [`NodeRuntime`] from this node-data dir.
+    #[cfg(feature = "cluster")]
     cluster_node_data: Option<String>,
     /// Optional cluster RPC listen address (`host:port`).
+    #[cfg(feature = "cluster")]
     cluster_rpc_listen: Option<String>,
     /// Repeatable JSON configuration for a named remote embedding provider.
+    #[cfg(feature = "remote-embedding")]
     embedding_provider_files: Vec<String>,
 }
 
@@ -144,6 +182,11 @@ ENVIRONMENT:
     MONGRELDB_NATIVE_TLS_CA     Native client CA PEM (require client certs)
     MONGRELDB_NATIVE_REQUIRE_CLIENT_CERT=1
                                 Require native client certificates
+
+COMPILE-TIME FEATURES:
+    The native RPC, cluster, OIDC, Vault KMS, and remote-embedding options are
+    only available when the binary is built with the corresponding cargo
+    features (native-rpc, cluster, oidc, vault-kms, remote-embedding).
 ";
 
 struct DatabaseCredentials {
@@ -192,6 +235,7 @@ fn take_database_credentials_from_env() -> Result<Option<DatabaseCredentials>, S
     database_credentials_from_values(username, password)
 }
 
+#[cfg(feature = "vault-kms")]
 fn take_vault_environment(
     configured: bool,
 ) -> Result<(Option<Zeroizing<String>>, Option<String>), String> {
@@ -309,26 +353,44 @@ fn parse_args() -> Result<Args, String> {
     let mut max_connections: Option<usize> = None;
     let mut max_sessions: usize = 256;
     let mut session_idle_timeout_secs: u64 = 300;
+    #[cfg(feature = "native-rpc")]
     let mut native_port = None;
+    #[cfg(feature = "native-rpc")]
     let mut native_listen = None;
+    #[cfg(feature = "native-rpc")]
     let mut native_advertise = None;
+    #[cfg(feature = "native-rpc")]
     let mut tls_certificate = None;
+    #[cfg(feature = "native-rpc")]
     let mut tls_private_key = None;
+    #[cfg(feature = "native-rpc")]
     let mut tls_client_ca = None;
+    #[cfg(feature = "native-rpc")]
     let mut require_client_cert = false;
+    #[cfg(feature = "native-rpc")]
     let mut service_token_file = None;
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     let mut oidc_issuer = None;
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     let mut oidc_audience = None;
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
     let mut oidc_allowed_hosts = BTreeSet::new();
     let mut passphrase: Option<String> = None;
+    #[cfg(feature = "vault-kms")]
     let mut vault_url = None;
+    #[cfg(feature = "vault-kms")]
     let mut vault_mount = None;
+    #[cfg(feature = "vault-kms")]
     let mut vault_key = None;
+    #[cfg(feature = "vault-kms")]
     let mut vault_ca_certificate = None;
     let mut daemon = false;
     let mut pidfile: Option<String> = None;
+    #[cfg(feature = "cluster")]
     let mut cluster_node_data: Option<String> = None;
+    #[cfg(feature = "cluster")]
     let mut cluster_rpc_listen: Option<String> = None;
+    #[cfg(feature = "remote-embedding")]
     let mut embedding_provider_files = Vec::new();
 
     // Skip the program name (raw[0]).
@@ -381,6 +443,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("--session-idle-timeout: invalid value '{v}'"))?;
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--native-port" => {
                 let value = raw.get(i + 1).ok_or("--native-port requires a value")?;
                 native_port = Some(
@@ -390,6 +453,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--native-listen" => {
                 native_listen = Some(
                     raw.get(i + 1)
@@ -398,6 +462,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--native-advertise" => {
                 native_advertise = Some(
                     raw.get(i + 1)
@@ -406,15 +471,18 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--tls-cert" => {
                 tls_certificate =
                     Some(raw.get(i + 1).ok_or("--tls-cert requires a value")?.clone());
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--tls-key" => {
                 tls_private_key = Some(raw.get(i + 1).ok_or("--tls-key requires a value")?.clone());
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--tls-client-ca" => {
                 tls_client_ca = Some(
                     raw.get(i + 1)
@@ -425,10 +493,12 @@ fn parse_args() -> Result<Args, String> {
                 require_client_cert = true;
                 i += 2;
             }
+            #[cfg(feature = "native-rpc")]
             "--require-client-cert" => {
                 require_client_cert = true;
                 i += 1;
             }
+            #[cfg(feature = "native-rpc")]
             "--service-tokens" => {
                 service_token_file = Some(
                     raw.get(i + 1)
@@ -437,6 +507,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(all(feature = "oidc", feature = "native-rpc"))]
             "--oidc-issuer" => {
                 oidc_issuer = Some(
                     raw.get(i + 1)
@@ -445,6 +516,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(all(feature = "oidc", feature = "native-rpc"))]
             "--oidc-audience" => {
                 oidc_audience = Some(
                     raw.get(i + 1)
@@ -453,6 +525,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(all(feature = "oidc", feature = "native-rpc"))]
             "--oidc-allow-host" => {
                 oidc_allowed_hosts.insert(
                     raw.get(i + 1)
@@ -466,6 +539,7 @@ fn parse_args() -> Result<Args, String> {
                 passphrase = Some(v.clone());
                 i += 2;
             }
+            #[cfg(feature = "vault-kms")]
             "--vault-url" => {
                 vault_url = Some(
                     raw.get(i + 1)
@@ -474,6 +548,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "vault-kms")]
             "--vault-mount" => {
                 vault_mount = Some(
                     raw.get(i + 1)
@@ -482,6 +557,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "vault-kms")]
             "--vault-key" => {
                 vault_key = Some(
                     raw.get(i + 1)
@@ -490,6 +566,7 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 2;
             }
+            #[cfg(feature = "vault-kms")]
             "--vault-ca-cert" => {
                 vault_ca_certificate = Some(
                     raw.get(i + 1)
@@ -507,6 +584,7 @@ fn parse_args() -> Result<Args, String> {
                 pidfile = Some(v.clone());
                 i += 2;
             }
+            #[cfg(feature = "cluster")]
             "--cluster-node-data" => {
                 let v = raw
                     .get(i + 1)
@@ -514,6 +592,7 @@ fn parse_args() -> Result<Args, String> {
                 cluster_node_data = Some(v.clone());
                 i += 2;
             }
+            #[cfg(feature = "cluster")]
             "--cluster-rpc-listen" => {
                 let v = raw
                     .get(i + 1)
@@ -521,12 +600,53 @@ fn parse_args() -> Result<Args, String> {
                 cluster_rpc_listen = Some(v.clone());
                 i += 2;
             }
+            #[cfg(feature = "remote-embedding")]
             "--embedding-provider" => {
                 let value = raw
                     .get(i + 1)
                     .ok_or("--embedding-provider requires a value")?;
                 embedding_provider_files.push(value.clone());
                 i += 2;
+            }
+            // Flags for compile-time features that are not part of this build
+            // fail closed with an explicit error instead of being swallowed as
+            // a positional database directory.
+            #[cfg(not(feature = "native-rpc"))]
+            "--native-port"
+            | "--native-listen"
+            | "--native-advertise"
+            | "--tls-cert"
+            | "--tls-key"
+            | "--tls-client-ca"
+            | "--require-client-cert"
+            | "--service-tokens" => {
+                return Err(format!(
+                    "{arg} requires the `native-rpc` feature (not compiled into this build)"
+                ));
+            }
+            #[cfg(not(all(feature = "oidc", feature = "native-rpc")))]
+            "--oidc-issuer" | "--oidc-audience" | "--oidc-allow-host" => {
+                return Err(format!(
+                    "{arg} requires a build with both the `oidc` and `native-rpc` features"
+                ));
+            }
+            #[cfg(not(feature = "vault-kms"))]
+            "--vault-url" | "--vault-mount" | "--vault-key" | "--vault-ca-cert" => {
+                return Err(format!(
+                    "{arg} requires the `vault-kms` feature (not compiled into this build)"
+                ));
+            }
+            #[cfg(not(feature = "cluster"))]
+            "--cluster-node-data" | "--cluster-rpc-listen" => {
+                return Err(format!(
+                    "{arg} requires the `cluster` feature (not compiled into this build)"
+                ));
+            }
+            #[cfg(not(feature = "remote-embedding"))]
+            "--embedding-provider" => {
+                return Err(format!(
+                    "{arg} requires the `remote-embedding` feature (not compiled into this build)"
+                ));
             }
             // Positional: first is db_dir, second (if numeric) is port for backward compat.
             other => {
@@ -549,41 +669,55 @@ fn parse_args() -> Result<Args, String> {
 
     let db_dir = db_dir.ok_or_else(|| format!("a database directory is required\n\n{USAGE}"))?;
     let port = port.unwrap_or(DEFAULT_PORT);
-    // Full native listen validation (loopback default, remote TLS requirement)
-    // runs later via NativeListenInput so env knobs are included.
-    let native_requested = native_port.is_some()
-        || native_listen.is_some()
-        || tls_certificate.is_some()
-        || tls_private_key.is_some()
-        || tls_client_ca.is_some()
-        || require_client_cert
-        || native_advertise.is_some();
-    if (service_token_file.is_some() || oidc_issuer.is_some() || oidc_audience.is_some())
-        && !native_requested
+    #[cfg(feature = "native-rpc")]
     {
-        return Err(
-            "native authentication options require --native-port / --native-listen \
-             (or MONGRELDB_NATIVE_LISTEN)"
-                .into(),
-        );
+        // Full native listen validation (loopback default, remote TLS requirement)
+        // runs later via NativeListenInput so env knobs are included.
+        let native_requested = native_port.is_some()
+            || native_listen.is_some()
+            || tls_certificate.is_some()
+            || tls_private_key.is_some()
+            || tls_client_ca.is_some()
+            || require_client_cert
+            || native_advertise.is_some();
+        #[cfg(feature = "oidc")]
+        let native_auth_requested =
+            service_token_file.is_some() || oidc_issuer.is_some() || oidc_audience.is_some();
+        #[cfg(not(feature = "oidc"))]
+        let native_auth_requested = service_token_file.is_some();
+        if native_auth_requested && !native_requested {
+            return Err(
+                "native authentication options require --native-port / --native-listen \
+                 (or MONGRELDB_NATIVE_LISTEN)"
+                    .into(),
+            );
+        }
     }
-    if oidc_issuer.is_some() != oidc_audience.is_some() {
-        return Err("--oidc-issuer and --oidc-audience must be configured together".into());
+    #[cfg(all(feature = "oidc", feature = "native-rpc"))]
+    {
+        if oidc_issuer.is_some() != oidc_audience.is_some() {
+            return Err("--oidc-issuer and --oidc-audience must be configured together".into());
+        }
+        if oidc_issuer.is_some() && oidc_allowed_hosts.is_empty() {
+            return Err("--oidc-issuer requires at least one --oidc-allow-host".into());
+        }
     }
-    if oidc_issuer.is_some() && oidc_allowed_hosts.is_empty() {
-        return Err("--oidc-issuer requires at least one --oidc-allow-host".into());
-    }
-    let vault_configured = vault_url.is_some() || vault_mount.is_some() || vault_key.is_some();
-    if vault_configured && !(vault_url.is_some() && vault_mount.is_some() && vault_key.is_some()) {
-        return Err(
-            "--vault-url, --vault-mount, and --vault-key must be configured together".into(),
-        );
-    }
-    if vault_ca_certificate.is_some() && !vault_configured {
-        return Err("--vault-ca-cert requires --vault-url".into());
-    }
-    if passphrase.is_some() && vault_configured {
-        return Err("--passphrase and --vault-url are mutually exclusive".into());
+    #[cfg(feature = "vault-kms")]
+    {
+        let vault_configured = vault_url.is_some() || vault_mount.is_some() || vault_key.is_some();
+        if vault_configured
+            && !(vault_url.is_some() && vault_mount.is_some() && vault_key.is_some())
+        {
+            return Err(
+                "--vault-url, --vault-mount, and --vault-key must be configured together".into(),
+            );
+        }
+        if vault_ca_certificate.is_some() && !vault_configured {
+            return Err("--vault-ca-cert requires --vault-url".into());
+        }
+        if passphrase.is_some() && vault_configured {
+            return Err("--passphrase and --vault-url are mutually exclusive".into());
+        }
     }
 
     Ok(Args {
@@ -594,30 +728,49 @@ fn parse_args() -> Result<Args, String> {
         max_connections,
         max_sessions,
         session_idle_timeout_secs,
+        #[cfg(feature = "native-rpc")]
         native_port,
+        #[cfg(feature = "native-rpc")]
         native_listen,
+        #[cfg(feature = "native-rpc")]
         native_advertise,
+        #[cfg(feature = "native-rpc")]
         tls_certificate,
+        #[cfg(feature = "native-rpc")]
         tls_private_key,
+        #[cfg(feature = "native-rpc")]
         tls_client_ca,
+        #[cfg(feature = "native-rpc")]
         require_client_cert,
+        #[cfg(feature = "native-rpc")]
         service_token_file,
+        #[cfg(all(feature = "oidc", feature = "native-rpc"))]
         oidc_issuer,
+        #[cfg(all(feature = "oidc", feature = "native-rpc"))]
         oidc_audience,
+        #[cfg(all(feature = "oidc", feature = "native-rpc"))]
         oidc_allowed_hosts,
         passphrase,
+        #[cfg(feature = "vault-kms")]
         vault_url,
+        #[cfg(feature = "vault-kms")]
         vault_mount,
+        #[cfg(feature = "vault-kms")]
         vault_key,
+        #[cfg(feature = "vault-kms")]
         vault_ca_certificate,
         daemon,
         pidfile,
+        #[cfg(feature = "cluster")]
         cluster_node_data,
+        #[cfg(feature = "cluster")]
         cluster_rpc_listen,
+        #[cfg(feature = "remote-embedding")]
         embedding_provider_files,
     })
 }
 
+#[cfg(feature = "remote-embedding")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteEmbeddingConfigFile {
@@ -640,18 +793,22 @@ struct RemoteEmbeddingConfigFile {
     max_response_bytes: usize,
 }
 
+#[cfg(feature = "remote-embedding")]
 const fn default_embedding_timeout_ms() -> u64 {
     30_000
 }
 
+#[cfg(feature = "remote-embedding")]
 const fn default_embedding_max_retries() -> usize {
     2
 }
 
+#[cfg(feature = "remote-embedding")]
 const fn default_embedding_max_response_bytes() -> usize {
     16 * 1024 * 1024
 }
 
+#[cfg(feature = "remote-embedding")]
 fn load_embedding_providers(
     paths: &[String],
     registry: &EmbeddingProviderRegistry,
@@ -770,13 +927,24 @@ fn main() {
                 return;
             }
             // Cluster bootstrap + membership subcommands (spec §11.1, S2A-002).
+            #[cfg(feature = "cluster")]
             "cluster" => {
                 cmd_cluster(&raw[2..]);
                 return;
             }
+            #[cfg(feature = "cluster")]
             "node" => {
                 cmd_node(&raw[2..]);
                 return;
+            }
+            #[cfg(not(feature = "cluster"))]
+            "cluster" | "node" => {
+                eprintln!(
+                    "error: `{}` subcommands require the `cluster` feature \
+                     (not compiled into this build)",
+                    raw[1]
+                );
+                std::process::exit(1);
             }
             _ => {}
         }
@@ -797,6 +965,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    #[cfg(feature = "vault-kms")]
     let (vault_token, vault_namespace) = match take_vault_environment(args.vault_url.is_some()) {
         Ok(environment) => environment,
         Err(error) => {
@@ -804,6 +973,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    #[cfg(feature = "vault-kms")]
     let vault_ca_certificate = args
         .vault_ca_certificate
         .as_ref()
@@ -823,6 +993,7 @@ fn main() {
         }
     }
 
+    #[cfg(feature = "vault-kms")]
     let vault_provider = args.vault_url.as_ref().map(|endpoint| {
         VaultTransitKeyManagementProvider::new(VaultTransitConfig {
             endpoint: endpoint.clone(),
@@ -837,17 +1008,23 @@ fn main() {
             std::process::exit(1);
         })
     });
+    #[cfg(feature = "vault-kms")]
     let kms = vault_provider.as_ref().map(|provider| {
         (
             provider as &dyn mongreldb_core::KeyManagementProvider,
             args.vault_key.as_deref().unwrap_or_default(),
         )
     });
+    #[cfg(not(feature = "vault-kms"))]
+    let kms: Option<(&dyn mongreldb_core::KeyManagementProvider, &str)> = None;
 
     // P0.2: cluster mode must not open a peer standalone user database.
     // NodeRuntime owns tablet roots; public data is consensus-owned.
+    #[cfg(feature = "cluster")]
     let cluster_configured =
         cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone()).is_some();
+    #[cfg(not(feature = "cluster"))]
+    let cluster_configured = false;
 
     let standalone_db = if cluster_configured {
         None
@@ -904,10 +1081,17 @@ fn main() {
     runtime.block_on(run_server(args, pidfile, standalone_db));
 }
 
+#[cfg(feature = "native-rpc")]
 fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, String> {
+    #[cfg(feature = "oidc")]
     if args.service_token_file.is_none() && args.oidc_issuer.is_none() {
         return Ok(None);
     }
+    #[cfg(not(feature = "oidc"))]
+    if args.service_token_file.is_none() {
+        return Ok(None);
+    }
+    #[cfg_attr(not(feature = "oidc"), allow(unused_mut))]
     let mut auth = NativeExternalAuth::new();
     if let Some(path) = &args.service_token_file {
         let metadata = std::fs::metadata(path)
@@ -937,6 +1121,7 @@ fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, 
                 .map_err(|error| error.to_string())?;
         }
     }
+    #[cfg(feature = "oidc")]
     if let (Some(issuer), Some(audience)) = (&args.oidc_issuer, &args.oidc_audience) {
         let provider = HttpsJwksProvider::new(
             args.oidc_allowed_hosts.clone(),
@@ -967,12 +1152,14 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
         std::time::Duration::from_secs(args.session_idle_timeout_secs),
     ));
     spawn_session_reaper(Arc::clone(&sessions));
+    #[cfg(feature = "native-rpc")]
     let native_external_auth = load_native_external_auth(&args).unwrap_or_else(|error| {
         eprintln!("failed to configure native authentication: {error}");
         std::process::exit(1);
     });
 
     // Build the single authoritative storage runtime (P0.2).
+    #[cfg(feature = "cluster")]
     let storage = match cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone())
     {
         Some(node_data) => {
@@ -1041,6 +1228,7 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
         }
         None => {
             let db = standalone_db.expect("standalone mode opens a local database");
+            #[cfg(feature = "remote-embedding")]
             if let Err(error) =
                 load_embedding_providers(&args.embedding_provider_files, db.embedding_providers())
             {
@@ -1053,6 +1241,23 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
         }
     };
 
+    // Standalone build (no `cluster` feature): the only storage runtime is a
+    // local database.
+    #[cfg(not(feature = "cluster"))]
+    let storage = {
+        let db = standalone_db.expect("standalone mode opens a local database");
+        #[cfg(feature = "remote-embedding")]
+        if let Err(error) =
+            load_embedding_providers(&args.embedding_provider_files, db.embedding_providers())
+        {
+            eprintln!("failed to configure embedding providers: {error}");
+            std::process::exit(1);
+        }
+        // §5.9: background cost-aware compaction (run-count trigger).
+        spawn_auto_compactor(Arc::clone(&db));
+        ServerStorageRuntime::standalone(db)
+    };
+
     let standalone_for_native = storage.standalone_db().cloned();
     let (app, server_control) = build_app_with_storage(
         storage,
@@ -1063,100 +1268,108 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
         Arc::clone(&sessions),
     );
     let (native_result_tx, mut native_result_rx) = tokio::sync::mpsc::channel(1);
+    // Holds the sender so `native_result_rx.recv()` pends forever when no
+    // native listener is configured (same as a listener that never exits).
+    #[cfg_attr(not(feature = "native-rpc"), allow(unused_mut, unused_variables))]
     let mut native_result_guard = Some(native_result_tx);
-    let mut native_shutdown = None;
+    #[cfg_attr(not(feature = "native-rpc"), allow(unused_mut))]
+    let mut native_shutdown: Option<tokio::sync::oneshot::Sender<()>> = None;
+    #[cfg(feature = "native-rpc")]
     let mut native_task = None;
-    let native_listen = mongreldb_server::NativeListenInput::from_cli_and_env(
-        mongreldb_server::NativeListenInput {
-            listen: args.native_listen.clone(),
-            native_port: args.native_port,
-            advertise: args.native_advertise.clone(),
-            tls_cert: args.tls_certificate.clone(),
-            tls_key: args.tls_private_key.clone(),
-            tls_ca: args.tls_client_ca.clone(),
-            require_client_cert: args.require_client_cert || args.tls_client_ca.is_some(),
-        },
-    )
-    .resolve()
-    .unwrap_or_else(|error| {
-        eprintln!("native listener configuration error: {error}");
-        std::process::exit(1);
-    });
-    if let Some(native_cfg) = native_listen {
-        let Some(db) = standalone_for_native.clone() else {
-            eprintln!(
-                "native RPC requires standalone storage; cluster mode does not open a \
-                 peer user database (configure native RPC only in standalone mode)"
-            );
+    #[cfg(feature = "native-rpc")]
+    {
+        let native_listen = mongreldb_server::NativeListenInput::from_cli_and_env(
+            mongreldb_server::NativeListenInput {
+                listen: args.native_listen.clone(),
+                native_port: args.native_port,
+                advertise: args.native_advertise.clone(),
+                tls_cert: args.tls_certificate.clone(),
+                tls_key: args.tls_private_key.clone(),
+                tls_ca: args.tls_client_ca.clone(),
+                require_client_cert: args.require_client_cert || args.tls_client_ca.is_some(),
+            },
+        )
+        .resolve()
+        .unwrap_or_else(|error| {
+            eprintln!("native listener configuration error: {error}");
             std::process::exit(1);
-        };
-        let read_pem = |path: &std::path::Path| {
-            std::fs::read(path).unwrap_or_else(|error| {
-                eprintln!("failed to read native TLS file {}: {error}", path.display());
-                std::process::exit(1);
-            })
-        };
-        let mut runtime = server_control.native_runtime(db, Arc::clone(&sessions));
-        if let Some(auth) = native_external_auth {
-            runtime = runtime.with_external_auth(auth);
-        }
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        native_shutdown = Some(shutdown_tx);
-        let result_tx = native_result_guard.take().expect("native result sender");
-        let address = native_cfg.listen;
-        let client_ca_pem = if native_cfg.require_client_cert || native_cfg.tls_ca.is_some() {
-            Some(read_pem(
-                native_cfg
-                    .tls_ca
-                    .as_deref()
-                    .expect("require_client_cert validated with CA"),
-            ))
-        } else {
-            None
-        };
-        let server = NativeRpcServer::new(NativeRpcServerConfig {
-            address,
-            certificate_pem: read_pem(&native_cfg.tls_cert),
-            private_key_pem: read_pem(&native_cfg.tls_key),
-            client_ca_pem,
-            max_connections: args.max_connections.unwrap_or(1_024),
-            max_concurrent_streams: 1_024,
-            max_in_flight_per_connection: 1_024,
-            request_timeout: std::time::Duration::from_secs(30),
-            idle_timeout: std::time::Duration::from_secs(args.session_idle_timeout_secs),
-            keepalive_interval: std::time::Duration::from_secs(30),
-            keepalive_timeout: std::time::Duration::from_secs(10),
         });
-        native_task = Some(tokio::spawn(async move {
-            let result = server
-                .serve_with_shutdown(
-                    NativeRpcServices {
-                        auth: runtime.clone(),
-                        session: runtime.clone(),
-                        query: runtime.clone(),
-                        transaction: runtime.clone(),
-                        catalog: runtime.clone(),
-                        admin: runtime.clone(),
-                        health: runtime,
-                    },
-                    async move {
-                        let _ = shutdown_rx.await;
-                    },
-                )
-                .await;
-            let _ = result_tx
-                .send(result.map_err(|error| error.to_string()))
-                .await;
-        }));
-        eprintln!("mongreldb native RPC listening on https://{address}");
-        if let Some(advertise) = &native_cfg.advertise {
-            eprintln!("mongreldb native RPC advertise: {advertise}");
-        }
-        if !mongreldb_server::is_loopback_addr(address.ip()) {
-            eprintln!(
-                "native RPC bound on non-loopback address {address} (TLS required; \
+        if let Some(native_cfg) = native_listen {
+            let Some(db) = standalone_for_native.clone() else {
+                eprintln!(
+                    "native RPC requires standalone storage; cluster mode does not open a \
+                 peer user database (configure native RPC only in standalone mode)"
+                );
+                std::process::exit(1);
+            };
+            let read_pem = |path: &std::path::Path| {
+                std::fs::read(path).unwrap_or_else(|error| {
+                    eprintln!("failed to read native TLS file {}: {error}", path.display());
+                    std::process::exit(1);
+                })
+            };
+            let mut runtime = server_control.native_runtime(db, Arc::clone(&sessions));
+            if let Some(auth) = native_external_auth {
+                runtime = runtime.with_external_auth(auth);
+            }
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            native_shutdown = Some(shutdown_tx);
+            let result_tx = native_result_guard.take().expect("native result sender");
+            let address = native_cfg.listen;
+            let client_ca_pem = if native_cfg.require_client_cert || native_cfg.tls_ca.is_some() {
+                Some(read_pem(
+                    native_cfg
+                        .tls_ca
+                        .as_deref()
+                        .expect("require_client_cert validated with CA"),
+                ))
+            } else {
+                None
+            };
+            let server = NativeRpcServer::new(NativeRpcServerConfig {
+                address,
+                certificate_pem: read_pem(&native_cfg.tls_cert),
+                private_key_pem: read_pem(&native_cfg.tls_key),
+                client_ca_pem,
+                max_connections: args.max_connections.unwrap_or(1_024),
+                max_concurrent_streams: 1_024,
+                max_in_flight_per_connection: 1_024,
+                request_timeout: std::time::Duration::from_secs(30),
+                idle_timeout: std::time::Duration::from_secs(args.session_idle_timeout_secs),
+                keepalive_interval: std::time::Duration::from_secs(30),
+                keepalive_timeout: std::time::Duration::from_secs(10),
+            });
+            native_task = Some(tokio::spawn(async move {
+                let result = server
+                    .serve_with_shutdown(
+                        NativeRpcServices {
+                            auth: runtime.clone(),
+                            session: runtime.clone(),
+                            query: runtime.clone(),
+                            transaction: runtime.clone(),
+                            catalog: runtime.clone(),
+                            admin: runtime.clone(),
+                            health: runtime,
+                        },
+                        async move {
+                            let _ = shutdown_rx.await;
+                        },
+                    )
+                    .await;
+                let _ = result_tx
+                    .send(result.map_err(|error| error.to_string()))
+                    .await;
+            }));
+            eprintln!("mongreldb native RPC listening on https://{address}");
+            if let Some(advertise) = &native_cfg.advertise {
+                eprintln!("mongreldb native RPC advertise: {advertise}");
+            }
+            if !mongreldb_server::is_loopback_addr(address.ip()) {
+                eprintln!(
+                    "native RPC bound on non-loopback address {address} (TLS required; \
                  certificate reload requires process restart)"
-            );
+                );
+            }
         }
     }
 
@@ -1249,6 +1462,7 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
     if let Some(shutdown) = native_shutdown {
         let _ = shutdown.send(());
     }
+    #[cfg(feature = "native-rpc")]
     if let Some(task) = native_task {
         let _ = task.await;
     }
@@ -1366,10 +1580,14 @@ fn cmd_restore(db_dir: &str) {
 // `TrustSummary`, and `TrustConfig`'s `Debug` redacts the key.
 
 /// PEM filenames inside a `--trust-dir` (default `<data-dir>/trust`).
+#[cfg(feature = "cluster")]
 const TRUST_CA_CERT_FILENAME: &str = "ca-cert.pem";
+#[cfg(feature = "cluster")]
 const TRUST_NODE_CERT_FILENAME: &str = "node-cert.pem";
+#[cfg(feature = "cluster")]
 const TRUST_NODE_KEY_FILENAME: &str = "node-key.pem";
 
+#[cfg(feature = "cluster")]
 const CLUSTER_USAGE: &str = "\
 mongreldb-server cluster — cluster bootstrap workflows (spec section 11.1, S2A-002)
 
@@ -1393,6 +1611,7 @@ OPTIONS:
                               first join, which mints the node id during join)
 ";
 
+#[cfg(feature = "cluster")]
 const NODE_USAGE: &str = "\
 mongreldb-server node — cluster membership transitions (spec section 11.1, S2A-002)
 
@@ -1408,6 +1627,7 @@ OPTIONS:
 ";
 
 /// `mongreldb-server cluster ...` — print the report or fail non-zero.
+#[cfg(feature = "cluster")]
 fn cmd_cluster(args: &[String]) {
     match cluster_command(args) {
         Ok(report) => println!("{report}"),
@@ -1419,6 +1639,7 @@ fn cmd_cluster(args: &[String]) {
 }
 
 /// `mongreldb-server node ...` — print the report or fail non-zero.
+#[cfg(feature = "cluster")]
 fn cmd_node(args: &[String]) {
     match node_command(args) {
         Ok(report) => println!("{report}"),
@@ -1431,6 +1652,7 @@ fn cmd_node(args: &[String]) {
 
 /// `cluster init|join|status` as a fallible report string (the testable form
 /// of [`cmd_cluster`]).
+#[cfg(feature = "cluster")]
 fn cluster_command(args: &[String]) -> Result<String, String> {
     let Some(subcommand) = args.first() else {
         return Err(format!(
@@ -1473,6 +1695,7 @@ fn cluster_command(args: &[String]) -> Result<String, String> {
 
 /// `node drain|remove` as a fallible report string (the testable form of
 /// [`cmd_node`]).
+#[cfg(feature = "cluster")]
 fn node_command(args: &[String]) -> Result<String, String> {
     let Some(subcommand) = args.first() else {
         return Err(format!("a node subcommand is required\n\n{NODE_USAGE}"));
@@ -1494,10 +1717,12 @@ fn node_command(args: &[String]) -> Result<String, String> {
 }
 
 /// Parsed `--flag value` pairs of one cluster/node subcommand.
+#[cfg(feature = "cluster")]
 type SubcommandFlags = BTreeMap<String, String>;
 
 /// Parse subcommand arguments as `--flag value` pairs, rejecting positionals,
 /// unknown flags, and missing values with the subcommand's usage text.
+#[cfg(feature = "cluster")]
 fn parse_subcommand_flags(
     args: &[String],
     usage: &str,
@@ -1522,6 +1747,7 @@ fn parse_subcommand_flags(
     Ok(values)
 }
 
+#[cfg(feature = "cluster")]
 fn required_flag<'a>(
     flags: &'a SubcommandFlags,
     name: &str,
@@ -1533,12 +1759,14 @@ fn required_flag<'a>(
         .ok_or_else(|| format!("--{name} is required\n\n{usage}"))
 }
 
+#[cfg(feature = "cluster")]
 fn optional_flag<'a>(flags: &'a SubcommandFlags, name: &str) -> Option<&'a str> {
     flags.get(name).map(String::as_str)
 }
 
 /// Load operator-supplied PEM trust material from a trust directory,
 /// validating it through the cluster crate (fails closed).
+#[cfg(feature = "cluster")]
 fn load_trust_config(
     trust_dir: &Path,
     allowed_node_ids: Vec<NodeId>,
@@ -1561,6 +1789,7 @@ fn load_trust_config(
     .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "cluster")]
 fn trust_dir_for(flags: &SubcommandFlags, data_path: &Path) -> PathBuf {
     optional_flag(flags, "trust-dir")
         .map(PathBuf::from)
@@ -1568,6 +1797,7 @@ fn trust_dir_for(flags: &SubcommandFlags, data_path: &Path) -> PathBuf {
 }
 
 /// Parse a comma-separated node-id list (`--allowed-node-ids`).
+#[cfg(feature = "cluster")]
 fn parse_node_id_list(text: Option<&str>) -> Result<Option<Vec<NodeId>>, String> {
     let Some(text) = text else {
         return Ok(None);
@@ -1588,6 +1818,7 @@ fn parse_node_id_list(text: Option<&str>) -> Result<Option<Vec<NodeId>>, String>
 
 /// Parse a comma-separated endpoint list (`--endpoints`), rejecting an
 /// effectively empty list before the cluster crate sees it.
+#[cfg(feature = "cluster")]
 fn parse_endpoints(text: &str) -> Result<Vec<String>, String> {
     let endpoints: Vec<String> = text
         .split(',')
@@ -1603,6 +1834,7 @@ fn parse_endpoints(text: &str) -> Result<Vec<String>, String> {
 
 /// Resolve the member `node drain`/`node remove` targets: the explicit
 /// `--node-id`, else this node's own persisted identity.
+#[cfg(feature = "cluster")]
 fn resolve_cli_node_id(data_path: &Path, requested: Option<&str>) -> Result<NodeId, String> {
     match requested {
         Some(text) => text
@@ -1620,12 +1852,14 @@ fn resolve_cli_node_id(data_path: &Path, requested: Option<&str>) -> Result<Node
 }
 
 /// Pretty-print one JSON report value.
+#[cfg(feature = "cluster")]
 fn json_report(value: serde_json::Value) -> String {
     serde_json::to_string_pretty(&value).expect("cluster report serialization")
 }
 
 /// `cluster init`: create the cluster on this node — cluster ID, initial
 /// membership, the single database Raft group, and the trust configuration.
+#[cfg(feature = "cluster")]
 fn cluster_init_command(flags: &SubcommandFlags) -> Result<String, String> {
     let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
     let data_path = Path::new(data_dir);
@@ -1680,6 +1914,7 @@ fn cluster_init_command(flags: &SubcommandFlags) -> Result<String, String> {
 
 /// `cluster join`: validate an invite (cluster ID, member endpoints, trust
 /// material) and provision this node for the invited cluster.
+#[cfg(feature = "cluster")]
 fn cluster_join_command(flags: &SubcommandFlags) -> Result<String, String> {
     let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
     let data_path = Path::new(data_dir);
@@ -1725,6 +1960,7 @@ fn cluster_join_command(flags: &SubcommandFlags) -> Result<String, String> {
 
 /// `cluster status`: identity, membership, and group descriptors; a directory
 /// without a cluster identity reports `standalone`.
+#[cfg(feature = "cluster")]
 fn cluster_status_command(flags: &SubcommandFlags) -> Result<String, String> {
     let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
     let report =
@@ -1734,6 +1970,7 @@ fn cluster_status_command(flags: &SubcommandFlags) -> Result<String, String> {
 
 /// `node drain`: move a member from `Up` to `Draining` in the persisted
 /// membership record.
+#[cfg(feature = "cluster")]
 fn node_drain_command(flags: &SubcommandFlags) -> Result<String, String> {
     let data_dir = required_flag(flags, "data-dir", NODE_USAGE)?;
     let data_path = Path::new(data_dir);
@@ -1745,6 +1982,7 @@ fn node_drain_command(flags: &SubcommandFlags) -> Result<String, String> {
 /// `node remove`: move a member to `Decommissioned`. Without
 /// `--confirm-token` this prints the out-of-band confirmation token and
 /// changes nothing.
+#[cfg(feature = "cluster")]
 fn node_remove_command(flags: &SubcommandFlags) -> Result<String, String> {
     let data_dir = required_flag(flags, "data-dir", NODE_USAGE)?;
     let data_path = Path::new(data_dir);
@@ -1792,6 +2030,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "remote-embedding")]
     fn remote_embedding_provider_files_register_named_models() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("embedding.json");
@@ -1914,12 +2153,16 @@ mod tests {
 
     // ── Cluster/node subcommand tests (spec §11.1, S2A-002) ─────────────────
 
+    #[cfg(feature = "cluster")]
     const CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nY2E=\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "cluster")]
     const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nbm9kZQ==\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "cluster")]
     const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n";
 
     /// Write operator-style PEM trust material under `<data>/trust` (the
     /// default `--trust-dir`).
+    #[cfg(feature = "cluster")]
     fn write_trust_dir(data_path: &Path) {
         let trust = data_path.join("trust");
         std::fs::create_dir_all(&trust).unwrap();
@@ -1928,16 +2171,19 @@ mod tests {
         std::fs::write(trust.join(TRUST_NODE_KEY_FILENAME), KEY_PEM).unwrap();
     }
 
+    #[cfg(feature = "cluster")]
     fn cli_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
 
+    #[cfg(feature = "cluster")]
     fn json_stdout(output: &str) -> serde_json::Value {
         serde_json::from_str(output)
             .unwrap_or_else(|error| panic!("stdout is not JSON: {error}\n{output}"))
     }
 
     /// `cluster init` on a fresh directory; returns `(cluster_id, node_id)`.
+    #[cfg(feature = "cluster")]
     fn init_cluster(data_path: &Path) -> (String, String) {
         let data_dir = data_path.to_str().unwrap();
         let output = cluster_command(&cli_args(&[
@@ -1956,6 +2202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_init_creates_identity_record_group_and_never_prints_key_material() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -2017,6 +2264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_init_twice_and_bad_flags_fail_closed() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -2039,6 +2287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_init_requires_readable_trust_material() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -2051,6 +2300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_join_provisions_and_reports() {
         let directory = tempfile::tempdir().unwrap();
         let data_a = directory.path().join("a");
@@ -2117,6 +2367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_join_rejects_bad_invites_and_mismatched_identity() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -2197,6 +2448,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn cluster_status_on_uninitialized_directory_reports_standalone() {
         let directory = tempfile::tempdir().unwrap();
         let output = cluster_command(&cli_args(&[
@@ -2214,6 +2466,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn node_drain_and_remove_transition_membership_with_token_enforcement() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("data");
@@ -2283,6 +2536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn node_commands_require_bootstrap() {
         let directory = tempfile::tempdir().unwrap();
         let data_dir = directory.path().to_str().unwrap();
@@ -2317,6 +2571,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cluster")]
     fn trust_config_debug_redacts_the_node_key() {
         let trust = TrustConfig::from_pems(
             CA_PEM.to_owned(),

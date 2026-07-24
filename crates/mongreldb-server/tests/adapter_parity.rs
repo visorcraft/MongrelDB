@@ -1,3 +1,4 @@
+#![cfg(feature = "native-rpc")]
 use std::sync::Arc;
 use std::time::Duration;
 

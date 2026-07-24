@@ -9,14 +9,22 @@
 //!
 //! Dual-root ownership (standalone user database + live cluster runtime as
 //! peer data planes) is refused.
+//!
+//! The standalone types (`StandaloneRuntime`, `ServerStorageRuntime`,
+//! `StorageRuntimeError`) are always compiled — the hot SQL path is typed over
+//! them. The cluster pieces (`ClusterGatewayRuntime`, the `Cluster` variant,
+//! and the cluster accessors) exist only with the `cluster` feature.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mongreldb_core::Database;
+#[cfg(feature = "cluster")]
 use mongreldb_query::ai_retrieval::RemoteAiEndpoint;
+#[cfg(feature = "cluster")]
 use mongreldb_query::distributed::RemoteFragmentEndpoint;
 
+#[cfg(feature = "cluster")]
 use crate::cluster_runtime::ClusterRuntimeHandle;
 
 /// Error when code asks the standalone data plane for a cluster process (or
@@ -85,6 +93,7 @@ impl StandaloneRuntime {
 /// Holds the live [`ClusterRuntimeHandle`] and optional fragment/AI worker
 /// endpoints installed on the authenticated internal RPC transport. Public
 /// SQL/Kit/native user writes do not open a peer standalone WAL here.
+#[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterGatewayRuntime {
     handle: ClusterRuntimeHandle,
@@ -92,6 +101,7 @@ pub struct ClusterGatewayRuntime {
     ai_endpoint: Option<Arc<RemoteAiEndpoint>>,
 }
 
+#[cfg(feature = "cluster")]
 impl ClusterGatewayRuntime {
     /// Wrap a started node runtime (workers may be installed later).
     pub fn new(handle: ClusterRuntimeHandle) -> Self {
@@ -157,6 +167,7 @@ pub enum ServerStorageRuntime {
     /// Single-node server-owned standalone core.
     Standalone(StandaloneRuntime),
     /// Cluster node: public data owned by consensus/tablet state.
+    #[cfg(feature = "cluster")]
     Cluster(ClusterGatewayRuntime),
 }
 
@@ -167,11 +178,13 @@ impl ServerStorageRuntime {
     }
 
     /// Construct the cluster variant (workers optional until installed).
+    #[cfg(feature = "cluster")]
     pub fn cluster(handle: ClusterRuntimeHandle) -> Self {
         Self::Cluster(ClusterGatewayRuntime::new(handle))
     }
 
     /// Construct the cluster variant with workers already installed.
+    #[cfg(feature = "cluster")]
     pub fn cluster_with_workers(
         handle: ClusterRuntimeHandle,
         fragment_endpoint: Arc<RemoteFragmentEndpoint>,
@@ -184,9 +197,17 @@ impl ServerStorageRuntime {
         ))
     }
 
-    /// `true` when this process is a cluster node data plane.
+    /// `true` when this process is a cluster node data plane. Always `false`
+    /// in builds without the `cluster` feature.
     pub fn is_cluster(&self) -> bool {
-        matches!(self, Self::Cluster(_))
+        #[cfg(feature = "cluster")]
+        {
+            matches!(self, Self::Cluster(_))
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
     }
 
     /// `true` when this process is standalone.
@@ -198,6 +219,7 @@ impl ServerStorageRuntime {
     pub fn standalone_db(&self) -> Option<&Arc<Database>> {
         match self {
             Self::Standalone(rt) => Some(rt.db()),
+            #[cfg(feature = "cluster")]
             Self::Cluster(_) => None,
         }
     }
@@ -210,6 +232,7 @@ impl ServerStorageRuntime {
     }
 
     /// Live cluster handle, when this is cluster mode.
+    #[cfg(feature = "cluster")]
     pub fn cluster_handle(&self) -> Option<&ClusterRuntimeHandle> {
         match self {
             Self::Cluster(rt) => Some(rt.handle()),
@@ -218,6 +241,7 @@ impl ServerStorageRuntime {
     }
 
     /// Cluster gateway pieces, when this is cluster mode.
+    #[cfg(feature = "cluster")]
     pub fn cluster_gateway(&self) -> Option<&ClusterGatewayRuntime> {
         match self {
             Self::Cluster(rt) => Some(rt),
@@ -226,6 +250,7 @@ impl ServerStorageRuntime {
     }
 
     /// Mutable cluster gateway (worker install bookkeeping).
+    #[cfg(feature = "cluster")]
     pub fn cluster_gateway_mut(&mut self) -> Option<&mut ClusterGatewayRuntime> {
         match self {
             Self::Cluster(rt) => Some(rt),
@@ -238,6 +263,7 @@ impl ServerStorageRuntime {
     pub fn durable_path(&self) -> PathBuf {
         match self {
             Self::Standalone(rt) => rt.root().to_path_buf(),
+            #[cfg(feature = "cluster")]
             Self::Cluster(rt) => rt.node_data().to_path_buf(),
         }
     }
@@ -246,6 +272,7 @@ impl ServerStorageRuntime {
     pub fn mode_name(&self) -> &'static str {
         match self {
             Self::Standalone(_) => "standalone",
+            #[cfg(feature = "cluster")]
             Self::Cluster(_) => "cluster",
         }
     }

@@ -209,6 +209,7 @@ impl SessionEntry {
             .map(|binding| (statement_id, binding))
     }
 
+    #[allow(dead_code)] // native RPC service surface (native-rpc feature)
     pub(crate) fn prepared_binding_by_id(
         &self,
         statement_id: u64,
@@ -381,12 +382,14 @@ impl SessionStore {
     /// Native RPC session ids are bearer capabilities delivered only over
     /// TLS. The authenticated identity was fixed when the session was
     /// created, so native requests do not accept a caller-supplied owner.
+    #[allow(dead_code)] // native RPC service surface (native-rpc feature)
     pub(crate) fn get_by_token(&self, token: &str) -> Option<Arc<SessionEntry>> {
         let guard = self.sessions.lock().ok()?;
         let entry = guard.get(token)?;
         (!entry.is_closed()).then(|| Arc::clone(entry))
     }
 
+    #[allow(dead_code)] // native RPC service surface (native-rpc feature)
     pub(crate) fn close_by_token(&self, token: &str) -> bool {
         let Ok(mut guard) = self.sessions.lock() else {
             return false;

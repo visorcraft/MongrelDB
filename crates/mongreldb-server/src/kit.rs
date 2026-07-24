@@ -1768,6 +1768,7 @@ pub async fn kit_txn(
 ) -> Response {
     // P0.2: cluster mode routes simple put batches through tablet Raft; never
     // open standalone AppState.db for ordinary Kit writes.
+    #[cfg(feature = "cluster")]
     if state.is_cluster_mode() {
         if let Some(response) = crate::cluster_data_plane::try_kit_txn(&state, &req).await {
             return response;
@@ -2912,6 +2913,7 @@ pub async fn kit_search(
     // P0.2 / P0.8: cluster mode serves tablet_rows with hybrid fusion when
     // multiple retrievers are present (fuse_distributed_hits → merge_hybrid_contributions).
     // Never open standalone AppState.db for Kit search.
+    #[cfg(feature = "cluster")]
     if state.is_cluster_mode() {
         if let Some(response) = crate::cluster_data_plane::try_kit_search(&state, &req).await {
             return response;

@@ -1,3 +1,4 @@
+#![cfg(feature = "cluster")] // scheduler parent admission on the SQL path is cluster-gated
 //! S1E-002 / S4A: hierarchical scheduler admission on the SQL path.
 //!
 //! Under an artificially tiny InteractiveSql max_queue, excess concurrent

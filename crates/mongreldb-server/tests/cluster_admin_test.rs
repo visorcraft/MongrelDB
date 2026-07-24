@@ -1,3 +1,4 @@
+#![cfg(feature = "cluster")]
 //! Cluster administration endpoint tests (spec section 11.1, S2A-002):
 //! - `GET /admin/cluster/status`: standalone reporting when no cluster
 //!   identity exists, and the cluster-mode view (identity, membership,

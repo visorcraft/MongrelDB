@@ -23,6 +23,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
-mongreldb-server = { path = "../mongreldb-server", version = "0.64.6" }
+mongreldb-server = { path = "../mongreldb-server", version = "0.64.6", features = ["native-rpc"] }
 rcgen = "0.13"
 tempfile = "3"

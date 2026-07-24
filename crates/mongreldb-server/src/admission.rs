@@ -149,6 +149,7 @@ impl NodeAdmissionController {
     }
 
     /// Admit any work class through the shared hierarchical scheduler.
+    #[allow(dead_code)] // product paths live behind the cluster/native-rpc features
     pub async fn admit<C>(
         &self,
         req: AdmitRequest<'_>,
@@ -165,6 +166,7 @@ impl NodeAdmissionController {
     /// `budget_bytes` is charged to `memory_class` on the shared governor.
     /// Fragment and tablet-AI children must reserve through
     /// [`reserve_child`](Self::reserve_child) and cannot exceed the parent.
+    #[allow(dead_code)] // product paths live behind the cluster/native-rpc features
     pub async fn admit_parent<C>(
         &self,
         req: AdmitRequest<'_>,
@@ -208,6 +210,7 @@ impl NodeAdmissionController {
     /// Fragment workers and tablet-AI calls must obtain children only through
     /// this path (or [`admit_child`](Self::admit_child)); children cannot
     /// exceed the parent budget.
+    #[allow(dead_code)] // product paths live behind the cluster/native-rpc features
     pub fn reserve_child(
         &self,
         parent: &ParentAdmission,
@@ -253,6 +256,7 @@ impl NodeAdmissionController {
     ///
     /// Alias of [`reserve_child`](Self::reserve_child) used by product paths
     /// that speak in "admit" terms for hierarchical work.
+    #[allow(dead_code)] // product paths live behind the cluster/native-rpc features
     pub fn admit_child(
         &self,
         parent: &ParentAdmission,
@@ -431,6 +435,7 @@ pub struct PressureControl {
 
 /// Point-in-time pressure flags for admin / tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // read by the cluster admin surface (cluster feature)
 pub struct PressureSnapshot {
     /// AI/analytics rejected under memory pressure.
     pub reject_ai: bool,
@@ -457,6 +462,7 @@ impl PressureControl {
     }
 
     /// Snapshot of applied pressure flags.
+    #[allow(dead_code)] // read by the cluster admin surface (cluster feature)
     pub fn snapshot(&self) -> PressureSnapshot {
         PressureSnapshot {
             reject_ai: self.reject_ai.load(Ordering::Relaxed),
@@ -715,30 +721,41 @@ impl std::fmt::Debug for AdmittedWork {
 pub struct SqlAdmissionGuard {
     /// Outer node hard cap.
     _permit: tokio::sync::OwnedSemaphorePermit,
-    /// Parent work unit + hierarchical memory budget (P1.1).
+    /// Parent work unit + hierarchical memory budget (P1.1). `None` on the
+    /// standalone fast path ([`SqlAdmissionGuard::from_permit_only`]).
     #[allow(dead_code)] // held for Drop side effects + child admission hooks
-    parent: ParentAdmission,
+    parent: Option<ParentAdmission>,
 }
 
 impl SqlAdmissionGuard {
     /// Bundle an outer node permit with a parent-admitted work unit.
+    #[allow(dead_code)] // product paths live behind the cluster/native-rpc features
     pub fn new(permit: tokio::sync::OwnedSemaphorePermit, parent: ParentAdmission) -> Self {
         Self {
             _permit: permit,
-            parent,
+            parent: Some(parent),
+        }
+    }
+
+    /// Standalone fast path: outer node permit only, no parent admission.
+    #[allow(dead_code)] // used by standalone builds (no cluster feature)
+    pub fn from_permit_only(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: permit,
+            parent: None,
         }
     }
 
     /// Parent work id (for fragment child admission under this SQL request).
     #[allow(dead_code)] // fragment child admission under SQL parent
-    pub fn parent(&self) -> &ParentAdmission {
-        &self.parent
+    pub fn parent(&self) -> Option<&ParentAdmission> {
+        self.parent.as_ref()
     }
 
     /// Work id assigned by the hierarchical scheduler.
     #[allow(dead_code)] // admin / fragment correlation
-    pub fn work_id(&self) -> u64 {
-        self.parent.work_id()
+    pub fn work_id(&self) -> Option<u64> {
+        self.parent.as_ref().map(ParentAdmission::work_id)
     }
 }
 
@@ -802,6 +819,7 @@ impl SchedulerAdmission {
     }
 
     /// Live pressure control (S4B).
+    #[allow(dead_code)] // read by the cluster admin surface (cluster feature)
     pub fn pressure(&self) -> &PressureControl {
         &self.pressure
     }

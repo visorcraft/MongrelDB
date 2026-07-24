@@ -10,9 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow::ipc::writer::StreamWriter;
 use futures::{Stream, StreamExt};
 use mongreldb_core::{
-    Database, JwksCache, JwtValidationConfig, MongrelError, Principal, ServiceToken,
-    ServiceTokenRegistry, WorkloadClass,
+    Database, MongrelError, Principal, ServiceToken, ServiceTokenRegistry, WorkloadClass,
 };
+#[cfg(feature = "oidc")]
+use mongreldb_core::{JwksCache, JwtValidationConfig};
 use mongreldb_protocol::native;
 use mongreldb_protocol::request::AuthenticatedIdentity;
 use mongreldb_protocol::validate_native_context;
@@ -51,6 +52,7 @@ struct PendingScram {
     expires_unix_micros: u64,
 }
 
+#[cfg(feature = "oidc")]
 #[derive(Clone)]
 struct NativeOidc {
     validation: JwtValidationConfig,
@@ -61,6 +63,7 @@ struct NativeOidc {
 #[derive(Clone, Default)]
 pub struct NativeExternalAuth {
     service_tokens: Arc<RwLock<ServiceTokenRegistry>>,
+    #[cfg(feature = "oidc")]
     oidc: Option<NativeOidc>,
 }
 
@@ -77,6 +80,7 @@ impl NativeExternalAuth {
         Ok(())
     }
 
+    #[cfg(feature = "oidc")]
     pub fn with_oidc(
         mut self,
         validation: JwtValidationConfig,
@@ -586,36 +590,46 @@ impl native::auth_service_server::AuthService for NativeRuntime {
                 (Some(principal), identity, response_identity)
             }
             Some(native::authenticate_request::Credential::Oidc(credential)) => {
-                let oidc = self
-                    .external_auth
-                    .as_ref()
-                    .and_then(|auth| auth.oidc.clone())
-                    .ok_or_else(|| {
-                        Status::unauthenticated("OIDC authentication is not configured")
-                    })?;
-                let token = credential.compact_jws;
-                let verified = tokio::task::spawn_blocking(move || {
-                    oidc.cache
-                        .verify(&token, &oidc.validation, now_unix_seconds())
-                })
-                .await
-                .map_err(|_| Status::internal("OIDC verifier task failed"))?
-                .map_err(|_| Status::unauthenticated("invalid credentials"))?;
-                let principal = self
-                    .db
-                    .resolve_principal(&verified.principal)
-                    .ok_or_else(|| Status::unauthenticated("invalid credentials"))?;
-                let identity = AuthenticatedIdentity::ExternalPrincipal {
-                    provider: "oidc".into(),
-                    subject: verified.principal.clone(),
-                    username: principal.username.clone(),
-                    user_id: principal.user_id,
-                    created_version: principal.created_epoch,
-                    scopes: verified.scopes.clone(),
-                };
-                let response_identity =
-                    native_external_identity(&principal, verified.principal, verified.scopes);
-                (Some(principal), identity, response_identity)
+                #[cfg(feature = "oidc")]
+                {
+                    let oidc = self
+                        .external_auth
+                        .as_ref()
+                        .and_then(|auth| auth.oidc.clone())
+                        .ok_or_else(|| {
+                            Status::unauthenticated("OIDC authentication is not configured")
+                        })?;
+                    let token = credential.compact_jws;
+                    let verified = tokio::task::spawn_blocking(move || {
+                        oidc.cache
+                            .verify(&token, &oidc.validation, now_unix_seconds())
+                    })
+                    .await
+                    .map_err(|_| Status::internal("OIDC verifier task failed"))?
+                    .map_err(|_| Status::unauthenticated("invalid credentials"))?;
+                    let principal = self
+                        .db
+                        .resolve_principal(&verified.principal)
+                        .ok_or_else(|| Status::unauthenticated("invalid credentials"))?;
+                    let identity = AuthenticatedIdentity::ExternalPrincipal {
+                        provider: "oidc".into(),
+                        subject: verified.principal.clone(),
+                        username: principal.username.clone(),
+                        user_id: principal.user_id,
+                        created_version: principal.created_epoch,
+                        scopes: verified.scopes.clone(),
+                    };
+                    let response_identity =
+                        native_external_identity(&principal, verified.principal, verified.scopes);
+                    (Some(principal), identity, response_identity)
+                }
+                #[cfg(not(feature = "oidc"))]
+                {
+                    let _ = credential;
+                    return Err(Status::unauthenticated(
+                        "OIDC authentication is not available in this build",
+                    ));
+                }
             }
             None => return Err(Status::unauthenticated("credentials are required")),
         };

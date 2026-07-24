@@ -38,29 +38,41 @@ use zeroize::Zeroizing;
 
 mod admission;
 mod audit;
+#[cfg(feature = "cluster")]
 pub mod cluster_admin;
+#[cfg(feature = "cluster")]
 mod cluster_data_plane;
+#[cfg(feature = "cluster")]
 pub mod cluster_runtime;
+#[cfg(feature = "cluster")]
 mod cluster_sql;
+#[cfg(feature = "cluster")]
 pub mod fragment_rpc;
 mod kit;
 mod metrics;
+#[cfg(feature = "native-rpc")]
 pub mod native;
+#[cfg(feature = "native-rpc")]
 pub mod native_listen;
+#[cfg(feature = "oidc")]
 pub mod oidc;
 mod pre_cancel;
 mod prepared;
 mod procedure;
+#[cfg(feature = "remote-embedding")]
 pub mod remote_embedding;
 mod sessions;
 mod sql_idempotency;
 mod sql_pages;
+// Always compiled: the hot SQL path is typed over `ServerStorageRuntime`.
+// Only the cluster pieces inside are feature-gated.
 pub mod storage_runtime;
+#[cfg(feature = "vault-kms")]
 pub mod vault_kms;
 
-pub use storage_runtime::{
-    ClusterGatewayRuntime, ServerStorageRuntime, StandaloneRuntime, StorageRuntimeError,
-};
+#[cfg(feature = "cluster")]
+pub use storage_runtime::ClusterGatewayRuntime;
+pub use storage_runtime::{ServerStorageRuntime, StandaloneRuntime, StorageRuntimeError};
 
 /// Parser-only entry point used by the release fuzz harness.
 #[doc(hidden)]
@@ -69,6 +81,7 @@ pub fn fuzz_validate_sql_cursor(value: &str, owner: &str, key: &[u8; 32]) {
 }
 mod trigger;
 
+#[cfg(feature = "native-rpc")]
 pub use native_listen::{is_loopback_addr, NativeListenConfig, NativeListenInput};
 pub use sessions::{spawn_session_reaper, SessionStore};
 
@@ -270,21 +283,29 @@ struct AppState {
     scheduler: admission::SchedulerAdmission,
     /// P1.1 universal node admission: hierarchical scheduler + memory governor
     /// reference, Control/Replication reserves, fragment/AI child budgets.
+    /// Read only by the cluster data plane / cluster parent admission.
+    #[cfg(feature = "cluster")]
     node_admission: admission::NodeAdmissionController,
     /// Stage 4 node memory governor (cross-tablet pressure actions).
     node_governor: std::sync::Mutex<mongreldb_core::NodeMemoryGovernor>,
     /// Stage 4 AI index generation registry (readiness/routing metadata).
+    /// Read only by the cluster admin surface.
+    #[cfg(feature = "cluster")]
     ai_generations: std::sync::Mutex<mongreldb_core::AiIndexGenerationRegistry>,
-    /// Stage 4 multi-region placement policy (default single-leader).
+    /// Multi-region placement policy (cluster control plane only).
+    #[cfg(feature = "cluster")]
     multi_region: std::sync::Mutex<mongreldb_cluster::multi_region::MultiRegionPolicy>,
     /// Stage 5 online ops job store (backup, restore, movement, …).
+    /// Read only by the cluster admin surface.
+    #[cfg(feature = "cluster")]
     ops_jobs: std::sync::Mutex<mongreldb_core::OpsJobStore>,
     /// Workload resource groups for admission (mirrors the core defaults;
     /// operators reconfigure via admin SQL / API).
     resource_groups: mongreldb_core::ResourceGroupRegistry,
     /// Optional embedding providers registered with the server process.
     /// Empty by default — application-supplied vectors and sparse retrieval
-    /// need no vendor.
+    /// need no vendor. Read only by the cluster admin surface.
+    #[cfg(feature = "cluster")]
     embedding_providers: mongreldb_core::EmbeddingProviderRegistry,
 }
 
@@ -295,11 +316,13 @@ impl AppState {
     }
 
     /// P1.1 universal node admission controller (product paths admit here).
+    #[cfg(feature = "cluster")]
     pub(crate) fn node_admission(&self) -> &admission::NodeAdmissionController {
         &self.node_admission
     }
 
     /// Workload resource groups used for class priority / admission.
+    #[cfg(feature = "cluster")]
     pub(crate) fn resource_groups(&self) -> &mongreldb_core::ResourceGroupRegistry {
         &self.resource_groups
     }
@@ -333,13 +356,23 @@ impl AppState {
     }
 
     /// Live cluster runtime when this process is in cluster mode.
+    #[cfg(feature = "cluster")]
     pub(crate) fn cluster_runtime(&self) -> Option<&cluster_runtime::ClusterRuntimeHandle> {
         self.storage.cluster_handle()
     }
 
-    /// `true` when public data is owned by consensus/tablet state.
+    /// `true` when public data is owned by consensus/tablet state. Always
+    /// `false` in builds without the `cluster` feature.
+    #[cfg(feature = "cluster")]
     pub(crate) fn is_cluster_mode(&self) -> bool {
         self.storage.is_cluster()
+    }
+
+    /// `true` when public data is owned by consensus/tablet state. Always
+    /// `false` in builds without the `cluster` feature.
+    #[cfg(not(feature = "cluster"))]
+    pub(crate) fn is_cluster_mode(&self) -> bool {
+        false
     }
 }
 
@@ -634,11 +667,16 @@ pub struct ServerControl {
     /// Authoritative storage (same as `AppState.storage`).
     storage: ServerStorageRuntime,
     audit: Arc<audit::AuditLog>,
+    #[cfg(feature = "native-rpc")]
     sql_idempotency: Arc<sql_idempotency::SqlIdempotencyStore>,
+    #[cfg(feature = "native-rpc")]
     sql_semaphore: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "native-rpc")]
     scheduler: admission::SchedulerAdmission,
     /// Shared with AppState for P1.1 parent admission on native SQL.
+    #[cfg(feature = "native-rpc")]
     node_admission: admission::NodeAdmissionController,
+    #[cfg(feature = "native-rpc")]
     sql_priority: u8,
 }
 
@@ -657,6 +695,7 @@ impl ServerControl {
     ///
     /// Cluster mode has no standalone user database; callers must not invoke
     /// this without a local engine (native RPC is standalone-only today).
+    #[cfg(feature = "native-rpc")]
     pub fn native_runtime(
         &self,
         db: Arc<Database>,
@@ -691,6 +730,7 @@ impl ServerControl {
         }
         let stuck = stuck_queries.len();
         self.metrics.add_sql_stuck_after_cancel(stuck);
+        #[cfg(feature = "cluster")]
         if let Some(runtime) = self.storage.cluster_handle() {
             if let Err(error) = runtime.shutdown().await {
                 eprintln!("[cluster-runtime] shutdown error: {error}");
@@ -702,6 +742,7 @@ impl ServerControl {
     }
 
     /// Live cluster runtime handle when the daemon started in cluster mode.
+    #[cfg(feature = "cluster")]
     pub fn cluster_runtime(&self) -> Option<&cluster_runtime::ClusterRuntimeHandle> {
         self.storage.cluster_handle()
     }
@@ -808,6 +849,7 @@ pub fn build_app_with_sessions(
 }
 
 /// Build the daemon router and return a handle for graceful query shutdown.
+#[cfg(feature = "cluster")]
 pub fn build_app_with_sessions_and_control(
     db: Arc<Database>,
     external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
@@ -827,6 +869,26 @@ pub fn build_app_with_sessions_and_control(
     )
 }
 
+/// Build the daemon router and return a handle for graceful query shutdown.
+#[cfg(not(feature = "cluster"))]
+pub fn build_app_with_sessions_and_control(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+    sessions: Arc<sessions::SessionStore>,
+) -> (axum::Router, ServerControl) {
+    build_app_with_storage(
+        ServerStorageRuntime::standalone(db),
+        external_modules,
+        auth_token,
+        max_connections,
+        user_auth,
+        sessions,
+    )
+}
+
 /// Build the daemon router with an optional live [`cluster_runtime::ClusterRuntimeHandle`].
 ///
 /// Used by the product cluster path (`--cluster-node-data`) and by tests that
@@ -838,6 +900,7 @@ pub fn build_app_with_sessions_and_control(
 /// should pass a throwaway or drop their standalone open; production start
 /// uses [`build_app_with_storage`] with [`ServerStorageRuntime::Cluster`] and
 /// never opens a user database as standalone.
+#[cfg(feature = "cluster")]
 pub fn build_app_with_sessions_control_and_cluster(
     db: Arc<Database>,
     external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
@@ -959,6 +1022,7 @@ pub fn build_app_with_storage(
         admission::NodeAdmissionController::new(&resource_groups, node_memory_governor.clone());
     let scheduler = node_admission.scheduler().clone();
     let sql_semaphore = Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent()));
+    #[cfg(feature = "native-rpc")]
     let sql_priority = admission::priority_for_class(
         &resource_groups,
         mongreldb_core::WorkloadClass::InteractiveSql,
@@ -972,12 +1036,18 @@ pub fn build_app_with_storage(
         reloadable: Arc::clone(&reloadable),
         storage: storage.clone(),
         audit: Arc::clone(&audit),
+        #[cfg(feature = "native-rpc")]
         sql_idempotency: Arc::clone(&sql_idempotency),
+        #[cfg(feature = "native-rpc")]
         sql_semaphore: Arc::clone(&sql_semaphore),
+        #[cfg(feature = "native-rpc")]
         scheduler: scheduler.clone(),
+        #[cfg(feature = "native-rpc")]
         node_admission: node_admission.clone(),
+        #[cfg(feature = "native-rpc")]
         sql_priority,
     };
+    #[cfg(feature = "cluster")]
     let ops_jobs_store = mongreldb_core::OpsJobStore::new();
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new_with_integrity(
@@ -1026,16 +1096,21 @@ pub fn build_app_with_storage(
         // Class configs seeded from resource-group defaults; env may tighten
         // InteractiveSql max_queue / max_concurrency for tests/operators.
         scheduler,
+        #[cfg(feature = "cluster")]
         node_admission,
         node_governor: std::sync::Mutex::new(mongreldb_core::NodeMemoryGovernor::new(
             node_memory_governor,
         )),
+        #[cfg(feature = "cluster")]
         ai_generations: std::sync::Mutex::new(mongreldb_core::AiIndexGenerationRegistry::new()),
+        #[cfg(feature = "cluster")]
         multi_region: std::sync::Mutex::new(
             mongreldb_cluster::multi_region::MultiRegionPolicy::default(),
         ),
+        #[cfg(feature = "cluster")]
         ops_jobs: std::sync::Mutex::new(ops_jobs_store),
         resource_groups,
+        #[cfg(feature = "cluster")]
         embedding_providers: mongreldb_core::EmbeddingProviderRegistry::new(),
     });
     let router = axum::Router::new()
@@ -1049,11 +1124,14 @@ pub fn build_app_with_storage(
         .route("/metrics", get(metrics_handler))
         .route("/audit", get(audit_handler))
         .route("/admin/drain", get(drain_status).post(admin_drain))
-        .route("/admin/reload", post(admin_reload))
-        // Cluster bootstrap + membership workflows (spec §11.1, S2A-002).
+        .route("/admin/reload", post(admin_reload));
+    // Cluster bootstrap + membership workflows (spec §11.1, S2A-002).
+    #[cfg(feature = "cluster")]
+    let router = router
         .route("/admin/cluster/status", get(cluster_admin::status))
         .route("/admin/cluster/node/drain", post(cluster_admin::drain))
-        .route("/admin/cluster/node/remove", post(cluster_admin::remove))
+        .route("/admin/cluster/node/remove", post(cluster_admin::remove));
+    let router = router
         .route("/tables", get(list_tables).post(create_table))
         .route("/tables/{name}", axum::routing::delete(drop_table))
         .route("/tables/{name}/put", post(put_row))
@@ -2018,6 +2096,7 @@ async fn admin_drain(
             .into_response();
     }
     let _serialization = state.drain.lock.lock().await;
+    #[cfg(feature = "cluster")]
     if state.is_cluster_mode() {
         // Cluster drain: stop admitting SQL, cancel queries, shut down the
         // NodeRuntime. There is no peer standalone DatabaseCore to close.
@@ -5733,6 +5812,8 @@ fn register_controlled_query(
 /// hierarchical scheduler enforces class/tenant fairness inside that bound.
 /// QueueFull / TenantQuota map to ResourceExhausted (HTTP 503). Cancel while
 /// waiting cancels the scheduler work id. RAII complete frees class slots.
+/// Scheduler admission runs only with the `cluster` feature; standalone
+/// builds take the semaphore-only fast path.
 ///
 /// S4B: best-effort node governor evaluate runs before admission so
 /// `ReduceAdmission` / cache eviction take effect under pressure.
@@ -5757,40 +5838,49 @@ async fn acquire_sql_permit(
         }
     };
 
-    let class = mongreldb_core::WorkloadClass::InteractiveSql;
-    let priority = admission::priority_for_class(&state.resource_groups, class);
-    let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
-
     // P1.1: product SQL path admits through NodeAdmissionController::admit_parent
-    // (hierarchical scheduler + parent memory budget), not a bare scheduler clone.
-    const SQL_PARENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-    let parent = match state
-        .node_admission
-        .admit_parent(
-            admission::AdmitRequest {
-                tenant: "default",
-                class,
-                priority,
-                deadline: None,
-                query_id: Some(types_query_id),
-                tag: "sql",
-            },
-            mongreldb_core::MemoryClass::QueryExecution,
-            SQL_PARENT_BUDGET_BYTES,
-            query.control().cancelled(),
-        )
-        .await
+    // (hierarchical scheduler + parent memory budget), not a bare scheduler
+    // clone. Standalone builds (no `cluster` feature) take the fast path: the
+    // outer semaphore permit only.
+    #[cfg(feature = "cluster")]
     {
-        Ok(parent) => parent,
-        Err(admission::AdmitError::Cancelled) => {
-            return Err(cancellation_checkpoint_error(query));
-        }
-        Err(error) => {
-            return Err(admission::admit_error_to_query(error));
-        }
-    };
+        let class = mongreldb_core::WorkloadClass::InteractiveSql;
+        let priority = admission::priority_for_class(&state.resource_groups, class);
+        let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
 
-    Ok(admission::SqlAdmissionGuard::new(permit, parent))
+        const SQL_PARENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+        let parent = match state
+            .node_admission
+            .admit_parent(
+                admission::AdmitRequest {
+                    tenant: "default",
+                    class,
+                    priority,
+                    deadline: None,
+                    query_id: Some(types_query_id),
+                    tag: "sql",
+                },
+                mongreldb_core::MemoryClass::QueryExecution,
+                SQL_PARENT_BUDGET_BYTES,
+                query.control().cancelled(),
+            )
+            .await
+        {
+            Ok(parent) => parent,
+            Err(admission::AdmitError::Cancelled) => {
+                return Err(cancellation_checkpoint_error(query));
+            }
+            Err(error) => {
+                return Err(admission::admit_error_to_query(error));
+            }
+        };
+
+        return Ok(admission::SqlAdmissionGuard::new(permit, parent));
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        Ok(admission::SqlAdmissionGuard::from_permit_only(permit))
+    }
 }
 
 /// Best-effort S4B evaluate: live DB reservations, AI semaphore saturation,
@@ -6996,12 +7086,14 @@ async fn sql(
     }
     // P0.2: handle §15 admin SQL before opening any standalone session, so
     // cluster mode never touches AppState.db for SHOW CLUSTER / TRANSFER LEADER.
+    #[cfg(feature = "cluster")]
     if let Some(response) = cluster_admin::try_admin_sql(&state, &principal, &req.sql).await {
         return response;
     }
     // P0.2: ordinary public SQL in cluster mode routes through the tablet
     // data plane (Raft propose / tablet_rows). Unsupported statements and a
     // missing runtime still fail closed — never AppState.db.
+    #[cfg(feature = "cluster")]
     if state.is_cluster_mode() {
         if let Some(response) = cluster_data_plane::try_execute_sql(&state, &req.sql).await {
             return response;

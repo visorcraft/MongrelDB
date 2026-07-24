@@ -1,3 +1,4 @@
+#![cfg(feature = "native-rpc")]
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -1,3 +1,4 @@
+#![cfg(feature = "cluster")]
 //! P0.2 — cluster public data runtime:
 //! - `ServerStorageRuntime` is the single AppState storage authority
 //! - Cluster mode refuses dual-root standalone data-plane opens

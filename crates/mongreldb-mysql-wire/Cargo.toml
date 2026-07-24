@@ -20,7 +20,7 @@ tokio-rustls = "0.25"
 
 [dev-dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.64.6" }
-mongreldb-server = { path = "../mongreldb-server", version = "0.64.6" }
+mongreldb-server = { path = "../mongreldb-server", version = "0.64.6", features = ["native-rpc"] }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 rcgen = "0.13"
 tempfile = "3"

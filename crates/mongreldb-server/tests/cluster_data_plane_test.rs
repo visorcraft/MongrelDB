@@ -1,3 +1,4 @@
+#![cfg(feature = "cluster")]
 //! P0.2 — public cluster data plane routes INSERT/SELECT through Raft
 //! (`write_tablet_rows` / `tablet_rows`), never through standalone AppState.db.
 

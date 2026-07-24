@@ -1,3 +1,4 @@
+#![cfg(feature = "cluster")]
 //! Server-hosted NodeRuntime product path (Stage 2/3):
 //! - After `cluster init`, start the app with a live runtime under plaintext
 //!   test mode and assert status / SHOW CLUSTER report a live runtime.
