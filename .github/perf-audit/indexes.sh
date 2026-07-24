@@ -15,6 +15,8 @@ cp .github/perf-audit/index_model_audit.rs \
   "$WORK/crates/mongreldb-core/tests/index_model_audit.rs"
 cp .github/perf-audit/index_failure_probes.rs \
   "$WORK/crates/mongreldb-core/tests/index_failure_probes.rs"
+cp .github/perf-audit/clustered_index_probe.rs \
+  "$WORK/crates/mongreldb-core/tests/clustered_index_probe.rs"
 
 git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGET_SHA"
 
@@ -45,6 +47,15 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
     probe_status=$?
   fi
   printf '%s\n' "$probe_status" > "$OUT/index-failure-probes-status.txt"
+
+  if cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
+    --test clustered_index_probe -- --nocapture \
+    > "$OUT/clustered-index-probe.log" 2>&1; then
+    clustered_status=0
+  else
+    clustered_status=$?
+  fi
+  printf '%s\n' "$clustered_status" > "$OUT/clustered-index-probe-status.txt"
 
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_after_update -- --nocapture
