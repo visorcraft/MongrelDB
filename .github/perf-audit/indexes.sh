@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
 
 : "${TARGET_SHA:?}"
 : "${RUST_VERSION:?}"
@@ -8,7 +8,6 @@ OUT=/tmp/e775-index-audit
 WORK=/tmp/e775-index-worktree
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/driver.log") 2>&1
-trap 'status=$?; echo "Index harness failed at line $LINENO: $BASH_COMMAND (status $status)"; exit $status' ERR
 set -x
 
 git worktree add --detach "$WORK" "$TARGET_SHA"
@@ -21,10 +20,11 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
 
 (
   cd "$WORK"
-  set +e
-  cargo "+$RUST_VERSION" fmt --check > "$OUT/fmt-check.log" 2>&1
-  fmt_status=$?
-  set -e
+  if cargo "+$RUST_VERSION" fmt --check > "$OUT/fmt-check.log" 2>&1; then
+    fmt_status=0
+  else
+    fmt_status=$?
+  fi
   printf '%s\n' "$fmt_status" > "$OUT/fmt-check-status.txt"
   cargo "+$RUST_VERSION" fmt --all
   git diff --stat > "$OUT/rustfmt-diff-stat.txt"
@@ -35,14 +35,15 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_model_audit -- --nocapture
 
-  # Expected to expose any focused correctness defects without preventing the
-  # established index suites from running and uploading their evidence.
-  set +e
-  cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
+  # Focused probes are diagnostic: record all failures, then continue through
+  # the repository's established index and complete-core suites.
+  if cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_failure_probes -- --nocapture \
-    > "$OUT/index-failure-probes.log" 2>&1
-  probe_status=$?
-  set -e
+    > "$OUT/index-failure-probes.log" 2>&1; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
   printf '%s\n' "$probe_status" > "$OUT/index-failure-probes-status.txt"
 
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
