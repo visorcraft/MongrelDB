@@ -156,6 +156,7 @@ OPTIONS:
     --embedding-provider <path> Register a remote embedding provider from JSON
                                 (repeatable; secrets are environment references)
     -h, --help                  Print this help message
+    -v, -V, --version           Print the version and exit
 
 SUBCOMMANDS (one-shot; they do not start the daemon):
     snapshot <db_dir>           Checkpoint to a stable byte image
@@ -339,7 +340,12 @@ fn validate_http_auth_configuration(
 
 /// Parse command-line arguments. Returns `Err(message)` on failure.
 fn parse_args() -> Result<Args, String> {
-    let raw: Vec<String> = std::env::args().collect();
+    parse_args_from(std::env::args().collect())
+}
+
+/// Parse the given argument vector (including the program name at index 0).
+/// Split from [`parse_args`] so tests can drive the parser directly.
+fn parse_args_from(raw: Vec<String>) -> Result<Args, String> {
     if raw.len() < 2 {
         return Err(format!(
             "error: a database directory is required\n\n{USAGE}"
@@ -400,6 +406,10 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-v" | "-V" | "--version" => {
+                println!("mongreldb-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--port" => {
@@ -649,7 +659,12 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             // Positional: first is db_dir, second (if numeric) is port for backward compat.
+            // Anything flag-shaped that reached here is an unrecognized option:
+            // fail loudly instead of booting a server in a garbage directory.
             other => {
+                if other.starts_with('-') {
+                    return Err(format!("unexpected argument: {other}\n\n{USAGE}"));
+                }
                 if db_dir.is_none() {
                     db_dir = Some(other.to_string());
                 } else if port.is_none() {
@@ -2027,6 +2042,45 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("mongreldb-server".to_string())
+            .chain(args.iter().map(|a| a.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_args_accepts_positional_db_dir_and_port() {
+        let args = parse_args_from(argv(&["mydb"])).unwrap();
+        assert_eq!(args.db_dir, "mydb");
+        assert_eq!(args.port, DEFAULT_PORT);
+
+        let args = parse_args_from(argv(&["mydb", "8454"])).unwrap();
+        assert_eq!(args.db_dir, "mydb");
+        assert_eq!(args.port, 8454);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag_shaped_arguments() {
+        // A typo'd or unsupported flag must fail loudly — never fall into the
+        // positional db_dir slot and boot a server in a garbage directory.
+        fn parse_err(args: &[&str]) -> String {
+            match parse_args_from(argv(args)) {
+                Err(e) => e,
+                Ok(_) => panic!("expected parse error for {args:?}"),
+            }
+        }
+        for bogus in ["--version-extra", "--portt", "-x"] {
+            let err = parse_err(&[bogus]);
+            assert!(
+                err.contains("unexpected argument"),
+                "{bogus}: expected 'unexpected argument' error, got: {err}"
+            );
+        }
+        // Unknown flags are rejected even after a valid positional.
+        let err = parse_err(&["mydb", "--bogus"]);
+        assert!(err.contains("unexpected argument"), "got: {err}");
     }
 
     #[test]
