@@ -1,0 +1,96 @@
+name: Audit e775 P0 P2 and indexes
+
+on:
+  push:
+    branches:
+      - agent/audit-e775-p0-p2-indexes
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-e775-p0-p2-indexes
+  cancel-in-progress: true
+
+env:
+  TARGET_SHA: e7755f65ab50aea70b2f5633a81b86af1ff089e1
+  COMPARE_RUST: "1.96.1"
+  CURRENT_RUST: "1.97.1"
+
+jobs:
+  p0:
+    name: P0 exact comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.COMPARE_RUST }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
+      - name: Compare setup-sensitive and steady-state put paths
+        env:
+          RUST_VERSION: ${{ env.COMPARE_RUST }}
+        run: bash .github/perf-audit/p0.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e775-p0-audit
+          path: /tmp/e775-p0
+          if-no-files-found: error
+
+  p2:
+    name: P2 exact comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.COMPARE_RUST }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Compare baseline, pre-fix, intermediate, and final HTTP paths
+        env:
+          RUST_VERSION: ${{ env.COMPARE_RUST }}
+        run: bash .github/perf-audit/p2.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e775-p2-audit
+          path: /tmp/e775-p2
+          if-no-files-found: error
+
+  indexes:
+    name: Index correctness and source audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.CURRENT_RUST }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run model-based and complete core index checks
+        env:
+          RUST_VERSION: ${{ env.CURRENT_RUST }}
+        run: bash .github/perf-audit/indexes.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e775-index-audit
+          path: /tmp/e775-index-audit
+          if-no-files-found: error
