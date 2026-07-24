@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - agent/audit-e775-p0-p2-indexes
-  pull_request:
-    branches:
-      - master
   workflow_dispatch:
 
 permissions:
