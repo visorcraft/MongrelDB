@@ -14,6 +14,8 @@ set -x
 git worktree add --detach "$WORK" "$TARGET_SHA"
 cp .github/perf-audit/index_model_audit.rs \
   "$WORK/crates/mongreldb-core/tests/index_model_audit.rs"
+cp .github/perf-audit/index_failure_probes.rs \
+  "$WORK/crates/mongreldb-core/tests/index_failure_probes.rs"
 
 git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGET_SHA"
 
@@ -32,6 +34,17 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
     --all-targets --all-features -- -D warnings
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_model_audit -- --nocapture
+
+  # Expected to expose any focused correctness defects without preventing the
+  # established index suites from running and uploading their evidence.
+  set +e
+  cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
+    --test index_failure_probes -- --nocapture \
+    > "$OUT/index-failure-probes.log" 2>&1
+  probe_status=$?
+  set -e
+  printf '%s\n' "$probe_status" > "$OUT/index-failure-probes-status.txt"
+
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_after_update -- --nocapture
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
