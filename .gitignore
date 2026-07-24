@@ -1,6 +1,7 @@
 .worktrees/
 target/
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 PLAN.md
 TODO.md
 AGENTS.md

@@ -82,8 +82,10 @@ if [ "$SKIP_COLLECT" -eq 1 ]; then
     fi
     echo "reusing existing profile: $MERGED"
 else
-    # B.1 — instrumented build (fresh profraw dir so stale runs never merge).
-    run rm -rf "$PROFRAW_DIR"
+    # B.1 — instrumented build (fresh profraw dir so stale runs never merge;
+    # fresh scratch target so the scale_test glob below can never pick a
+    # stale binary from a previous instrumented build).
+    run rm -rf "$PROFRAW_DIR" "$INSTR_TARGET"
     run mkdir -p "$PROFRAW_DIR"
     run env RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" CARGO_TARGET_DIR="$INSTR_TARGET" \
         cargo +stable build --release -p mongreldb-server --tests "${features_args[@]}"
