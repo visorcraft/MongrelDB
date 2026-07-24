@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-node"
-version = "0.64.5"
+version = "0.64.6"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -12,8 +12,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bincode = "1"
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.5" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.64.5" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.6" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.64.6" }
 napi = { version = "2", default-features = false, features = ["dyn-symbols", "napi8", "tokio_rt"] }
 napi-derive = "2"
 parking_lot = "0.12"

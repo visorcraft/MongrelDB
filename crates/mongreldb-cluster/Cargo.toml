@@ -27,14 +27,14 @@ serde_json = "1"
 thiserror = "1"
 sha2 = "0.10"
 getrandom = "0.2"
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.5" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.5" }
-mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.64.5" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.5" }
-mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.5" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.6" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.6" }
+mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.64.6" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.6" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.64.6" }
 
 [dev-dependencies]
-mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.5" }
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.6" }
 tempfile = "3"
 
 [features]
