@@ -1,0 +1,45 @@
+name: Audit e775 focused indexes
+
+on:
+  push:
+    branches:
+      - agent/audit-e775-index-focused
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-e775-index-focused
+  cancel-in-progress: true
+
+env:
+  TARGET_SHA: e7755f65ab50aea70b2f5633a81b86af1ff089e1
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  indexes:
+    name: Focused index correctness audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run focused and model-based index checks
+        run: bash .github/perf-audit/indexes.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e775-index-focused
+          path: /tmp/e775-index-audit
+          if-no-files-found: error
