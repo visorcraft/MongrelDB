@@ -41,6 +41,62 @@ impl BitmapIndex {
         self.active.entry(value).or_default().insert(id32);
     }
 
+    /// Remove `row_id` from the set for `value` across the active layer and any
+    /// sealed generations. Used by secondary-index delta maintenance when a
+    /// row is replaced or an indexed column changes.
+    ///
+    /// Returns whether the id was present in any layer.
+    pub fn remove(&mut self, value: &[u8], row_id: RowId) -> bool {
+        let Ok(id32) = u32::try_from(row_id.0) else {
+            return false;
+        };
+        let mut removed = false;
+        if let Some(bm) = self.active.get_mut(value) {
+            removed |= bm.remove(id32);
+            if bm.is_empty() {
+                self.active.remove(value);
+            }
+        }
+        // Sealed generations are shared; copy-on-write only the layers that
+        // actually contain this membership so readers keep stable snapshots.
+        let mut new_frozen: Option<Vec<Arc<BitmapLayer>>> = None;
+        for (i, layer) in self.frozen.iter().enumerate() {
+            if layer.get(value).is_some_and(|bm| bm.contains(id32)) {
+                let layers = new_frozen.get_or_insert_with(|| {
+                    self.frozen.iter().cloned().collect::<Vec<_>>()
+                });
+                let mut owned = (*layers[i]).clone();
+                if let Some(bm) = owned.get_mut(value) {
+                    if bm.remove(id32) {
+                        removed = true;
+                        if bm.is_empty() {
+                            owned.remove(value);
+                        }
+                    }
+                }
+                layers[i] = Arc::new(owned);
+            }
+        }
+        if let Some(layers) = new_frozen {
+            self.frozen = Arc::new(layers);
+        }
+        removed
+    }
+
+    /// True if any layer currently associates `value` with `row_id`.
+    #[cfg(test)]
+    pub fn contains(&self, value: &[u8], row_id: RowId) -> bool {
+        let Ok(id32) = u32::try_from(row_id.0) else {
+            return false;
+        };
+        if self.active.get(value).is_some_and(|bm| bm.contains(id32)) {
+            return true;
+        }
+        self.frozen
+            .iter()
+            .any(|layer| layer.get(value).is_some_and(|bm| bm.contains(id32)))
+    }
+
     /// The row-id set for `value` (empty if absent).
     pub fn get(&self, value: &[u8]) -> RoaringBitmap {
         let mut rows = self.active.get(value).cloned().unwrap_or_default();
@@ -158,6 +214,23 @@ mod tests {
         let both = BitmapIndex::intersect(&[red, us]);
         let ids: Vec<u32> = both.iter().collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn remove_drops_membership_across_active_and_sealed() {
+        let mut idx = BitmapIndex::new();
+        idx.insert(b"tok".to_vec(), RowId(1));
+        idx.insert(b"tok".to_vec(), RowId(2));
+        idx.seal();
+        idx.insert(b"tok".to_vec(), RowId(3));
+        assert!(idx.contains(b"tok", RowId(1)));
+        assert!(idx.remove(b"tok", RowId(1)));
+        assert!(!idx.contains(b"tok", RowId(1)));
+        assert!(idx.contains(b"tok", RowId(2)));
+        assert!(idx.contains(b"tok", RowId(3)));
+        assert!(idx.remove(b"tok", RowId(3)));
+        assert!(!idx.contains(b"tok", RowId(3)));
+        assert!(!idx.remove(b"missing", RowId(9)));
     }
 
     #[test]

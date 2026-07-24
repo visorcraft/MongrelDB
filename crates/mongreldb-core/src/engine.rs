@@ -3480,6 +3480,7 @@ impl Table {
             for &cid in r.columns.keys() {
                 self.pending_put_cols.insert(cid);
             }
+            let mut replaced_image: Option<Row> = None;
             match pk_id {
                 Some(pid) if probe || maintain_pk_by_row => {
                     if let Some(pk_val) = r.columns.get(&pid) {
@@ -3487,6 +3488,7 @@ impl Table {
                         if probe {
                             if let Some(old_rid) = self.hot.get(&key) {
                                 if old_rid != r.row_id {
+                                    replaced_image = self.get(old_rid, self.snapshot());
                                     self.tombstone_row(
                                         old_rid,
                                         r.committed_epoch,
@@ -3506,7 +3508,11 @@ impl Table {
                     self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
                 }
             }
-            self.index_row(&r);
+            if let Some(old) = replaced_image {
+                self.maintain_indexes_on_pk_replace(&old, &r);
+            } else {
+                self.index_row(&r);
+            }
             self.reservoir.offer(r.row_id.0);
             self.memtable.upsert(r);
             // Count as each row lands so a later duplicate's tombstone
@@ -3519,23 +3525,34 @@ impl Table {
     /// One-row specialization of [`Table::apply_put_rows_inner`]: identical
     /// upsert semantics (tombstone the previous PK owner, insert into HOT,
     /// index, sample, materialize) without the per-batch winner/loser maps.
+    ///
+    /// When a same-PK put replaces an older live row (the product update path
+    /// after delete+put normalize, or a direct upsert), Bitmap secondary indexes
+    /// are maintained via [`crate::index::maintain_bitmap_secondary_on_replace`]
+    /// so unchanged equality keys only re-point row ids and changed keys move —
+    /// rather than leaving tombstoned row ids permanently in the bitmaps.
     fn apply_put_row_single(&mut self, row: Row, check_existing_pk: bool) {
         for &cid in row.columns.keys() {
             self.pending_put_cols.insert(cid);
         }
         let epoch = row.committed_epoch;
+        let mut replaced_image: Option<Row> = None;
         if let Some(pk_col) = self.schema.primary_key() {
             let pk_id = pk_col.id;
             if let Some(pk_val) = row.columns.get(&pk_id) {
-                // `index_row` below writes the HOT entry (`index_into` covers
-                // the PK). The reverse map is maintained inline only once a
-                // delete has built it; ingest-only tables never pay for it.
+                // `index_row` / HOT-only path below writes the HOT entry. The
+                // reverse map is maintained inline only once a delete has built
+                // it; ingest-only tables never pay for it.
                 let maintain_pk_by_row = self.pk_by_row_complete;
                 if check_existing_pk || maintain_pk_by_row {
                     let key = self.index_lookup_key(pk_id, pk_val);
                     if check_existing_pk {
                         if let Some(old_rid) = self.hot.get(&key) {
                             if old_rid != row.row_id {
+                                // Capture the pre-image while it is still live so
+                                // secondary-index delta maintenance can drop the
+                                // old row-id from Bitmap keys.
+                                replaced_image = self.get(old_rid, self.snapshot());
                                 self.tombstone_row(old_rid, epoch, row.commit_ts, true);
                             }
                         }
@@ -3549,11 +3566,91 @@ impl Table {
             self.hot
                 .insert(row.row_id.0.to_be_bytes().to_vec(), row.row_id);
         }
-        self.index_row(&row);
+        if let Some(old) = replaced_image {
+            self.maintain_indexes_on_pk_replace(&old, &row);
+        } else {
+            self.index_row(&row);
+        }
         self.reservoir.offer(row.row_id.0);
         self.memtable.upsert(row);
         self.live_count = self.live_count.saturating_add(1);
         self.data_generation = self.data_generation.wrapping_add(1);
+    }
+
+    /// PK-replace index maintenance: Bitmap secondaries via delta plan; other
+    /// secondary kinds + HOT via the existing full path for those families.
+    fn maintain_indexes_on_pk_replace(&mut self, old: &Row, new: &Row) {
+        let has_partial = self
+            .schema
+            .indexes
+            .iter()
+            .any(|idx| idx.predicate.is_some());
+        if has_partial {
+            // Partial predicates make selective unindex subtle; drop old Bitmap
+            // memberships then full-index the new image (still cleans tombstone
+            // pollution for Bitmap keys).
+            for idef in &self.schema.indexes {
+                if idef.kind != crate::schema::IndexKind::Bitmap {
+                    continue;
+                }
+                if let Some(key) = crate::index::maintain::bitmap_key_for_column(old, idef.column_id)
+                {
+                    if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
+                        b.remove(&key, old.row_id);
+                    }
+                }
+            }
+            self.index_row(new);
+            return;
+        }
+
+        crate::index::maintain_bitmap_secondary_on_replace(
+            &self.schema,
+            &mut self.bitmap,
+            old,
+            new,
+        );
+        self.index_row_non_bitmap(new);
+    }
+
+    /// Index HOT + every non-Bitmap secondary for `row`. Bitmap secondaries are
+    /// assumed already maintained by a delta plan on the replace path.
+    fn index_row_non_bitmap(&mut self, row: &Row) {
+        if row.deleted {
+            return;
+        }
+        let effective = if self.column_keys.is_empty() {
+            None
+        } else {
+            Some(self.tokenized_for_indexes(row))
+        };
+        let source = effective.as_ref().unwrap_or(row);
+        for idef in &self.schema.indexes {
+            if idef.kind == crate::schema::IndexKind::Bitmap {
+                continue;
+            }
+            index_into_single(
+                idef,
+                &self.schema,
+                source,
+                &mut self.hot,
+                &mut self.bitmap,
+                &mut self.ann,
+                &mut self.fm,
+                &mut self.sparse,
+                &mut self.minhash,
+            );
+        }
+        if let Some(pk_col) = self.schema.primary_key() {
+            if let Some(pk_val) = source.columns.get(&pk_col.id) {
+                let key = if self.column_keys.is_empty() {
+                    pk_val.encode_key()
+                } else {
+                    self.index_lookup_key(pk_col.id, pk_val)
+                };
+                self.hot.insert(key, source.row_id);
+            }
+        }
     }
 
     /// Allocate a fresh row id (advancing the table's allocator). Used by the

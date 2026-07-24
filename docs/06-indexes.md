@@ -8,6 +8,23 @@ MongrelDB exposes six secondary index kinds: Bitmap, LearnedRange, FmIndex,
 Ann, Sparse, and MinHash. Primary-key lookup and the PMA mutable-run tier are
 internal and require no schema declaration.
 
+## Bitmap maintenance on update / PK replace
+
+Product updates (`update_many`, and same-PK put that replaces a live row) keep
+**Bitmap** secondaries consistent via a modular delta path
+(`index::maintain`):
+
+| Indexed value | Maintenance |
+| --- | --- |
+| **Unchanged** | **Repoint** — remove the old `RowId` under that key, insert the new `RowId` (no-op when the id is unchanged) |
+| **Changed** | **Move** — remove the old key membership, insert under the new key |
+
+That means a partial update that only touches non-indexed columns does **not**
+leave the tombstoned row id in the Bitmap for the still-valid equality key.
+ANN / FM / Sparse / MinHash / LearnedRange keep their existing full reindex
+paths; Bitmap is the first family on the delta planner so equality/FK-style
+indexes stay correct under high update volume.
+
 ## How to Declare Indexes
 
 Indexes are defined in the schema when you create a table:

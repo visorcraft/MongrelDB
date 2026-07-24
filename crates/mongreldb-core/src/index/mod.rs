@@ -12,6 +12,7 @@ pub mod generation;
 pub mod hnsw;
 pub mod hot;
 pub mod learned_range;
+pub mod maintain;
 pub mod minhash;
 pub mod pgm;
 pub mod sparse;
@@ -22,6 +23,10 @@ pub use fm_index::FmIndex;
 pub use generation::{IndexFamilyGeneration, IndexGeneration};
 pub use hot::HotIndex;
 pub use learned_range::{ColumnLearnedRange, ColumnLearnedRangeSnapshot};
+pub use maintain::{
+    apply_bitmap_secondary_delta, maintain_bitmap_secondary_on_replace, plan_bitmap_secondary_deltas,
+    BitmapIndexDelta,
+};
 pub use minhash::{
     minhash_member_hash_v1, minhash_token_hash, token_hashes_from_bytes, MinHashIndex,
 };
