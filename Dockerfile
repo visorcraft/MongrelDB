@@ -6,7 +6,9 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked --manifest-path crates/mongreldb-server/Cargo.toml --bin mongreldb-server
+# Packaged deployments opt into the cluster/native/OIDC/vault/embedding
+# features; the default feature set is the standalone HTTP-only build.
+RUN cargo build --release --locked --manifest-path crates/mongreldb-server/Cargo.toml --bin mongreldb-server --features cluster,native-rpc,oidc,vault-kms,remote-embedding
 
 FROM debian:bookworm-slim
 

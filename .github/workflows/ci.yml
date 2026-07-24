@@ -69,6 +69,11 @@ jobs:
           workspaces: crates/mongreldb-server
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --all-targets --all-features
+      # Standalone variant (default features): the deployment measured by the
+      # P2 benchmark; omits cluster/native-rpc/oidc/vault-kms/remote-embedding.
+      - run: cargo test --all-targets
+      # Cluster variant: full suite including cluster admin SQL and data plane.
+      - run: cargo test --all-targets --features cluster
 
   client:
     name: Client checks

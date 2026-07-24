@@ -228,7 +228,9 @@ jobs:
 
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.apt }}
 
-      - run: cargo build --release --bin mongreldb-server --target ${{ matrix.target }}
+      # Packaged deployments opt into the cluster/native/OIDC/vault/embedding
+      # features; the default feature set is the standalone HTTP-only build.
+      - run: cargo build --release --bin mongreldb-server --target ${{ matrix.target }} --features cluster,native-rpc,oidc,vault-kms,remote-embedding
         working-directory: crates/mongreldb-server
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
