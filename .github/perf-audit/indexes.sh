@@ -11,12 +11,10 @@ exec > >(tee -a "$OUT/driver.log") 2>&1
 set -x
 
 git worktree add --detach "$WORK" "$TARGET_SHA"
-cp .github/perf-audit/index_model_audit.rs \
-  "$WORK/crates/mongreldb-core/tests/index_model_audit.rs"
-cp .github/perf-audit/index_failure_probes.rs \
-  "$WORK/crates/mongreldb-core/tests/index_failure_probes.rs"
-cp .github/perf-audit/clustered_index_probe.rs \
-  "$WORK/crates/mongreldb-core/tests/clustered_index_probe.rs"
+for probe in index_model_audit index_failure_probes clustered_index_probe stale_hot_probe; do
+  cp ".github/perf-audit/$probe.rs" \
+    "$WORK/crates/mongreldb-core/tests/$probe.rs"
+done
 
 git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGET_SHA"
 
@@ -34,28 +32,23 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
 
   cargo "+$RUST_VERSION" clippy -p mongreldb-core \
     --all-targets --all-features -- -D warnings
-  cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
-    --test index_model_audit -- --nocapture
 
-  # Focused probes are diagnostic: record all failures, then continue through
-  # the repository's established index and complete-core suites.
-  if cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
-    --test index_failure_probes -- --nocapture \
-    > "$OUT/index-failure-probes.log" 2>&1; then
-    probe_status=0
-  else
-    probe_status=$?
-  fi
-  printf '%s\n' "$probe_status" > "$OUT/index-failure-probes-status.txt"
+  run_diagnostic() {
+    local test_name=$1
+    if cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
+      --test "$test_name" -- --nocapture \
+      > "$OUT/$test_name.log" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    printf '%s\n' "$status" > "$OUT/$test_name-status.txt"
+  }
 
-  if cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
-    --test clustered_index_probe -- --nocapture \
-    > "$OUT/clustered-index-probe.log" 2>&1; then
-    clustered_status=0
-  else
-    clustered_status=$?
-  fi
-  printf '%s\n' "$clustered_status" > "$OUT/clustered-index-probe-status.txt"
+  run_diagnostic stale_hot_probe
+  run_diagnostic index_failure_probes
+  run_diagnostic clustered_index_probe
+  run_diagnostic index_model_audit
 
   cargo "+$RUST_VERSION" test -p mongreldb-core --all-features \
     --test index_after_update -- --nocapture
