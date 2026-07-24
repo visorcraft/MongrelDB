@@ -11,7 +11,7 @@ exec > >(tee -a "$OUT/driver.log") 2>&1
 set -x
 
 git worktree add --detach "$WORK" "$TARGET_SHA"
-for probe in index_model_audit index_failure_probes clustered_index_probe stale_hot_probe; do
+for probe in index_model_trace index_model_audit index_failure_probes clustered_index_probe stale_hot_probe; do
   cp ".github/perf-audit/$probe.rs" \
     "$WORK/crates/mongreldb-core/tests/$probe.rs"
 done
@@ -45,6 +45,7 @@ git archive --format=tar.gz --output="$OUT/mongreldb-e775-source.tar.gz" "$TARGE
     printf '%s\n' "$status" > "$OUT/$test_name-status.txt"
   }
 
+  run_diagnostic index_model_trace
   run_diagnostic stale_hot_probe
   run_diagnostic index_failure_probes
   run_diagnostic clustered_index_probe
