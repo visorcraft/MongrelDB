@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 : "${TARGET_SHA:?}"
 : "${RUST_VERSION:?}"
@@ -9,6 +9,9 @@ PRE_SHA=bb59eb8d7071a2c08e2d0084b11c1c82cb12a521
 FIX_SHA=295567a4b87956e7e990b412d65bb6ee5cb253c9
 OUT=/tmp/e775-p0
 mkdir -p "$OUT"
+exec > >(tee -a "$OUT/driver.log") 2>&1
+trap 'status=$?; echo "P0 harness failed at line $LINENO: $BASH_COMMAND (status $status)"; exit $status' ERR
+set -x
 
 prepare_variant() {
   local label=$1 sha=$2 dir="/tmp/e775-p0-$label"
@@ -52,7 +55,6 @@ extra = r'''
 '''
 path.write_text(text.replace(needle, extra + needle, 1))
 PY
-  cargo "+$RUST_VERSION" fmt --manifest-path "$dir/Cargo.toml"
 }
 
 prepare_variant base "$BASE_SHA"
