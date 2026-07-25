@@ -1,0 +1,115 @@
+name: Measure ca3 P0 and P2
+
+on:
+  push:
+    branches: [agent/measure-ca3-p0-p2]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  p0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run exact P0 split three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ca3-p0
+          for repetition in 1 2 3; do
+            echo "=== repetition $repetition ===" | tee -a /tmp/ca3-p0/p0.log
+            cargo +"$RUST_VERSION" test -p mongreldb-core --release \
+              --test p0_p2_bench p0_p2_split_benchmarks -- --nocapture \
+              2>&1 | tee -a /tmp/ca3-p0/p0.log
+          done
+          grep '"test":"p0_p2_split_benchmarks"' /tmp/ca3-p0/p0.log \
+            > /tmp/ca3-p0/results.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ca3-p0
+          path: /tmp/ca3-p0
+          if-no-files-found: error
+
+  p2-default:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: crates/mongreldb-server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-server
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run default standalone P2 three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ca3-p2-default
+          for repetition in 1 2 3; do
+            echo "=== repetition $repetition ===" | tee -a /tmp/ca3-p2-default/p2.log
+            cargo +"$RUST_VERSION" test --release --test scale_test \
+              loopback_point_query_p95_baseline -- --nocapture \
+              2>&1 | tee -a /tmp/ca3-p2-default/p2.log
+          done
+          grep '"test":"loopback_point_query"' /tmp/ca3-p2-default/p2.log \
+            > /tmp/ca3-p2-default/results.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ca3-p2-default
+          path: /tmp/ca3-p2-default
+          if-no-files-found: error
+
+  p2-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: crates/mongreldb-server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-server
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Run full-feature P2 three times
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ca3-p2-full
+          FEATURES=cluster,native-rpc,remote-embedding,oidc,vault-kms
+          for repetition in 1 2 3; do
+            echo "=== repetition $repetition ===" | tee -a /tmp/ca3-p2-full/p2.log
+            cargo +"$RUST_VERSION" test --release --features "$FEATURES" \
+              --test scale_test loopback_point_query_p95_baseline -- --nocapture \
+              2>&1 | tee -a /tmp/ca3-p2-full/p2.log
+          done
+          grep '"test":"loopback_point_query"' /tmp/ca3-p2-full/p2.log \
+            > /tmp/ca3-p2-full/results.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ca3-p2-full
+          path: /tmp/ca3-p2-full
+          if-no-files-found: error
