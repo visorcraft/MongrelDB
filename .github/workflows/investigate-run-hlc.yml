@@ -20,15 +20,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          out=/tmp/run-hlc-inventory.txt
-          {
-            echo '=== sorted-run APIs ==='
-            rg -n 'get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible|into_visible_version_cursor|visible_positions_with_rids|find_version_page' crates/mongreldb-core/src/sorted_run.rs || true
-            echo '=== call sites ==='
-            rg -n '\.(get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible|into_visible_version_cursor)\(' crates --glob '*.rs' || true
-            echo '=== existing HLC tests ==='
-            rg -n 'HLC|hlc|at_hlc|version_is_newer' crates/mongreldb-core/tests crates/mongreldb-core/src/sorted_run.rs crates/mongreldb-core/src/engine.rs | tail -300 || true
-          } | tee "$out"
+          python3 - <<'PY' | tee /tmp/run-hlc-inventory.txt
+          from pathlib import Path
+          import re
+
+          root = Path('crates')
+          patterns = [
+              'get_version', 'visible_versions', 'visible_rows', 'visible_indices',
+              'visible_indices_native', 'range_row_ids_visible_i64',
+              'range_row_ids_visible_f64', 'null_row_ids_visible',
+              'into_visible_version_cursor', 'visible_positions_with_rids',
+              'find_version_page',
+          ]
+          print('=== sorted-run APIs ===')
+          path = Path('crates/mongreldb-core/src/sorted_run.rs')
+          for number, line in enumerate(path.read_text().splitlines(), 1):
+              if any(pattern in line for pattern in patterns):
+                  print(f'{path}:{number}:{line}')
+
+          print('=== call sites ===')
+          call = re.compile(r'\.(?:' + '|'.join(map(re.escape, patterns[:8] + ['into_visible_version_cursor'])) + r')\(')
+          for path in sorted(root.rglob('*.rs')):
+              for number, line in enumerate(path.read_text().splitlines(), 1):
+                  if call.search(line):
+                      print(f'{path}:{number}:{line}')
+
+          print('=== existing HLC tests ===')
+          paths = list(Path('crates/mongreldb-core/tests').glob('*.rs')) + [
+              Path('crates/mongreldb-core/src/sorted_run.rs'),
+              Path('crates/mongreldb-core/src/engine.rs'),
+          ]
+          hits = []
+          for path in paths:
+              for number, line in enumerate(path.read_text().splitlines(), 1):
+                  if any(term in line for term in ('HLC', 'hlc', 'at_hlc', 'version_is_newer')):
+                      hits.append(f'{path}:{number}:{line}')
+          print('\n'.join(hits[-400:]))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: run-hlc-call-site-inventory
