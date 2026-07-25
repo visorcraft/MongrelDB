@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .github/scripts /tmp/run-hlc-validation
+          mkdir -p .github/scripts /tmp/run-hlc-validation/sources
           cat .github/run-hlc-parts/* | base64 -d > .github/scripts/apply_run_hlc_fix.py
           echo "$GENERATOR_SHA256  .github/scripts/apply_run_hlc_fix.py" | sha256sum --check -
           python3 .github/scripts/apply_run_hlc_fix.py
@@ -67,6 +67,12 @@ jobs:
             crates/mongreldb-core/src/engine.rs \
             crates/mongreldb-core/tests/sorted_run_hlc_visibility.rs \
             > /tmp/run-hlc-validation/run-hlc-fix.patch
+          cp crates/mongreldb-core/src/sorted_run.rs \
+            /tmp/run-hlc-validation/sources/sorted_run.rs
+          cp crates/mongreldb-core/src/engine.rs \
+            /tmp/run-hlc-validation/sources/engine.rs
+          cp crates/mongreldb-core/tests/sorted_run_hlc_visibility.rs \
+            /tmp/run-hlc-validation/sources/sorted_run_hlc_visibility.rs
       - name: Formatting and Clippy
         shell: bash
         run: |
