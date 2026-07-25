@@ -3779,6 +3779,47 @@ impl RunReader {
         Ok(out)
     }
 
+    /// Row ids whose newest visible version in this run at `snapshot` is a
+    /// tombstone (`deleted=true`). These rids must be subtracted from a
+    /// multi-run range survivor set, otherwise a tombstone landing in a
+    /// newer run can't strip its alive preimage from an older run that the
+    /// learned index (built only from run 0) or `range_row_ids_visible_i64`
+    /// happily returned.
+    pub fn tombstoned_row_ids(&mut self, snapshot: Epoch) -> Result<Vec<u64>> {
+        let n = self.row_count();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // Clean runs have no tombstones.
+        if self.is_clean()
+            && self.epoch_override.is_none()
+            && self.header.epoch_created <= snapshot.0
+        {
+            return Ok(Vec::new());
+        }
+        let (row_ids, epochs, deleted) = self.system_columns_native()?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let rid = row_ids[i] as u64;
+            let mut best: Option<usize> = None;
+            let mut j = i;
+            while j < n && row_ids[j] as u64 == rid {
+                if epochs[j] as u64 <= snapshot.0 {
+                    best = Some(j);
+                }
+                j += 1;
+            }
+            if let Some(b) = best {
+                if deleted[b] != 0 {
+                    out.push(rid);
+                }
+            }
+            i = j;
+        }
+        Ok(out)
+    }
+
     /// tombstones excluded) paired with each position's `RowId`, in one pass.
     /// Used by [`crate::cursor::NativePageCursor`] to map survivors to pages
     /// without re-decoding the system columns.
