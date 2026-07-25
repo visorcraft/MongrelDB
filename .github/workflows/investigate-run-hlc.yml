@@ -44,18 +44,30 @@ jobs:
             crates/mongreldb-core/tests/sorted_run_hlc_visibility.rs \
             > /tmp/run-hlc-validation/run-hlc-fix.patch
       - name: Formatting and Clippy
+        shell: bash
         run: |
-          cargo +"$RUST_VERSION" fmt --check
+          set -o pipefail
+          cargo +"$RUST_VERSION" fmt --check 2>&1 \
+            | tee /tmp/run-hlc-validation/fmt.log
           cargo +"$RUST_VERSION" clippy -p mongreldb-core \
-            --all-targets --all-features -- -D warnings
+            --all-targets --all-features -- -D warnings 2>&1 \
+            | tee /tmp/run-hlc-validation/clippy.log
       - name: Focused HLC regression tests
+        shell: bash
         run: |
+          set -o pipefail
           cargo +"$RUST_VERSION" test -p mongreldb-core --all-features \
-            --test sorted_run_hlc_visibility -- --nocapture
+            --test sorted_run_hlc_visibility -- --nocapture 2>&1 \
+            | tee /tmp/run-hlc-validation/focused.log
           cargo +"$RUST_VERSION" test -p mongreldb-core --all-features \
-            p05_t3 -- --nocapture
+            p05_t3 -- --nocapture 2>&1 \
+            | tee -a /tmp/run-hlc-validation/focused.log
       - name: Complete core suite
-        run: cargo +"$RUST_VERSION" test -p mongreldb-core --all-features
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +"$RUST_VERSION" test -p mongreldb-core --all-features 2>&1 \
+            | tee /tmp/run-hlc-validation/core-suite.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
