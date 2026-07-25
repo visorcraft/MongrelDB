@@ -35,6 +35,30 @@ jobs:
           cat .github/run-hlc-parts/* | base64 -d > .github/scripts/apply_run_hlc_fix.py
           echo "$GENERATOR_SHA256  .github/scripts/apply_run_hlc_fix.py" | sha256sum --check -
           python3 .github/scripts/apply_run_hlc_fix.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/mongreldb-core/src/sorted_run.rs')
+          source = path.read_text()
+          edits = [
+              (
+                  '    pub(crate) fn into_visible_version_cursor(\n',
+                  '    #[cfg(test)]\n    pub(crate) fn into_visible_version_cursor(\n',
+              ),
+              (
+                  '    fn find_version_page(\n',
+                  '    #[allow(dead_code)]\n    fn find_version_page(\n',
+              ),
+              (
+                  '            for index in lo..=hi {\n                let epoch = Epoch(epochs[index] as u64);\n',
+                  '            for (index, &epoch_value) in epochs.iter().enumerate().take(hi + 1).skip(lo) {\n                let epoch = Epoch(epoch_value as u64);\n',
+              ),
+          ]
+          for old, new in edits:
+              if source.count(old) != 1:
+                  raise SystemExit(f'expected one generated lint target, found {source.count(old)}: {old!r}')
+              source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
           cargo +"$RUST_VERSION" fmt
           git diff --check
           git diff --stat | tee /tmp/run-hlc-validation/diff-stat.txt
