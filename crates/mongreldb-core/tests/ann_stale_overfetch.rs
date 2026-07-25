@@ -2,8 +2,8 @@ use mongreldb_core::query::Retriever;
 use mongreldb_core::schema::{
     ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId,
 };
-use mongreldb_core::{Snapshot, Table, Value};
-use tempfile::tempdir;
+use mongreldb_core::{RowId, Snapshot, Table, Value};
+use tempfile::{tempdir, TempDir};
 
 fn schema() -> Schema {
     Schema {
@@ -39,32 +39,22 @@ fn schema() -> Schema {
     }
 }
 
-/// Regression probe for the fixed-size `AnnIndex::search_filtered` over-fetch
-/// window. Deleted HNSW nodes remain in the graph by design. More stale nearest
-/// neighbors than the over-fetch window must not hide the farther live row.
-#[test]
-fn stale_nearest_neighbors_do_not_exhaust_ann_overfetch() {
+fn saturated_cluster() -> (TempDir, Table, Vec<RowId>, RowId) {
     let directory = tempdir().unwrap();
     let mut table = Table::create(directory.path(), schema(), 1).unwrap();
-    let query = vec![1.0_f32; 8];
-
-    // k=1 currently fetches max(4*k, k+16) == 17 candidates per layer.
-    // Create far more exact stale neighbors so the first window can contain no
-    // visible row at all.
-    let mut stale = Vec::new();
+    let duplicate = vec![1.0_f32; 8];
+    let mut cluster = Vec::new();
     for id in 0..64_i64 {
-        stale.push(
+        cluster.push(
             table
                 .put(vec![
                     (1, Value::Int64(id)),
-                    (2, Value::Embedding(query.clone())),
+                    (2, Value::Embedding(duplicate.clone())),
                 ])
                 .unwrap(),
         );
     }
-
-    // The only row left live is deliberately farther from the query.
-    let survivor = table
+    let outlier = table
         .put(vec![
             (1, Value::Int64(10_000)),
             (2, Value::Embedding(vec![-1.0_f32; 8])),
@@ -72,7 +62,30 @@ fn stale_nearest_neighbors_do_not_exhaust_ann_overfetch() {
         .unwrap();
     table.commit().unwrap();
     table.flush().unwrap();
+    (directory, table, cluster, outlier)
+}
 
+/// Saturating every old node's neighbor list with identical vectors must not
+/// make a later, distant node unreachable from the graph entry point.
+#[test]
+fn late_outlier_remains_reachable_before_any_delete() {
+    let (_directory, mut table, _cluster, outlier) = saturated_cluster();
+    let hits = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![-1.0_f32; 8],
+            k: 1,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1, "late ANN outlier became unreachable");
+    assert_eq!(hits[0].row_id, outlier);
+}
+
+/// Deleted HNSW nodes remain in the graph by design. More stale nearest
+/// neighbors than the candidate window must not hide the farther live row.
+#[test]
+fn stale_nearest_neighbors_do_not_exhaust_ann_overfetch() {
+    let (_directory, mut table, stale, survivor) = saturated_cluster();
     for row_id in stale {
         table.delete(row_id).unwrap();
     }
@@ -86,7 +99,7 @@ fn stale_nearest_neighbors_do_not_exhaust_ann_overfetch() {
     let hits = table
         .retrieve(&Retriever::Ann {
             column_id: 2,
-            query,
+            query: vec![1.0_f32; 8],
             k: 1,
         })
         .unwrap();
@@ -94,7 +107,7 @@ fn stale_nearest_neighbors_do_not_exhaust_ann_overfetch() {
     assert_eq!(
         hits.len(),
         1,
-        "stale nearest graph nodes exhausted ANN's over-fetch window"
+        "stale nearest graph nodes exhausted ANN candidate discovery"
     );
     assert_eq!(hits[0].row_id, survivor);
 }
