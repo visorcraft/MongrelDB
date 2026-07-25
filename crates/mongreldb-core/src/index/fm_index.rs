@@ -428,7 +428,14 @@ impl FmIndex {
 
     pub fn locate(&self, pattern: &[u8]) -> Vec<RowId> {
         let mut seen = HashSet::new();
-        self.layers()
+        // Iterate the active segment FIRST so the newest version of any row
+        // id wins the dedup. A row that was put, tombstoned, then re-put
+        // with a fresh rid leaves the stale (text, rid) in a frozen segment
+        // and the live (text, rid') in the active segment — the active hit
+        // must survive the dedup, not the frozen one. MVCC above still
+        // drops tombstoned rids that have no live successor.
+        std::iter::once(&self.active)
+            .chain(self.frozen.iter().map(Arc::as_ref))
             .flat_map(|segment| segment.locate(pattern))
             .filter(|row_id| seen.insert(*row_id))
             .collect()

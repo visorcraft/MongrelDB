@@ -506,9 +506,11 @@ fn apply_put(table: &mut Table, harness: &mut Harness, pk: i64, cols: Vec<(u16, 
         .iter()
         .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
         .collect();
-    // Same-PK re-uses the rid: model mirrors engine upsert semantics.
+    // Engine's Table::put uses apply_put_row_single which tombstones a stale
+    // HOT entry and allocates a fresh rid. The model mirrors that with
+    // new_rid=true (which tombstones the old rid and hands out a new one).
     let already_live = harness.model.live_pks.contains_key(&pk);
-    harness.model.upsert(pk, reprs.clone(), false);
+    harness.model.upsert(pk, reprs.clone(), true);
     table.put(cols).unwrap();
     harness.record(Op::Put {
         pk,
@@ -541,7 +543,10 @@ fn apply_put_batch(table: &mut Table, harness: &mut Harness, rows: Vec<Vec<(u16,
                 _ => None,
             })
             .unwrap_or(0);
-        harness.model.upsert(pk, reprs.clone(), false);
+        // Engine's put_batch allocates fresh rids; mirror that with
+        // new_rid=true so the existing-rid branch tombstones the old row.
+        let existing = harness.model.live_pks.contains_key(&pk);
+        harness.model.upsert(pk, reprs.clone(), existing);
     }
     table.put_batch(rows).unwrap();
     harness.record(Op::PutBatch { pks, new_rids });
@@ -766,13 +771,24 @@ fn churn_oracle_fmindex() {
             let mut oracle_rids: Vec<u64> = oracle.iter().copied().collect();
             oracle_rids.sort_unstable();
             let op_log = &harness.log;
+            if engine_rids != oracle_rids {
+                eprintln!(
+                    "FM oracle diverged at step {step}\n\
+                     ENGINE BUG: <placeholder: FM index returns empty for a pattern that matches live rows>\n\
+                     op_log={op_log:?}\n\
+                     engine_rids={engine_rids:?}\n\
+                     oracle_rids={oracle_rids:?}\n\
+                     engine_hits_detail={engine_hits:?}"
+                );
+            }
             assert_eq!(
                 engine_rids, oracle_rids,
                 "FM oracle diverged at step {step}\n\
                  ENGINE BUG: <placeholder: FM index returns empty for a pattern that matches live rows>\n\
                  op_log={op_log:?}\n\
                  engine_rids={engine_rids:?}\n\
-                 oracle_rids={oracle_rids:?}"
+                 oracle_rids={oracle_rids:?}\n\
+                 engine_hits_detail={engine_hits:?}"
             );
         }
     }
@@ -923,13 +939,24 @@ fn churn_oracle_learned_range() {
             let mut oracle_rids: Vec<u64> = oracle.iter().copied().collect();
             oracle_rids.sort_unstable();
             let op_log = &harness.log;
+            if engine_rids != oracle_rids {
+                eprintln!(
+                    "LearnedRange oracle diverged at step {step}\n\
+                     ENGINE BUG: <placeholder: Range index returns empty even though the memtable has rows in range>\n\
+                     op_log={op_log:?}\n\
+                     engine_rids={engine_rids:?}\n\
+                     oracle_rids={oracle_rids:?}\n\
+                     engine_hits_detail={engine_hits:?}"
+                );
+            }
             assert_eq!(
                 engine_rids, oracle_rids,
                 "LearnedRange oracle diverged at step {step}\n\
                  ENGINE BUG: <placeholder: Range index returns empty even though the memtable has rows in range>\n\
                  op_log={op_log:?}\n\
                  engine_rids={engine_rids:?}\n\
-                 oracle_rids={oracle_rids:?}"
+                 oracle_rids={oracle_rids:?}\n\
+                 engine_hits_detail={engine_hits:?}"
             );
         }
     }
@@ -1130,13 +1157,32 @@ fn churn_oracle_ann_hnsw_dense() {
             let mut oracle_rids: Vec<u64> = oracle.iter().map(|(r, _)| *r).collect();
             oracle_rids.sort_unstable();
             let op_log = &harness.log;
+            if engine_rids != oracle_rids {
+                eprintln!(
+                    "ANN Dense oracle diverged at step {step}\n\
+                     ENGINE BUG: <placeholder: ANN Dense top-k returns empty even though the model has matching vectors>\n\
+                     op_log={op_log:?}\n\
+                     engine_rids={engine_rids:?}\n\
+                     oracle_rids={oracle_rids:?}\n\
+                     engine_hits_detail={:?}",
+                    engine_hits
+                        .iter()
+                        .map(|h| (h.row_id.0, format!("{:?}", h.score)))
+                        .collect::<Vec<_>>()
+                );
+            }
             assert_eq!(
                 engine_rids, oracle_rids,
                 "ANN Dense oracle diverged at step {step}\n\
                  ENGINE BUG: <placeholder: ANN Dense top-k returns empty even though the model has matching vectors>\n\
                  op_log={op_log:?}\n\
                  engine_rids={engine_rids:?}\n\
-                 oracle_rids={oracle_rids:?}"
+                 oracle_rids={oracle_rids:?}\n\
+                 engine_hits_detail={:?}",
+                engine_hits
+                    .iter()
+                    .map(|h| (h.row_id.0, format!("{:?}", h.score)))
+                    .collect::<Vec<_>>()
             );
             // Distances must be ascending (sanity on the engine ordering).
             for w in engine_hits.windows(2) {
