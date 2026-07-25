@@ -554,9 +554,12 @@ fn apply_put_batch(table: &mut Table, harness: &mut Harness, rows: Vec<Vec<(u16,
             })
             .unwrap_or(0);
         // Engine's put_batch allocates fresh rids; mirror that with
-        // new_rid=true so the existing-rid branch tombstones the old row.
-        let existing = harness.model.live_pks.contains_key(&pk);
-        harness.model.upsert(pk, reprs.clone(), existing);
+        // new_rid=true so any existing row at this PK is tombstoned.
+        let reprs: Vec<(u16, ValueRepr)> = cols
+            .iter()
+            .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
+            .collect();
+        harness.model.upsert(pk, reprs, true);
     }
     table.put_batch(rows).unwrap();
     harness.record(Op::PutBatch { pks, new_rids });
@@ -584,14 +587,16 @@ fn apply_delete_then_put(
         .iter()
         .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
         .collect();
-    let new_rid = harness.model.upsert(pk, reprs.clone(), true);
-    // Engine side: delete the row id, then put. Even if the original rid was
-    // unknown to the model (e.g. recovered from disk), use the row id we have.
+    // Engine side first: delete the row id, then put. Capture the engine's
+    // allocated rid from the put return value.
     if let Some(rid) = old_rid {
         table.delete(RowId(rid)).unwrap();
     }
-    table.put(cols).unwrap();
-    debug_assert!(new_rid > 0);
+    let engine_new_rid = table.put(cols).unwrap().0;
+    // Sync the model with the engine's actual rid allocation.
+    harness
+        .model
+        .upsert_with_rid(pk, reprs.clone(), true, engine_new_rid);
     harness.record(Op::DeleteThenPut { pk, cols: reprs });
 }
 
