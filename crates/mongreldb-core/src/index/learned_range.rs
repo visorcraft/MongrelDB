@@ -128,9 +128,39 @@ impl ColumnLearnedRange {
         if hi < lo || self.keys.is_empty() {
             return HashSet::new();
         }
-        let start = self.lower_bound(i64_key(lo));
-        let end = self.upper_bound(i64_key(hi));
-        self.row_ids[start..end].iter().copied().collect()
+        let lo_key = i64_key(lo);
+        let hi_key = i64_key(hi);
+        let start = self.lower_bound(lo_key);
+        let end = self.upper_bound(hi_key);
+        // PGM model miss safety: if the PGM window was so far off that the
+        // galloping still produced a degenerate `start > end` (or an empty
+        // result while keys clearly exist in `[lo_key, hi_key]`), fall back
+        // to a full linear scan so a learned-index miss never silently drops
+        // a row that the model should have served.
+        if start > end {
+            return self.linear_range(lo_key, hi_key);
+        }
+        let mut hits: HashSet<u64> = self.row_ids[start..end].iter().copied().collect();
+        if hits.is_empty() {
+            let fallback = self.linear_range(lo_key, hi_key);
+            if !fallback.is_empty() {
+                return fallback;
+            }
+        }
+        hits
+    }
+
+    /// Brute-force range scan over the sorted `(key, row_id)` arrays. Used
+    /// only as a PGM-miss safety net from [`Self::range`]; the hot path is
+    /// the PGM-seeded `lower_bound`/`upper_bound` window.
+    fn linear_range(&self, lo_key: u64, hi_key: u64) -> HashSet<u64> {
+        let mut hits = HashSet::new();
+        for (k, rid) in self.keys.iter().zip(self.row_ids.iter()) {
+            if *k >= lo_key && *k <= hi_key {
+                hits.insert(*rid);
+            }
+        }
+        hits
     }
 
     /// Build from `(f64_value, row_id)` pairs (Phase 13.3).

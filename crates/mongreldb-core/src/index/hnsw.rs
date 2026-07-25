@@ -559,6 +559,12 @@ impl DenseHnsw {
     /// k-nearest neighbors of `query` (cosine distance). `ef` controls beam
     /// width (larger ⇒ higher recall).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(RowId, f32)> {
+        // Floor the beam at 2·k (not just k): the engine's candidate-cap loop
+        // starts the first ANN probe at exactly k, which starves recall on
+        // small top-k queries — the beam finishes before the graph's
+        // closer-than-current-worst neighbors get expanded. 2·k matches the
+        // recall budget used in the dense recall test.
+        let ef = ef.max(k.saturating_mul(2));
         self.search_with_context(query, k, ef, None)
             .expect("context-free dense HNSW search cannot fail")
     }
