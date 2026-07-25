@@ -20,9 +20,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo '=== sorted-run APIs ==='
-          rg -n 'pub (fn|\(crate\) fn) (get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible)|into_visible_version_cursor|visible_positions_with_rids|find_version_page' crates/mongreldb-core/src/sorted_run.rs
-          echo '=== call sites ==='
-          rg -n '\.(get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible|into_visible_version_cursor)\(' crates --glob '*.rs'
-          echo '=== existing HLC tests ==='
-          rg -n 'HLC|hlc|at_hlc|version_is_newer' crates/mongreldb-core/tests crates/mongreldb-core/src/sorted_run.rs crates/mongreldb-core/src/engine.rs | tail -300
+          out=/tmp/run-hlc-inventory.txt
+          {
+            echo '=== sorted-run APIs ==='
+            rg -n 'get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible|into_visible_version_cursor|visible_positions_with_rids|find_version_page' crates/mongreldb-core/src/sorted_run.rs || true
+            echo '=== call sites ==='
+            rg -n '\.(get_version|visible_versions|visible_rows|visible_indices|visible_indices_native|range_row_ids_visible_i64|range_row_ids_visible_f64|null_row_ids_visible|into_visible_version_cursor)\(' crates --glob '*.rs' || true
+            echo '=== existing HLC tests ==='
+            rg -n 'HLC|hlc|at_hlc|version_is_newer' crates/mongreldb-core/tests crates/mongreldb-core/src/sorted_run.rs crates/mongreldb-core/src/engine.rs | tail -300 || true
+          } | tee "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: run-hlc-call-site-inventory
+          path: /tmp/run-hlc-inventory.txt
+          if-no-files-found: error
