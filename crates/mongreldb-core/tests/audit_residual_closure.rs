@@ -275,12 +275,13 @@ fn r4_delete_then_put_same_pk_bitmap_lists_one_live() {
     assert_eq!(counted, 1);
 }
 
-/// Point get skips runs outside the RowId range directory.
+/// Point get skips runs outside the RowId range directory — proven via
+/// `get_run_skipped` / `get_run_opened` counters on the shipped metrics path.
 #[test]
 fn get_skips_runs_outside_row_id_range_directory() {
     let dir = tempdir().unwrap();
     let mut db = Table::create(dir.path(), city_schema(), 1).unwrap();
-    // Run 1: ids 0..20
+    // Run 1: sequential rids for pk 0..20
     for i in 0..20 {
         db.put(vec![
             (1, Value::Int64(i)),
@@ -290,8 +291,7 @@ fn get_skips_runs_outside_row_id_range_directory() {
     }
     db.commit().unwrap();
     db.force_flush().unwrap();
-    // Run 2: ids 1000..1020 (non-overlapping rid space after allocator advance
-    // is not guaranteed — RowIds are sequential. Force via bulk of middle rows.)
+    // Run 2: next sequential rids (non-overlapping ranges on disk).
     for i in 20..40 {
         db.put(vec![
             (1, Value::Int64(i)),
@@ -303,16 +303,109 @@ fn get_skips_runs_outside_row_id_range_directory() {
     db.force_flush().unwrap();
 
     let snap = db.snapshot();
-    // First and last live rids must be findable.
     let first = db
         .query(&Query::new().and(Condition::Pk(Value::Int64(0).encode_key())))
         .unwrap();
     assert_eq!(first.len(), 1);
     let rid = first[0].row_id;
+    let before = db.lookup_metrics_snapshot();
     let got = db.get(rid, snap).expect("get must find row in range");
     assert!(!got.deleted);
+    let mid = db.lookup_metrics_snapshot();
+    // In-range get opens at least one run.
+    assert!(
+        mid.get_run_opened > before.get_run_opened,
+        "in-range get must open at least one run"
+    );
 
-    // Out-of-range synthetic rid must not panic and returns None.
+    // Out-of-range rid: both runs' ranges exclude it → both skipped, zero opens.
+    let before_miss = db.lookup_metrics_snapshot();
     let missing = db.get(mongreldb_core::RowId(u64::MAX / 2), snap);
     assert!(missing.is_none());
+    let after_miss = db.lookup_metrics_snapshot();
+    let skipped = after_miss.get_run_skipped - before_miss.get_run_skipped;
+    let opened = after_miss.get_run_opened - before_miss.get_run_opened;
+    assert!(
+        skipped >= 2,
+        "out-of-range get must skip both runs via range directory (skipped={skipped})"
+    );
+    assert_eq!(
+        opened, 0,
+        "out-of-range get must not open_reader any run (opened={opened})"
+    );
+}
+
+/// Multi-pin rebuild: a newer pin that observed a row the oldest pin never
+/// saw must still discover it via BitmapEq after compact/rebuild.
+#[test]
+fn multi_pin_compact_preserves_newer_pin_bitmap_eq() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), city_schema(), 1).unwrap();
+    // Baseline rows.
+    for i in 0..10 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(b"alpha".to_vec())),
+        ])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.force_flush().unwrap();
+
+    let pin_a = db.pin_snapshot(); // oldest: does not see the next insert
+
+    // Insert a row only pin B will observe as live before delete.
+    db.put(vec![
+        (1, Value::Int64(999)),
+        (2, Value::Bytes(b"alpha".to_vec())),
+    ])
+    .unwrap();
+    db.commit().unwrap();
+    db.force_flush().unwrap();
+
+    let pin_b = db.pin_snapshot(); // sees 999 live
+
+    // Delete 999 after pin B — current snap loses it; pin B must retain it.
+    let doomed = db
+        .query(&Query::new().and(Condition::Pk(Value::Int64(999).encode_key())))
+        .unwrap();
+    assert_eq!(doomed.len(), 1);
+    db.delete(doomed[0].row_id).unwrap();
+    db.commit().unwrap();
+    db.force_flush().unwrap();
+
+    // Second run so compact has work.
+    for i in 100..110 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(b"beta".to_vec())),
+        ])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.force_flush().unwrap();
+    db.compact().unwrap();
+
+    let count_b = db
+        .count_conditions(std::slice::from_ref(&alpha_cond()), pin_b)
+        .unwrap()
+        .unwrap();
+    let rows_b = db
+        .query_at_with_allowed(&Query::new().and(alpha_cond()), pin_b, None)
+        .unwrap();
+    assert_eq!(count_b, rows_b.len() as u64);
+    // pin B pre-delete saw 11 alphas (10 baseline + 999).
+    assert_eq!(
+        count_b, 11,
+        "newer pin B must still discover deleted-after-pin row via Bitmap"
+    );
+    // pin A never saw 999 → 10 alphas.
+    let count_a = db
+        .count_conditions(std::slice::from_ref(&alpha_cond()), pin_a)
+        .unwrap()
+        .unwrap();
+    assert_eq!(count_a, 10);
+
+    db.unpin_snapshot(pin_b);
+    db.unpin_snapshot(pin_a);
 }

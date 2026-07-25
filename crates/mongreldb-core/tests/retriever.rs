@@ -340,13 +340,10 @@ fn churn_oracle_topk_matches_visible_brute_force() {
 
     let decode_set = |v: &Value| -> HashSet<String> {
         match v {
-            Value::Bytes(b) => bincode::deserialize::<Vec<SetMember>>(b)
+            // `members()` stores a JSON string array (see helper above).
+            Value::Bytes(b) => serde_json::from_slice::<Vec<String>>(b)
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|m| match m {
-                    SetMember::String(s) => Some(s),
-                    _ => None,
-                })
                 .collect(),
             _ => HashSet::new(),
         }
@@ -493,31 +490,25 @@ fn churn_oracle_topk_matches_visible_brute_force() {
                 k,
             })
             .unwrap();
+        // Sparse scoring is exact (dot product): require full top-k match.
+        assert_eq!(
+            sparse_hits.len(),
+            sparse_o.len().min(k),
+            "cycle {cycle}: Sparse returned {} vs oracle {}",
+            sparse_hits.len(),
+            sparse_o.len()
+        );
         assert!(
             !sparse_hits.is_empty(),
             "cycle {cycle}: Sparse must be non-empty"
         );
-        assert!(
-            sparse_hits.len() <= k,
-            "cycle {cycle}: Sparse returned more than k"
-        );
-        // Top-1 must match oracle top-1 (strict ranking check for best hit).
+        let sparse_ids: Vec<_> = sparse_hits.iter().map(|h| h.row_id).collect();
         assert_eq!(
-            sparse_hits[0].row_id, sparse_o[0],
-            "cycle {cycle}: Sparse top-1 != oracle"
+            sparse_ids,
+            sparse_o[..sparse_ids.len()],
+            "cycle {cycle}: Sparse full top-k {sparse_ids:?} != oracle {:?}",
+            &sparse_o[..sparse_ids.len()]
         );
-        for hit in &sparse_hits {
-            assert!(
-                sparse_o.contains(&hit.row_id) || {
-                    // Remaining slots may order-tie; require liveness + positive score.
-                    table
-                        .get(hit.row_id, mongreldb_core::Snapshot::unbounded())
-                        .is_some_and(|r| !r.deleted)
-                },
-                "cycle {cycle}: Sparse hit {} not live/oracle",
-                hit.row_id.0
-            );
-        }
 
         let minhash_hits = table
             .retrieve(&Retriever::MinHash {
@@ -532,23 +523,32 @@ fn churn_oracle_topk_matches_visible_brute_force() {
             "cycle {cycle}: MinHash returned {} not k={k} (stale budget ate recall)",
             minhash_hits.len()
         );
-        // MinHash is approximate LSH: require non-empty full-k of live rows,
-        // and that top-1 is among the exact-Jaccard oracle top-k (not a
-        // tombstone / far-set row).
-        let minhash_o_set: HashSet<_> = minhash_o.iter().copied().collect();
+        // MinHash is approximate LSH: senior bar is full-k of *max-quality*
+        // live matches (exact Jaccard of every hit equals the oracle top
+        // score), not rid-order identity. With our layout oracle top-k are
+        // all J=1 exact-set rows; LSH may pick any of the exact-set rids.
+        let qset: HashSet<String> = ["a", "b", "c", "d"].into_iter().map(String::from).collect();
+        let oracle_top_j = {
+            let visible = table.query(&Query::new()).unwrap();
+            let row = visible
+                .iter()
+                .find(|r| r.row_id == minhash_o[0])
+                .expect("oracle top row visible");
+            jaccard(&qset, &decode_set(row.columns.get(&4).expect("members")))
+        };
         assert!(
-            minhash_o_set.contains(&minhash_hits[0].row_id),
-            "cycle {cycle}: MinHash top-1 {:?} not in oracle top-k {:?}",
-            minhash_hits[0].row_id,
-            minhash_o
+            (oracle_top_j - 1.0).abs() < 1e-9,
+            "cycle {cycle}: test data expects oracle top Jaccard=1, got {oracle_top_j}"
         );
         for hit in &minhash_hits {
-            let live = table
+            let row = table
                 .get(hit.row_id, mongreldb_core::Snapshot::unbounded())
-                .map(|row| !row.deleted);
+                .expect("MinHash hit must materialize");
+            assert!(!row.deleted, "cycle {cycle}: MinHash tombstone {}", hit.row_id.0);
+            let j = jaccard(&qset, &decode_set(row.columns.get(&4).expect("members")));
             assert!(
-                live.unwrap_or(false),
-                "cycle {cycle}: MinHash returned tombstoned rid {}",
+                (j - oracle_top_j).abs() < 1e-9,
+                "cycle {cycle}: MinHash hit {} Jaccard {j} < oracle top {oracle_top_j}",
                 hit.row_id.0
             );
         }

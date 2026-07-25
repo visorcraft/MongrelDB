@@ -126,17 +126,21 @@ impl ControlledVisibleCandidate {
 }
 
 enum ControlledVisibleCursor {
-    /// Newest-visible overlay rows, ordered by RowId. Produced by a streaming
-    /// fold that yields one row at a time rather than requiring the controlled
-    /// scan caller to hold a second full-table copy beyond the source iterator.
+    /// Newest-visible overlay rows, ordered by RowId (full source already small).
     Memory(std::vec::IntoIter<Row>),
-    /// Batch-bounded overlay: only `batch_cap` rows are retained at a time;
-    /// the remainder is held as a deferred `Vec` drained into the active iter
-    /// when exhausted. Bounds peak merge-side allocation for large overlays.
-    MemoryBatched {
+    /// Batch-bounded overlay drain of a `BTreeMap` of newest-per-rid rows.
+    /// Only `batch_cap` rows live in the active merge buffer at once; the
+    /// remainder stays in the ordered map iterator (no full intermediate `Vec`).
+    MemoryStreaming {
         active: std::vec::IntoIter<Row>,
-        rest: Vec<Row>,
+        rest: std::collections::btree_map::IntoValues<RowId, Row>,
         batch_cap: usize,
+        /// Peak active-buffer length observed (for structural tests).
+        #[allow(dead_code)]
+        peak_active: usize,
+        /// Total rows that will be yielded (map size at construction).
+        #[allow(dead_code)]
+        total: usize,
     },
     Run(Box<RunVisibleVersionCursor>),
     #[cfg(test)]
@@ -155,23 +159,38 @@ struct ControlledVisibleSource {
 }
 
 impl ControlledVisibleSource {
+    /// Test/helper: wrap a pre-built row list (small fixtures only).
+    #[cfg(test)]
     fn memory(rows: Vec<Row>) -> Self {
-        // Batch-bound large overlays so the controlled merge does not keep the
-        // entire hot-tier Vec live as a single contiguous merge buffer.
-        if rows.len() > CONTROLLED_HOT_BATCH {
-            let mut rows = rows;
-            let rest = rows.split_off(CONTROLLED_HOT_BATCH.min(rows.len()));
+        Self {
+            cursor: ControlledVisibleCursor::Memory(rows.into_iter()),
+            current: None,
+        }
+    }
+
+    /// Stream newest-visible hot-tier rows from an ordered map without first
+    /// collecting a full intermediate `Vec`. Only `CONTROLLED_HOT_BATCH` rows
+    /// occupy the active merge buffer at a time.
+    fn memory_from_map(map: BTreeMap<RowId, Row>) -> Self {
+        let total = map.len();
+        let mut values = map.into_values();
+        if total > CONTROLLED_HOT_BATCH {
+            let active: Vec<Row> = values.by_ref().take(CONTROLLED_HOT_BATCH).collect();
+            let peak = active.len();
             Self {
-                cursor: ControlledVisibleCursor::MemoryBatched {
-                    active: rows.into_iter(),
-                    rest,
+                cursor: ControlledVisibleCursor::MemoryStreaming {
+                    active: active.into_iter(),
+                    rest: values,
                     batch_cap: CONTROLLED_HOT_BATCH,
+                    peak_active: peak,
+                    total,
                 },
                 current: None,
             }
         } else {
+            let active: Vec<Row> = values.collect();
             Self {
-                cursor: ControlledVisibleCursor::Memory(rows.into_iter()),
+                cursor: ControlledVisibleCursor::Memory(active.into_iter()),
                 current: None,
             }
         }
@@ -197,21 +216,25 @@ impl ControlledVisibleSource {
             ControlledVisibleCursor::Memory(rows) => {
                 rows.next().map(ControlledVisibleCandidate::Memory)
             }
-            ControlledVisibleCursor::MemoryBatched {
+            ControlledVisibleCursor::MemoryStreaming {
                 active,
                 rest,
                 batch_cap,
+                peak_active,
+                total: _,
             } => {
                 if let Some(row) = active.next() {
                     Some(ControlledVisibleCandidate::Memory(row))
-                } else if rest.is_empty() {
-                    None
                 } else {
                     control.checkpoint()?;
-                    let take = (*batch_cap).min(rest.len());
-                    let next_batch: Vec<Row> = rest.drain(..take).collect();
-                    *active = next_batch.into_iter();
-                    active.next().map(ControlledVisibleCandidate::Memory)
+                    let next_batch: Vec<Row> = rest.by_ref().take(*batch_cap).collect();
+                    if next_batch.is_empty() {
+                        None
+                    } else {
+                        *peak_active = (*peak_active).max(next_batch.len());
+                        *active = next_batch.into_iter();
+                        active.next().map(ControlledVisibleCandidate::Memory)
+                    }
                 }
             }
             ControlledVisibleCursor::Run(cursor) => cursor
@@ -256,8 +279,24 @@ impl ControlledVisibleSource {
     }
 
     #[cfg(test)]
-    fn is_batched_memory(&self) -> bool {
-        matches!(self.cursor, ControlledVisibleCursor::MemoryBatched { .. })
+    fn is_streaming_memory(&self) -> bool {
+        matches!(self.cursor, ControlledVisibleCursor::MemoryStreaming { .. })
+    }
+
+    #[cfg(test)]
+    fn streaming_peak_active(&self) -> Option<usize> {
+        match &self.cursor {
+            ControlledVisibleCursor::MemoryStreaming { peak_active, .. } => Some(*peak_active),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn streaming_total(&self) -> Option<usize> {
+        match &self.cursor {
+            ControlledVisibleCursor::MemoryStreaming { total, .. } => Some(*total),
+            _ => None,
+        }
     }
 }
 
@@ -543,14 +582,53 @@ mod controlled_visible_cursor_tests {
     }
 
     #[test]
-    fn controlled_memory_source_batches_large_overlays() {
-        let rows: Vec<Row> = (1..=500)
-            .map(|i| Row::new(RowId(i), Epoch(1)).with_column(1, Value::Int64(i as i64)))
-            .collect();
-        let source = ControlledVisibleSource::memory(rows);
+    fn controlled_memory_source_streams_large_overlays_without_full_active_vec() {
+        let mut map = BTreeMap::new();
+        for i in 1..=500u64 {
+            map.insert(
+                RowId(i),
+                Row::new(RowId(i), Epoch(1)).with_column(1, Value::Int64(i as i64)),
+            );
+        }
+        let source = ControlledVisibleSource::memory_from_map(map);
         assert!(
-            source.is_batched_memory(),
-            "overlays larger than CONTROLLED_HOT_BATCH must use batched cursor"
+            source.is_streaming_memory(),
+            "overlays larger than CONTROLLED_HOT_BATCH must use streaming cursor"
+        );
+        assert_eq!(source.streaming_total(), Some(500));
+        // Active buffer is capped — never holds the full 500-row set at once.
+        assert!(
+            source.streaming_peak_active().unwrap_or(usize::MAX) <= CONTROLLED_HOT_BATCH,
+            "peak active buffer must be <= CONTROLLED_HOT_BATCH"
+        );
+
+        // Drain fully and re-check peak never exceeds the batch cap.
+        let control = crate::ExecutionControl::new(None);
+        let mut sources = vec![ControlledVisibleSource::memory_from_map({
+            let mut m = BTreeMap::new();
+            for i in 1..=500u64 {
+                m.insert(
+                    RowId(i),
+                    Row::new(RowId(i), Epoch(1)).with_column(1, Value::Int64(i as i64)),
+                );
+            }
+            m
+        })];
+        let mut n = 0usize;
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |_| {
+                n += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(n, 500);
+        assert!(
+            sources[0].streaming_peak_active().unwrap_or(0) <= CONTROLLED_HOT_BATCH,
+            "after full drain peak active still <= batch cap"
         );
     }
 }
@@ -1151,6 +1229,9 @@ struct LookupMetrics {
     result_cache_disk_hit: std::sync::atomic::AtomicU64,
     result_cache_miss: std::sync::atomic::AtomicU64,
     result_cache_persistent_write_us: std::sync::atomic::AtomicU64,
+    /// Point-get run probes: opened vs skipped via `run_row_id_ranges`.
+    get_run_opened: std::sync::atomic::AtomicU64,
+    get_run_skipped: std::sync::atomic::AtomicU64,
 }
 
 impl Clone for LookupMetrics {
@@ -1184,6 +1265,14 @@ impl Clone for LookupMetrics {
                 self.result_cache_persistent_write_us
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            get_run_opened: std::sync::atomic::AtomicU64::new(
+                self.get_run_opened
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            get_run_skipped: std::sync::atomic::AtomicU64::new(
+                self.get_run_skipped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -1211,6 +1300,12 @@ impl LookupMetrics {
             result_cache_persistent_write_us: self
                 .result_cache_persistent_write_us
                 .load(std::sync::atomic::Ordering::Relaxed),
+            get_run_opened: self
+                .get_run_opened
+                .load(std::sync::atomic::Ordering::Relaxed),
+            get_run_skipped: self
+                .get_run_skipped
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -1227,6 +1322,8 @@ pub struct LookupMetricsSnapshot {
     pub result_cache_disk_hit: u64,
     pub result_cache_miss: u64,
     pub result_cache_persistent_write_us: u64,
+    pub get_run_opened: u64,
+    pub get_run_skipped: u64,
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -3180,44 +3277,46 @@ impl Table {
                 self.index_row(&row);
             }
         }
-        // Pin-aware historical discovery: pure deletes keep Bitmap memberships
-        // so older pins can still resolve rids. A live-only rebuild would drop
-        // those memberships; re-index versions that are still visible to the
-        // oldest active pin even if tombstoned at Epoch::MAX (Bitmap only —
-        // do not re-bind HOT to a tombstoned PK).
-        if let Some(min_pin) = self.min_active_snapshot() {
-            let pin_snap = Snapshot::at(min_pin);
+        // Pin-aware historical discovery for EVERY active pin (not only the
+        // oldest). Compact may retain born-then-deleted versions for newer pins
+        // that the oldest pin never observed; live-only rebuild would drop
+        // those Bitmap memberships. Re-index Bitmap for each pin's visible
+        // live pre-image of rids that are not live at Epoch::MAX.
+        let pin_epochs = self.active_local_pin_epochs();
+        if !pin_epochs.is_empty() {
             let current_snap = Snapshot::at(Epoch(u64::MAX));
-            let mut historical: Vec<Row> = Vec::new();
-            for rr in self.run_refs.clone() {
+            for pin_epoch in pin_epochs {
                 if let Some(control) = control {
                     control.checkpoint()?;
                 }
-                let mut reader = self.open_reader(rr.run_id)?;
-                for row in reader.visible_rows(min_pin)? {
+                let pin_snap = Snapshot::at(pin_epoch);
+                for rr in self.run_refs.clone() {
+                    if let Some(control) = control {
+                        control.checkpoint()?;
+                    }
+                    let mut reader = self.open_reader(rr.run_id)?;
+                    for row in reader.visible_rows(pin_epoch)? {
+                        if row.deleted || self.row_expired_at(&row, ttl_now) {
+                            continue;
+                        }
+                        if self.get(row.row_id, current_snap).is_none() {
+                            self.index_bitmap_membership_only(&row);
+                        }
+                    }
+                }
+                for row in self
+                    .mutable_run
+                    .visible_versions_at(pin_snap)
+                    .into_iter()
+                    .chain(self.memtable.visible_versions_at(pin_snap))
+                {
                     if row.deleted || self.row_expired_at(&row, ttl_now) {
                         continue;
                     }
                     if self.get(row.row_id, current_snap).is_none() {
-                        historical.push(row);
+                        self.index_bitmap_membership_only(&row);
                     }
                 }
-            }
-            for row in self
-                .mutable_run
-                .visible_versions_at(pin_snap)
-                .into_iter()
-                .chain(self.memtable.visible_versions_at(pin_snap))
-            {
-                if row.deleted || self.row_expired_at(&row, ttl_now) {
-                    continue;
-                }
-                if self.get(row.row_id, current_snap).is_none() {
-                    historical.push(row);
-                }
-            }
-            for row in historical {
-                self.index_bitmap_membership_only(&row);
             }
         }
         self.recent_delete_preimages.clear();
@@ -5719,9 +5818,15 @@ impl Table {
             // from run headers on open/spill). Missing range falls through.
             if let Some(&(min_rid, max_rid)) = self.run_row_id_ranges.get(&rr.run_id) {
                 if row_id.0 < min_rid || row_id.0 > max_rid {
+                    self.lookup_metrics
+                        .get_run_skipped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
             }
+            self.lookup_metrics
+                .get_run_opened
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Ok(mut reader) = self.open_reader(rr.run_id) else {
                 continue;
             };
@@ -5777,17 +5882,18 @@ impl Table {
     {
         let mut sources = Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
-        // Pass the full snapshot so HLC-stamped memtable versions are observed.
-        let memtable = self.memtable.visible_versions_at(snapshot);
-        if !memtable.is_empty() {
-            sources.push(ControlledVisibleSource::memory(memtable));
+        // Stream newest-per-rid from ordered maps (batch-bounded active buffer).
+        // No full intermediate Vec of all hot-tier rows before the k-way merge.
+        let memtable_map = self.memtable.newest_visible_map(snapshot);
+        if !memtable_map.is_empty() {
+            sources.push(ControlledVisibleSource::memory_from_map(memtable_map));
         }
         control.checkpoint()?;
         // Mutable-run is HLC-aware (P0.5-T3); still re-check observes_row for
         // epoch-keyed sorted-run materialisation below.
-        let mutable = self.mutable_run.visible_versions_at(snapshot);
-        if !mutable.is_empty() {
-            sources.push(ControlledVisibleSource::memory(mutable));
+        let mutable_map = self.mutable_run.newest_visible_map(snapshot);
+        if !mutable_map.is_empty() {
+            sources.push(ControlledVisibleSource::memory_from_map(mutable_map));
         }
         for run in &self.run_refs {
             control.checkpoint()?;
@@ -9125,6 +9231,13 @@ impl Table {
         let snap = self.snapshot();
         *self.pinned.entry(snap.epoch).or_insert(0) += 1;
         snap
+    }
+
+    /// Every epoch currently held by the standalone [`Self::pin_snapshot`] API,
+    /// sorted ascending. Used by pin-aware index rebuild so multi-pin tables
+    /// restore Bitmap discovery for newer pins, not only the oldest.
+    fn active_local_pin_epochs(&self) -> Vec<Epoch> {
+        self.pinned.keys().copied().collect()
     }
 
     /// P0.5-T6: report the HLC GC floor as named pin sources.

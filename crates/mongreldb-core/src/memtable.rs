@@ -346,6 +346,16 @@ impl Memtable {
     }
 
     pub fn visible_versions_at(&self, snapshot: crate::epoch::Snapshot) -> Vec<Row> {
+        self.newest_visible_map(snapshot).into_values().collect()
+    }
+
+    /// Newest visible version per `RowId` as an ordered map (ascending RowId).
+    /// Callers that need to stream into a controlled merge without a second
+    /// full `Vec` should drain this map in batches rather than collecting.
+    pub(crate) fn newest_visible_map(
+        &self,
+        snapshot: crate::epoch::Snapshot,
+    ) -> BTreeMap<RowId, Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
         for segment in self
             .frozen
@@ -372,7 +382,7 @@ impl Memtable {
                     .or_insert(row);
             }
         }
-        by_row.into_values().collect()
+        by_row
     }
 
     /// Freeze the current write delta so future clones share it by `Arc`.

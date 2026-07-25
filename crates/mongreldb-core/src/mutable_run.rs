@@ -157,6 +157,13 @@ impl MutableRun {
     /// Newest visible version per `RowId` under a full [`Snapshot`], including
     /// tombstones. HLC-stamped versions use HLC order (P0.5-T3).
     pub fn visible_versions_at(&self, snapshot: Snapshot) -> Vec<Row> {
+        self.newest_visible_map(snapshot).into_values().collect()
+    }
+
+    /// Newest visible version per `RowId` as an ordered map (ascending RowId).
+    /// Prefer draining this in batches for controlled scans instead of a full
+    /// intermediate `Vec`.
+    pub(crate) fn newest_visible_map(&self, snapshot: Snapshot) -> BTreeMap<RowId, Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
         for pma in self
             .frozen
@@ -183,7 +190,7 @@ impl MutableRun {
                     .or_insert_with(|| row.clone());
             }
         }
-        by_row.into_values().collect()
+        by_row
     }
 
     pub(crate) fn seal(&mut self) {
