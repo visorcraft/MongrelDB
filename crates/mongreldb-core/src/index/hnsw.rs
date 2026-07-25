@@ -579,13 +579,34 @@ impl DenseHnsw {
         let Some(entry) = self.entry else {
             return Ok(Vec::new());
         };
+        let ef = ef.max(k);
+        if ef >= self.vectors.len() {
+            let mut results = Vec::with_capacity(self.vectors.len());
+            for (node, vector) in self.vectors.iter().enumerate() {
+                if let Some(context) = context {
+                    context.consume(crate::query::work_units(
+                        self.dim,
+                        crate::query::FLOAT_WORK_QUANTUM,
+                    ))?;
+                }
+                results.push((cosine_distance(query, vector), node));
+            }
+            results.sort_by(|(da, na), (db, nb)| {
+                da.total_cmp(db)
+                    .then_with(|| self.row_ids[*na].cmp(&self.row_ids[*nb]))
+            });
+            return Ok(results
+                .into_iter()
+                .take(k)
+                .map(|(distance, node)| (self.row_ids[node], distance))
+                .collect());
+        }
         if let Some(context) = context {
             context.consume(crate::query::work_units(
                 self.dim,
                 crate::query::FLOAT_WORK_QUANTUM,
             ))?;
         }
-        let ef = ef.max(k);
         let mut ep: Vec<(f32, usize)> = vec![(cosine_distance(query, &self.vectors[entry]), entry)];
         for lc in (1..=self.max_level).rev() {
             ep = self.search_layer_with_context(query, ep, 1, lc, context)?;
