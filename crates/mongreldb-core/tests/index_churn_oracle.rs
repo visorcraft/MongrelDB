@@ -3,8 +3,8 @@
 //! The Bitmap churn oracle in `audit_residual_closure.rs` is good for the
 //! roaring secondary, but the public AI index families (FM, LearnedRange,
 //! Sparse, MinHash, ANN) each have their own scoring + visibility rules
-//! and require a richer oracle: an in-test model of `(pk, rid, deleted,
-//! version history, indexed values)` that is updated in lockstep with every
+//! and require a richer oracle: an in-test model of `(pk, rid, commit_epoch,
+//! delete_epoch, indexed values)` that is updated in lockstep with every
 //! `Table` operation, so any divergence between the engine and the model
 //! fails the test loudly.
 //!
@@ -135,15 +135,24 @@ impl ValueRepr {
 }
 
 // ---------------------------------------------------------------------------
-// Test-owned model. Tracks every (pk, rid, deleted, columns) tuple so the
-// oracle answer is computed from the model — never from `Table::visible_rows`.
+// Test-owned model. Tracks every (pk, rid, commit_epoch, delete_epoch, cols)
+// tuple so the oracle answer is computed from the model — never from
+// `Table::visible_rows`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct ModelRow {
     pk: i64,
     rid: u64,
-    deleted: bool,
+    /// Epoch at which the row's CURRENT columns became committed (insert or
+    /// update). Mirrors `engine.pending_epoch()` at write time. A snapshot at
+    /// `snap.epoch` only observes the row's current state when this value is
+    /// `<= snap.epoch`.
+    commit_epoch: Epoch,
+    /// Epoch at which the row was tombstoned. `None` while the row is alive.
+    /// A snapshot at `snap.epoch` observes the tombstone when this value is
+    /// `<= snap.epoch` (the delete had already happened by that snapshot).
+    delete_epoch: Option<Epoch>,
     cols: BTreeMap<u16, ValueRepr>,
 }
 
@@ -173,7 +182,13 @@ impl Model {
 
     /// Insert or update: same-PK re-uses the existing rid (upsert); an
     /// explicit `new_rid` flag forces a fresh rid (Kit update shape).
-    fn upsert(&mut self, pk: i64, cols: Vec<(u16, ValueRepr)>, new_rid: bool) -> u64 {
+    fn upsert(
+        &mut self,
+        pk: i64,
+        cols: Vec<(u16, ValueRepr)>,
+        new_rid: bool,
+        commit_epoch: Epoch,
+    ) -> u64 {
         let rid = if new_rid {
             self.fresh_rid()
         } else if let Some(existing) = self.live_pks.get(&pk).copied() {
@@ -181,7 +196,7 @@ impl Model {
         } else {
             self.fresh_rid()
         };
-        self.upsert_with_rid(pk, cols, new_rid, rid);
+        self.upsert_with_rid(pk, cols, new_rid, rid, commit_epoch);
         rid
     }
 
@@ -191,20 +206,24 @@ impl Model {
         cols: Vec<(u16, ValueRepr)>,
         new_rid: bool,
         rid: u64,
+        commit_epoch: Epoch,
     ) {
         self.next_rid = self.next_rid.max(rid.saturating_add(1));
         if new_rid {
             if let Some(prev) = self.live_pks.insert(pk, rid) {
                 self.tombstones.insert(prev);
                 if let Some(row) = self.rows.iter_mut().find(|r| r.rid == prev) {
-                    row.deleted = true;
+                    // Tombstone the previous rid at the same epoch the engine
+                    // sealed the delete+insert pair.
+                    row.delete_epoch = Some(commit_epoch);
                 }
             }
         } else {
             self.live_pks.insert(pk, rid);
         }
         if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
-            row.deleted = false;
+            row.commit_epoch = commit_epoch;
+            row.delete_epoch = None;
             for (cid, val) in cols {
                 row.cols.insert(cid, val);
             }
@@ -213,16 +232,17 @@ impl Model {
             self.rows.push(ModelRow {
                 pk,
                 rid,
-                deleted: false,
+                commit_epoch,
+                delete_epoch: None,
                 cols: cols_map,
             });
         }
     }
 
-    fn delete(&mut self, pk: i64) -> Option<u64> {
+    fn delete(&mut self, pk: i64, delete_epoch: Epoch) -> Option<u64> {
         if let Some(rid) = self.live_pks.remove(&pk) {
             if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
-                row.deleted = true;
+                row.delete_epoch = Some(delete_epoch);
             }
             self.tombstones.insert(rid);
             Some(rid)
@@ -231,12 +251,20 @@ impl Model {
         }
     }
 
-    fn live_rows(&self) -> Vec<&ModelRow> {
+    /// Rows visible at `snap`. Mirrors the engine's MVCC visibility rule:
+    /// a row is alive at `snap.epoch` iff the row's last commit happened at
+    /// `<= snap.epoch` AND no tombstone at `<= snap.epoch` has sealed it.
+    fn live_rows(&self, snap: Snapshot) -> Vec<&ModelRow> {
         let now_nanos = now_nanos();
         self.rows
             .iter()
             .filter(|r| {
-                if r.deleted {
+                if let Some(d) = r.delete_epoch {
+                    if d <= snap.epoch {
+                        return false;
+                    }
+                }
+                if r.commit_epoch > snap.epoch {
                     return false;
                 }
                 if let Some((col_id, duration)) = self.ttl_policy {
@@ -252,8 +280,8 @@ impl Model {
             .collect()
     }
 
-    fn live_rids(&self) -> HashSet<u64> {
-        self.live_rows().into_iter().map(|r| r.rid).collect()
+    fn live_rids(&self, snap: Snapshot) -> HashSet<u64> {
+        self.live_rows(snap).into_iter().map(|r| r.rid).collect()
     }
 
     fn set_ttl(&mut self, column_id: u16, duration_nanos: u64) {
@@ -275,9 +303,9 @@ fn now_nanos() -> i64 {
 
 /// Oracle for `IndexKind::FmIndex` substring scan. Returns the set of live
 /// row ids whose Bytes column on `column_id` contains `pattern`.
-fn fm_oracle(model: &Model, column_id: u16, pattern: &[u8]) -> HashSet<u64> {
+fn fm_oracle(model: &Model, snap: Snapshot, column_id: u16, pattern: &[u8]) -> HashSet<u64> {
     let mut hits = HashSet::new();
-    for row in model.live_rows() {
+    for row in model.live_rows(snap) {
         if let Some(ValueRepr::Bytes(text)) = row.cols.get(&column_id) {
             if text.windows(pattern.len()).any(|w| w == pattern) {
                 hits.insert(row.rid);
@@ -288,9 +316,15 @@ fn fm_oracle(model: &Model, column_id: u16, pattern: &[u8]) -> HashSet<u64> {
 }
 
 /// Oracle for `IndexKind::LearnedRange` inclusive range scan on Int64.
-fn range_oracle(model: &Model, column_id: u16, lo: i64, hi: i64) -> HashSet<u64> {
+fn range_oracle(
+    model: &Model,
+    snap: Snapshot,
+    column_id: u16,
+    lo: i64,
+    hi: i64,
+) -> HashSet<u64> {
     let mut hits = HashSet::new();
-    for row in model.live_rows() {
+    for row in model.live_rows(snap) {
         if let Some(ValueRepr::Int(v)) = row.cols.get(&column_id) {
             if *v >= lo && *v <= hi {
                 hits.insert(row.rid);
@@ -302,9 +336,15 @@ fn range_oracle(model: &Model, column_id: u16, lo: i64, hi: i64) -> HashSet<u64>
 
 /// Oracle for `IndexKind::Ann` (Dense, HNSW). Returns the top-`k` live rids
 /// ranked by ascending cosine distance, tie-breaking on rid ascending.
-fn ann_dense_oracle(model: &Model, column_id: u16, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+fn ann_dense_oracle(
+    model: &Model,
+    snap: Snapshot,
+    column_id: u16,
+    query: &[f32],
+    k: usize,
+) -> Vec<(u64, f32)> {
     let mut scored: Vec<(u64, f32)> = model
-        .live_rows()
+        .live_rows(snap)
         .into_iter()
         .filter_map(|row| match row.cols.get(&column_id) {
             Some(ValueRepr::Embedding(v)) => {
@@ -499,8 +539,11 @@ impl Harness {
         self.log.push(op.clone());
     }
 
-    fn live_rids(&self) -> HashSet<u64> {
-        self.model.live_rids()
+    /// Rids the model considers live at `snap`. Caller passes the engine's
+    /// authoritative snapshot (typically `table.snapshot()`) so the auth
+    /// allowed-set check observes the same MVCC view as `table.query()`.
+    fn live_rids(&self, snap: Snapshot) -> HashSet<u64> {
+        self.model.live_rids(snap)
     }
 }
 
@@ -508,6 +551,14 @@ impl Harness {
 // Generic op-dispatch helpers. Each helper appends to the log and updates
 // the model + table identically.
 // ---------------------------------------------------------------------------
+
+/// Snapshot the engine's pending epoch (= `visible + 1`) so the model can
+/// stamp rows at the same epoch the engine's `Table::pending_epoch()`
+/// hands out. Sourced directly from `Table::snapshot()` to keep the model
+/// in lockstep with the engine's `epoch_authority.visible()`.
+fn pending_epoch(table: &Table) -> Epoch {
+    Epoch(table.snapshot().epoch.0.saturating_add(1))
+}
 
 fn apply_put(table: &mut Table, harness: &mut Harness, pk: i64, cols: Vec<(u16, Value)>) {
     let reprs: Vec<(u16, ValueRepr)> = cols
@@ -518,10 +569,11 @@ fn apply_put(table: &mut Table, harness: &mut Harness, pk: i64, cols: Vec<(u16, 
     // HOT entry and allocates a fresh rid. The model mirrors that with
     // new_rid=true (which tombstones the old rid and hands out a new one).
     let already_live = harness.model.live_pks.contains_key(&pk);
+    let epoch = pending_epoch(table);
     let rid = table.put(cols).unwrap();
     harness
         .model
-        .upsert_with_rid(pk, reprs.clone(), true, rid.0);
+        .upsert_with_rid(pk, reprs.clone(), true, rid.0, epoch);
     harness.record(Op::Put {
         pk,
         cols: reprs,
@@ -540,6 +592,8 @@ fn apply_put_batch(table: &mut Table, harness: &mut Harness, rows: Vec<Vec<(u16,
         })
         .collect();
     let new_rids = pks.iter().any(|pk| harness.model.live_pks.contains_key(pk));
+    // Engine's put_batch stamps every row at one pending_epoch(); mirror it.
+    let epoch = pending_epoch(table);
     for cols in &rows {
         let reprs: Vec<(u16, ValueRepr)> = cols
             .iter()
@@ -559,14 +613,15 @@ fn apply_put_batch(table: &mut Table, harness: &mut Harness, rows: Vec<Vec<(u16,
             .iter()
             .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
             .collect();
-        harness.model.upsert(pk, reprs, true);
+        harness.model.upsert(pk, reprs, true, epoch);
     }
     table.put_batch(rows).unwrap();
     harness.record(Op::PutBatch { pks, new_rids });
 }
 
 fn apply_delete(table: &mut Table, harness: &mut Harness, pk: i64) {
-    let rid = harness.model.delete(pk);
+    let epoch = pending_epoch(table);
+    let rid = harness.model.delete(pk, epoch);
     if let Some(rid) = rid {
         // The engine requires the row id (not the PK) for delete().
         table.delete(RowId(rid)).unwrap();
@@ -581,8 +636,11 @@ fn apply_delete_then_put(
     cols: Vec<(u16, Value)>,
 ) {
     // Delete then re-insert with the same PK. The engine allocates a new rid
-    // (the old rid is tombstoned) — mirror that exactly in the model.
-    let old_rid = harness.model.delete(pk);
+    // (the old rid is tombstoned) — mirror that exactly in the model. Both
+    // the tombstone and the new put commit at the same `pending_epoch()` in
+    // the standalone path, so we share one epoch value for the pair.
+    let epoch = pending_epoch(table);
+    let old_rid = harness.model.delete(pk, epoch);
     let reprs: Vec<(u16, ValueRepr)> = cols
         .iter()
         .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
@@ -596,7 +654,7 @@ fn apply_delete_then_put(
     // Sync the model with the engine's actual rid allocation.
     harness
         .model
-        .upsert_with_rid(pk, reprs.clone(), true, engine_new_rid);
+        .upsert_with_rid(pk, reprs.clone(), true, engine_new_rid, epoch);
     harness.record(Op::DeleteThenPut { pk, cols: reprs });
 }
 
@@ -784,7 +842,8 @@ fn churn_oracle_fmindex() {
             // epoch=visible+1); advance the visible epoch via flush so the
             // oracle check observes the same state the model has.
             table.flush().unwrap();
-            let oracle = fm_oracle(&harness.model, 2, &query_pattern);
+            let snap = table.snapshot();
+            let oracle = fm_oracle(&harness.model, snap, 2, &query_pattern);
             let engine_q = Query::new().and(Condition::FmContains {
                 column_id: 2,
                 pattern: query_pattern.clone(),
@@ -830,7 +889,7 @@ fn churn_oracle_fmindex() {
         .into_iter()
         .map(|r| r.row_id.0)
         .collect();
-    assert_eq!(final_engine_rids, harness.live_rids());
+    assert_eq!(final_engine_rids, harness.live_rids(table.snapshot()));
 }
 
 #[test]
@@ -920,7 +979,12 @@ fn churn_oracle_learned_range() {
             }
             94 => {
                 // Authorization allowed-set on a range query.
-                let live: Vec<RowId> = harness.live_rids().into_iter().take(3).map(RowId).collect();
+                let live: Vec<RowId> = harness
+                    .live_rids(table.snapshot())
+                    .into_iter()
+                    .take(3)
+                    .map(RowId)
+                    .collect();
                 let allowed: HashSet<RowId> = live.iter().copied().collect();
                 let q = Query::new().and(Condition::Range {
                     column_id: 2,
@@ -933,7 +997,7 @@ fn churn_oracle_learned_range() {
                     .into_iter()
                     .map(|r| r.row_id.0)
                     .collect();
-                let mut oracle = range_oracle(&harness.model, 2, -200, 200);
+                let mut oracle = range_oracle(&harness.model, table.snapshot(), 2, -200, 200);
                 oracle.retain(|rid| allowed.contains(&RowId(*rid)));
                 assert_eq!(engine_hits, oracle, "auth allowed-set at step {step}");
                 harness.record(Op::AuthAllowedSet);
@@ -951,7 +1015,8 @@ fn churn_oracle_learned_range() {
             // oracle check observes the same state the model has.
             table.flush().unwrap();
             let (lo, hi) = (-150, 150);
-            let oracle = range_oracle(&harness.model, 2, lo, hi);
+            let snap = table.snapshot();
+            let oracle = range_oracle(&harness.model, snap, 2, lo, hi);
             let engine_q = Query::new().and(Condition::Range {
                 column_id: 2,
                 lo,
@@ -1172,7 +1237,8 @@ fn churn_oracle_ann_hnsw_dense() {
             // epoch=visible+1); advance the visible epoch via flush so the
             // oracle check observes the same state the model has.
             table.flush().unwrap();
-            let oracle = ann_dense_oracle(&harness.model, 2, &query, k);
+            let snap = table.snapshot();
+            let oracle = ann_dense_oracle(&harness.model, snap, 2, &query, k);
             let engine_hits = table
                 .retrieve(&Retriever::Ann {
                     column_id: 2,
@@ -1401,7 +1467,7 @@ fn range_cols(pk: i64, score: i64) -> Vec<(u16, Value)> {
 // ---------------------------------------------------------------------------
 // Engine bugs surfaced by churn oracle (intentionally RED — fix in follow-up):
 //
-// 1. FM (`churn_oracle_fmindex` at line 586): the engine returns
+// 1. FM (`churn_oracle_fmindex` at line 666): the engine returns
 //    `RowIdSet::empty()` for `Condition::FmContains` at step 9 while the
 //    model has live rows whose Bytes column contains "the". The FM index is
 //    populated by `index_into` (engine.rs:13712) for every put, but the
@@ -1411,7 +1477,7 @@ fn range_cols(pk: i64, score: i64) -> Vec<(u16, Value)> {
 //    just-inserted doc. Suspected: src/index/fm_index.rs:429
 //    (`FmIndex::locate` / `FmSegment::backward`).
 //
-// 2. LearnedRange (`churn_oracle_learned_range` at line 777): the engine
+// 2. LearnedRange (`churn_oracle_learned_range` at line 896): the engine
 //    returns `RowIdSet::empty()` for `Condition::Range` at step 9 while the
 //    model has live rows whose Int64 column is in [-150, 150]. The
 //    per-column PGM is built from a single run (`build_learned_ranges` at
@@ -1425,7 +1491,7 @@ fn range_cols(pk: i64, score: i64) -> Vec<(u16, Value)> {
 //    Suspected: src/index/learned_range.rs:127 (`ColumnLearnedRange::range`)
 //    or engine.rs:9324 (`range_scan_overlay_i64`).
 //
-// 3. ANN Dense (`churn_oracle_ann_hnsw_dense` at line 911): the engine
+// 3. ANN Dense (`churn_oracle_ann_hnsw_dense` at line 1060): the engine
 //    returns an empty `Vec<RetrieverHit>` for `Retriever::Ann` at step 9
 //    while the model has live rows whose Embedding column is similar to
 //    the query. The ANN Dense index is populated by `index_into`
