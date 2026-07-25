@@ -3,6 +3,8 @@ name: Investigate sorted-run HLC visibility
 on:
   push:
     branches: [agent/fix-run-hlc-visibility-ca3]
+  pull_request:
+    branches: [master]
 
 permissions:
   contents: read
