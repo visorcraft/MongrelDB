@@ -114,6 +114,16 @@ impl ControlledVisibleCandidate {
             Self::Run(version) => version.deleted,
         }
     }
+
+    fn commit_ts(&self) -> Option<mongreldb_types::hlc::HlcTimestamp> {
+        match self {
+            Self::Memory(row) => row.commit_ts,
+            // Sorted runs are epoch-keyed on disk; HLC is not carried in
+            // RunVisibleVersion. Falls back to epoch comparison via
+            // Snapshot::version_is_newer.
+            Self::Run(_) => None,
+        }
+    }
 }
 
 enum ControlledVisibleCursor {
@@ -233,7 +243,15 @@ fn merge_controlled_visible_sources(
                 break;
             };
             let candidate = sources[source_index].pop(control)?;
-            if candidate.committed_epoch() > best.committed_epoch() {
+            // HLC-authoritative: when both candidates carry HLC, the higher
+            // HLC wins regardless of local epoch. Falls back to epoch when
+            // either side lacks HLC (legacy / sorted-run path).
+            if Snapshot::version_is_newer(
+                candidate.committed_epoch(),
+                candidate.commit_ts(),
+                best.committed_epoch(),
+                best.commit_ts(),
+            ) {
                 best = candidate;
                 best_source = source_index;
             }
@@ -313,6 +331,89 @@ mod controlled_visible_cursor_tests {
             vec![2, 3, 4]
         );
         assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(22)));
+    }
+
+    #[test]
+    fn controlled_merge_uses_hlc_authority_when_epochs_inverted() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let hlc_old = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let hlc_new = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        // Source A: high epoch, OLD HLC. Source B: low epoch, NEW HLC.
+        // HLC authority should pick B; legacy epoch-only pick would pick A.
+        let a = vec![
+            Row::new_with_hlc(RowId(1), Epoch(50), hlc_old)
+                .with_column(1, Value::Int64(999)),
+        ];
+        let b = vec![
+            Row::new_with_hlc(RowId(1), Epoch(1), hlc_new)
+                .with_column(1, Value::Int64(11)),
+        ];
+        let control = crate::ExecutionControl::new(None);
+        let mut sources = vec![
+            ControlledVisibleSource::memory(a),
+            ControlledVisibleSource::memory(b),
+        ];
+        let mut rows = Vec::new();
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row_id.0, 1);
+        // HLC-newer (source B, value 11) must win despite Epoch(50) on source A.
+        assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(11)));
+        assert_eq!(rows[0].commit_ts, Some(hlc_new));
+    }
+
+    #[test]
+    fn controlled_merge_epoch_wins_when_one_side_lacks_hlc() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let hlc_old = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        // Source A: HLC-stamped, higher epoch. Source B: no HLC, lower epoch.
+        // Legacy path: epoch wins -> A is newer.
+        let a = vec![
+            Row::new_with_hlc(RowId(1), Epoch(10), hlc_old)
+                .with_column(1, Value::Int64(10)),
+        ];
+        let b = vec![
+            Row::new(RowId(1), Epoch(5)).with_column(1, Value::Int64(5)),
+        ];
+        let control = crate::ExecutionControl::new(None);
+        let mut sources = vec![
+            ControlledVisibleSource::memory(a),
+            ControlledVisibleSource::memory(b),
+        ];
+        let mut rows = Vec::new();
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(10)));
     }
 }
 
@@ -887,6 +988,99 @@ pub struct Table {
     /// [`Table::clone_read_generation`], released when the generation drops.
     /// Shared behind an `Arc` so cloning a generation shares one pin.
     read_generation_pin: Option<Arc<crate::retention::PinGuard>>,
+    /// Lookup observability counters. HOT hits are the fast-path expectation;
+    /// any fallback in a healthy workload is a regression to investigate.
+    /// Each clone of `Table` (e.g. `clone_read_generation`) gets its own
+    /// counters — readers and writers typically share via `Arc<Table>`.
+    lookup_metrics: LookupMetrics,
+}
+
+#[derive(Debug, Default)]
+struct LookupMetrics {
+    hot_lookup_hit: std::sync::atomic::AtomicU64,
+    hot_lookup_fallback: std::sync::atomic::AtomicU64,
+    hot_lookup_fallback_overlay_rows: std::sync::atomic::AtomicU64,
+    hot_lookup_fallback_runs: std::sync::atomic::AtomicU64,
+    result_cache_memory_hit: std::sync::atomic::AtomicU64,
+    result_cache_disk_hit: std::sync::atomic::AtomicU64,
+    result_cache_miss: std::sync::atomic::AtomicU64,
+    result_cache_persistent_write_us: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for LookupMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            hot_lookup_hit: std::sync::atomic::AtomicU64::new(
+                self.hot_lookup_hit.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            hot_lookup_fallback: std::sync::atomic::AtomicU64::new(
+                self.hot_lookup_fallback.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            hot_lookup_fallback_overlay_rows: std::sync::atomic::AtomicU64::new(
+                self.hot_lookup_fallback_overlay_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            hot_lookup_fallback_runs: std::sync::atomic::AtomicU64::new(
+                self.hot_lookup_fallback_runs.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            result_cache_memory_hit: std::sync::atomic::AtomicU64::new(
+                self.result_cache_memory_hit
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            result_cache_disk_hit: std::sync::atomic::AtomicU64::new(
+                self.result_cache_disk_hit
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            result_cache_miss: std::sync::atomic::AtomicU64::new(
+                self.result_cache_miss.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            result_cache_persistent_write_us: std::sync::atomic::AtomicU64::new(
+                self.result_cache_persistent_write_us
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl LookupMetrics {
+    fn snapshot(&self) -> LookupMetricsSnapshot {
+        LookupMetricsSnapshot {
+            hot_lookup_hit: self.hot_lookup_hit.load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_fallback: self.hot_lookup_fallback.load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_fallback_overlay_rows: self
+                .hot_lookup_fallback_overlay_rows
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_fallback_runs: self
+                .hot_lookup_fallback_runs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_memory_hit: self
+                .result_cache_memory_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_disk_hit: self
+                .result_cache_disk_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_miss: self
+                .result_cache_miss
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persistent_write_us: self
+                .result_cache_persistent_write_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time copy of [`LookupMetrics`]. Returned from
+/// [`Table::lookup_metrics_snapshot`] for `/metrics` exposure or test assertions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LookupMetricsSnapshot {
+    pub hot_lookup_hit: u64,
+    pub hot_lookup_fallback: u64,
+    pub hot_lookup_fallback_overlay_rows: u64,
+    pub hot_lookup_fallback_runs: u64,
+    pub result_cache_memory_hit: u64,
+    pub result_cache_disk_hit: u64,
+    pub result_cache_miss: u64,
+    pub result_cache_persistent_write_us: u64,
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -958,6 +1152,13 @@ struct ResultCache {
     dir: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     cache_dek: Option<Zeroizing<[u8; DEK_LEN]>>,
+    /// Cache hit/miss counters (memory vs disk tier) + persistent-write latency.
+    /// Independent of `LookupMetrics` on the parent `Table` — the cache may be
+    /// queried by paths that don't pass through the table's Pk arm.
+    memory_hit: std::sync::atomic::AtomicU64,
+    disk_hit: std::sync::atomic::AtomicU64,
+    miss: std::sync::atomic::AtomicU64,
+    persistent_write_us: std::sync::atomic::AtomicU64,
 }
 
 /// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
@@ -1043,6 +1244,10 @@ impl ResultCache {
             max_bytes,
             dir: None,
             cache_dek: None,
+            memory_hit: std::sync::atomic::AtomicU64::new(0),
+            disk_hit: std::sync::atomic::AtomicU64::new(0),
+            miss: std::sync::atomic::AtomicU64::new(0),
+            persistent_write_us: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1280,6 +1485,8 @@ impl ResultCache {
         });
         if res.is_some() {
             self.touch(key);
+            self.memory_hit
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return res;
         }
         // Memory miss → try the persistent tier (b).
@@ -1295,9 +1502,12 @@ impl ResultCache {
                 self.entries.insert(key, entry);
                 self.touch(key);
                 self.evict();
+                self.disk_hit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return res;
             }
         }
+        self.miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         None
     }
 
@@ -1308,6 +1518,8 @@ impl ResultCache {
         });
         if res.is_some() {
             self.touch(key);
+            self.memory_hit
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return res;
         }
         // Memory miss → try the persistent tier (b).
@@ -1323,9 +1535,12 @@ impl ResultCache {
                 self.entries.insert(key, entry);
                 self.touch(key);
                 self.evict();
+                self.disk_hit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return res;
             }
         }
+        self.miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         None
     }
 
@@ -1337,12 +1552,30 @@ impl ResultCache {
             self.untrack(key);
         }
         // Write to the persistent tier (b) before memory insert.
+        let write_start = std::time::Instant::now();
         self.store_to_disk(key, &entry);
+        let write_us = write_start.elapsed().as_micros() as u64;
+        self.persistent_write_us
+            .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(approx);
         self.index_entry(key, &entry);
         self.entries.insert(key, entry);
         self.touch(key);
         self.evict();
+    }
+
+    /// Read the per-tier counters. Returned as `(memory_hit, disk_hit, miss,
+    /// persistent_write_us)` so callers can roll them into their own snapshot.
+    fn cache_counters(&self) -> (u64, u64, u64, u64) {
+        (
+            self.memory_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.disk_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.miss.load(std::sync::atomic::Ordering::Relaxed),
+            self.persistent_write_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Fine-grained invalidation (hardening (c)). Drop only entries that are
@@ -2127,6 +2360,7 @@ impl Table {
             pins: Arc::new(crate::retention::PinRegistry::new()),
             published: Arc::new(ArcSwap::from_pointee(initial_view)),
             read_generation_pin: None,
+            lookup_metrics: LookupMetrics::default(),
         })
     }
 
@@ -2443,6 +2677,7 @@ impl Table {
             pins: Arc::new(crate::retention::PinRegistry::new()),
             published: Arc::new(ArcSwap::from_pointee(initial_view)),
             read_generation_pin: None,
+            lookup_metrics: LookupMetrics::default(),
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -2611,6 +2846,9 @@ impl Table {
     ) -> Result<RowIdSet> {
         // Overlay first (newest versions).
         for row in self.memtable.visible_versions_at(snapshot) {
+            self.lookup_metrics
+                .hot_lookup_fallback_overlay_rows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
                 continue;
             }
@@ -2621,6 +2859,9 @@ impl Table {
             }
         }
         for row in self.mutable_run.visible_versions_at(snapshot) {
+            self.lookup_metrics
+                .hot_lookup_fallback_overlay_rows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
                 continue;
             }
@@ -2635,7 +2876,11 @@ impl Table {
         if lookup.len() == 8 {
             if let Ok(arr) = <[u8; 8]>::try_from(lookup) {
                 let n = i64::from_be_bytes(arr);
-                return self.range_scan_i64(pk_column_id, n, n, snapshot);
+                let result = self.range_scan_i64(pk_column_id, n, n, snapshot)?;
+                self.lookup_metrics
+                    .hot_lookup_fallback_runs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(result);
             }
         }
         // Bytes / other PK types: linear visible scan of runs is expensive but
@@ -2643,6 +2888,9 @@ impl Table {
         let mut found = Vec::new();
         let overlay = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
+            self.lookup_metrics
+                .hot_lookup_fallback_runs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.visible_rows(snapshot.epoch)? {
                 if overlay.contains(&row.row_id.0) || row.deleted {
@@ -5379,6 +5627,19 @@ impl Table {
         }
     }
 
+    /// Snapshot of lookup + result-cache counters. Point-in-time copy suitable
+    /// for `/metrics` exposition or test assertions. Cache counts come from the
+    /// [`ResultCache`] mutex; HOT counts come from the in-table atomics.
+    pub fn lookup_metrics_snapshot(&self) -> LookupMetricsSnapshot {
+        let mut snap = self.lookup_metrics.snapshot();
+        let (mem, disk, miss, write_us) = self.result_cache.lock().cache_counters();
+        snap.result_cache_memory_hit = mem;
+        snap.result_cache_disk_hit = disk;
+        snap.result_cache_miss = miss;
+        snap.result_cache_persistent_write_us = write_us;
+        snap
+    }
+
     /// Run a conjunctive query over the shared row-id space: each condition
     /// yields a candidate row-id set, the sets are intersected, and the
     /// survivors are materialized at the current snapshot. This is the AI-native
@@ -7907,6 +8168,9 @@ impl Table {
                     .map(|pk| self.index_lookup_key_bytes(pk.id, key))
                     .unwrap_or_else(|| key.clone());
                 if let Some(r) = self.hot.get(&lookup) {
+                    self.lookup_metrics
+                        .hot_lookup_hit
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     RowIdSet::one(r.0)
                 } else if let Some(pk_col) = self.schema.primary_key() {
                     // HOT miss self-heal: the base row may still be live after
@@ -7914,6 +8178,9 @@ impl Table {
                     // PK lookup returns empty). Fall back to a targeted
                     // equality scan on the PK column and re-seed is left to
                     // rebuild_indexes / the next put path.
+                    self.lookup_metrics
+                        .hot_lookup_fallback
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?
                 } else {
                     RowIdSet::empty()
