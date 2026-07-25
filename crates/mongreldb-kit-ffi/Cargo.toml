@@ -26,8 +26,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # Engine 0.64.9 and Kit 0.64.9 are both published and aligned, so the adapter
 # resolves everything from the registry. Re-add the [patch.crates-io] below
 # when a core/query fix must ship before the next engine release.
-kit = { package = "mongreldb-kit", version = "=0.64.9" }
-mongreldb-kit-core = "=0.64.9"
+kit = { package = "mongreldb-kit", version = "=0.64.10" }
+mongreldb-kit-core = "=0.64.10"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 
