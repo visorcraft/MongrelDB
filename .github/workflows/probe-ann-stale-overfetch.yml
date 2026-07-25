@@ -1,4 +1,4 @@
-name: Validate ANN stale-overfetch fix
+name: Validate HNSW reciprocal connectivity
 
 on:
   push:
@@ -27,18 +27,113 @@ jobs:
       - name: Apply minimal production fix
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p /tmp/hnsw-connectivity
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('crates/mongreldb-core/src/index/ann/mod.rs')
+          path = Path('crates/mongreldb-core/src/index/hnsw.rs')
           source = path.read_text()
-          old = '            for (row_id, distance) in graph.search(query, k, self.ef_search, context)? {\n'
-          new = '            for (row_id, distance) in graph.search(query, k, self.ef_search.max(k), context)? {\n'
-          if source.count(old) != 1:
-              raise SystemExit(f'expected one ANN search target, found {source.count(old)}')
-          path.write_text(source.replace(old, new, 1))
+          old_binary = '''            for &n in &neighbors {
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(Dist, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (hamming(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by_key(|(d, _)| *d);
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                }
+            }
+'''
+          new_binary = '''            for (neighbor_rank, &n) in neighbors.iter().enumerate() {
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(Dist, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (hamming(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by_key(|(d, _)| *d);
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    // The new node only has outgoing edges until at least one
+                    // discovered old node retains the reciprocal edge. If every
+                    // saturated neighbor prunes it as the farthest candidate,
+                    // the new node is unreachable from the existing entry point.
+                    // Preserve one bridge through the nearest chosen neighbor.
+                    if neighbor_rank == 0 && !adj.contains(&node) {
+                        adj.pop();
+                        adj.push(node);
+                    }
+                }
+            }
+'''
+          old_dense = '''            for &n in &neighbors {
+                checkpoint()?;
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(f32, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by(|(da, _), (db, _)| da.total_cmp(db));
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                }
+            }
+'''
+          new_dense = '''            for (neighbor_rank, &n) in neighbors.iter().enumerate() {
+                checkpoint()?;
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(f32, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by(|(da, _), (db, _)| da.total_cmp(db));
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    // Mirror the binary HNSW reachability invariant: retain
+                    // one reciprocal bridge from the existing graph to a late
+                    // distant node even when every neighbor list is saturated.
+                    if neighbor_rank == 0 && !adj.contains(&node) {
+                        adj.pop();
+                        adj.push(node);
+                    }
+                }
+            }
+'''
+          for label, old, new in [
+              ('binary reciprocal block', old_binary, new_binary),
+              ('dense reciprocal block', old_dense, new_dense),
+          ]:
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one {label}, found {count}')
+              source = source.replace(old, new, 1)
+          path.write_text(source)
           PY
           cargo fmt
           git diff --check
+          git diff --binary ca3d0b2442bc83759686fa8fd0a449964d7a68a8 -- \
+            crates/mongreldb-core/src/index/hnsw.rs \
+            crates/mongreldb-core/tests/ann_stale_overfetch.rs \
+            > /tmp/hnsw-connectivity/hnsw-connectivity.patch
+          cp crates/mongreldb-core/src/index/hnsw.rs /tmp/hnsw-connectivity/hnsw.rs
+          cp crates/mongreldb-core/tests/ann_stale_overfetch.rs \
+            /tmp/hnsw-connectivity/ann_stale_overfetch.rs
       - name: Formatting and Clippy
         run: |
           cargo fmt --check
@@ -51,5 +146,13 @@ jobs:
             --test retriever -- --nocapture
           cargo test -p mongreldb-core --all-features \
             --test ai_query_limits -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            index::hnsw -- --nocapture
       - name: Complete core suite
         run: cargo test -p mongreldb-core --all-features
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hnsw-connectivity-validation
+          path: /tmp/hnsw-connectivity
+          if-no-files-found: warn
