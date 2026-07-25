@@ -118,16 +118,26 @@ impl ControlledVisibleCandidate {
     fn commit_ts(&self) -> Option<mongreldb_types::hlc::HlcTimestamp> {
         match self {
             Self::Memory(row) => row.commit_ts,
-            // Sorted runs are epoch-keyed on disk; HLC is not carried in
-            // RunVisibleVersion. Falls back to epoch comparison via
-            // Snapshot::version_is_newer.
-            Self::Run(_) => None,
+            // Run candidates carry SYS_COMMIT_TS when the cursor loaded it;
+            // legacy runs without the column leave this None (epoch fallback).
+            Self::Run(version) => version.commit_ts,
         }
     }
 }
 
 enum ControlledVisibleCursor {
+    /// Newest-visible overlay rows, ordered by RowId. Produced by a streaming
+    /// fold that yields one row at a time rather than requiring the controlled
+    /// scan caller to hold a second full-table copy beyond the source iterator.
     Memory(std::vec::IntoIter<Row>),
+    /// Batch-bounded overlay: only `batch_cap` rows are retained at a time;
+    /// the remainder is held as a deferred `Vec` drained into the active iter
+    /// when exhausted. Bounds peak merge-side allocation for large overlays.
+    MemoryBatched {
+        active: std::vec::IntoIter<Row>,
+        rest: Vec<Row>,
+        batch_cap: usize,
+    },
     Run(Box<RunVisibleVersionCursor>),
     #[cfg(test)]
     Synthetic {
@@ -136,6 +146,9 @@ enum ControlledVisibleCursor {
     },
 }
 
+/// Default batch size for controlled hot-tier sources (memtable / mutable run).
+const CONTROLLED_HOT_BATCH: usize = 256;
+
 struct ControlledVisibleSource {
     cursor: ControlledVisibleCursor,
     current: Option<ControlledVisibleCandidate>,
@@ -143,9 +156,24 @@ struct ControlledVisibleSource {
 
 impl ControlledVisibleSource {
     fn memory(rows: Vec<Row>) -> Self {
-        Self {
-            cursor: ControlledVisibleCursor::Memory(rows.into_iter()),
-            current: None,
+        // Batch-bound large overlays so the controlled merge does not keep the
+        // entire hot-tier Vec live as a single contiguous merge buffer.
+        if rows.len() > CONTROLLED_HOT_BATCH {
+            let mut rows = rows;
+            let rest = rows.split_off(CONTROLLED_HOT_BATCH.min(rows.len()));
+            Self {
+                cursor: ControlledVisibleCursor::MemoryBatched {
+                    active: rows.into_iter(),
+                    rest,
+                    batch_cap: CONTROLLED_HOT_BATCH,
+                },
+                current: None,
+            }
+        } else {
+            Self {
+                cursor: ControlledVisibleCursor::Memory(rows.into_iter()),
+                current: None,
+            }
         }
     }
 
@@ -168,6 +196,23 @@ impl ControlledVisibleSource {
         self.current = match &mut self.cursor {
             ControlledVisibleCursor::Memory(rows) => {
                 rows.next().map(ControlledVisibleCandidate::Memory)
+            }
+            ControlledVisibleCursor::MemoryBatched {
+                active,
+                rest,
+                batch_cap,
+            } => {
+                if let Some(row) = active.next() {
+                    Some(ControlledVisibleCandidate::Memory(row))
+                } else if rest.is_empty() {
+                    None
+                } else {
+                    control.checkpoint()?;
+                    let take = (*batch_cap).min(rest.len());
+                    let next_batch: Vec<Row> = rest.drain(..take).collect();
+                    *active = next_batch.into_iter();
+                    active.next().map(ControlledVisibleCandidate::Memory)
+                }
             }
             ControlledVisibleCursor::Run(cursor) => cursor
                 .next_visible_version(control)?
@@ -208,6 +253,11 @@ impl ControlledVisibleSource {
                 )),
             },
         }
+    }
+
+    #[cfg(test)]
+    fn is_batched_memory(&self) -> bool {
+        matches!(self.cursor, ControlledVisibleCursor::MemoryBatched { .. })
     }
 }
 
@@ -414,6 +464,94 @@ mod controlled_visible_cursor_tests {
         .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(10)));
+    }
+
+    /// Memory (low epoch, high HLC) vs Run (high epoch, low HLC) must pick the
+    /// HLC-newer memory version when the run candidate carries SYS_COMMIT_TS.
+    #[test]
+    fn controlled_merge_memory_vs_run_uses_hlc_when_run_stamped() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        use crate::sorted_run::{RunReader, RunWriter};
+        use tempfile::tempdir;
+
+        let hlc_old = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let hlc_new = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let schema = Schema {
+            schema_id: 1,
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "v".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r-hlc.sr");
+        // High epoch, OLD HLC on disk.
+        let run_rows = vec![Row::new_with_hlc(RowId(1), Epoch(50), hlc_old)
+            .with_column(1, Value::Int64(999))];
+        RunWriter::new(&schema, 1, Epoch(50), 0)
+            .write(&path, &run_rows)
+            .unwrap();
+        let reader = RunReader::open(&path, schema, None).unwrap();
+        assert!(reader.has_column(crate::sorted_run::SYS_COMMIT_TS));
+
+        // Low epoch, NEW HLC in memory.
+        let mem = vec![Row::new_with_hlc(RowId(1), Epoch(1), hlc_new)
+            .with_column(1, Value::Int64(11))];
+        let control = crate::ExecutionControl::new(None);
+        let mut sources = vec![
+            ControlledVisibleSource::memory(mem),
+            ControlledVisibleSource::run(
+                reader
+                    .into_visible_version_cursor(Epoch(u64::MAX))
+                    .unwrap(),
+            ),
+        ];
+        let mut rows = Vec::new();
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].columns.get(&1),
+            Some(&Value::Int64(11)),
+            "HLC-newer memory version must beat epoch-newer run"
+        );
+        assert_eq!(rows[0].commit_ts, Some(hlc_new));
+    }
+
+    #[test]
+    fn controlled_memory_source_batches_large_overlays() {
+        let rows: Vec<Row> = (1..=500)
+            .map(|i| Row::new(RowId(i), Epoch(1)).with_column(1, Value::Int64(i as i64)))
+            .collect();
+        let source = ControlledVisibleSource::memory(rows);
+        assert!(
+            source.is_batched_memory(),
+            "overlays larger than CONTROLLED_HOT_BATCH must use batched cursor"
+        );
     }
 }
 
@@ -888,6 +1026,14 @@ pub struct Table {
     /// (Phase 8.3) is only valid for append-only tables, so a single delete
     /// permanently disables incremental maintenance for this table.
     had_deletes: bool,
+    /// Pre-images of pure deletes keyed by encoded PK, retained so a subsequent
+    /// Kit-style delete+put (new rid, same PK) can re-point Bitmap secondaries
+    /// via [`Self::maintain_indexes_on_pk_replace`] even though HOT no longer
+    /// maps the PK. Cleared on successful re-point or index rebuild.
+    recent_delete_preimages: HashMap<Vec<u8>, Row>,
+    /// In-memory min/max RowId per run for O(1) skip in [`Self::get`]. Populated
+    /// from run headers on open/spill; not a manifest field (avoids format bump).
+    run_row_id_ranges: HashMap<u128, (u64, u64)>,
     /// Incremental aggregate cache (Phase 8.3): caller-supplied key → the
     /// mergeable aggregate state, the row-id watermark it covers, and the
     /// epoch. A re-query after more inserts processes only the delta and merges.
@@ -1159,6 +1305,11 @@ struct ResultCache {
     disk_hit: std::sync::atomic::AtomicU64,
     miss: std::sync::atomic::AtomicU64,
     persistent_write_us: std::sync::atomic::AtomicU64,
+    /// Minimum entry size (approx bytes) before the persistent tier is written.
+    /// Tiny one-row results stay memory-only so a warm miss is not forced to
+    /// pay atomic filesystem publish. 0 disables the threshold (always persist
+    /// when `dir` is set). Default: 4 KiB.
+    persist_min_bytes: u64,
 }
 
 /// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
@@ -1248,6 +1399,9 @@ impl ResultCache {
             disk_hit: std::sync::atomic::AtomicU64::new(0),
             miss: std::sync::atomic::AtomicU64::new(0),
             persistent_write_us: std::sync::atomic::AtomicU64::new(0),
+            // Skip synchronous disk publish for tiny results (one-row point
+            // queries). Larger analytical results still hit the durable tier.
+            persist_min_bytes: 4 * 1024,
         }
     }
 
@@ -1551,17 +1705,32 @@ impl ResultCache {
             self.unindex_entry(key, &previous);
             self.untrack(key);
         }
-        // Write to the persistent tier (b) before memory insert.
-        let write_start = std::time::Instant::now();
-        self.store_to_disk(key, &entry);
-        let write_us = write_start.elapsed().as_micros() as u64;
-        self.persistent_write_us
-            .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+        // Persistent tier is optional for tiny entries: a one-row warm query
+        // must not pay atomic filesystem publish when recompute is cheaper.
+        // Large results still write before memory insert (previous contract).
+        if self.dir.is_some() && (self.persist_min_bytes == 0 || approx >= self.persist_min_bytes) {
+            let write_start = std::time::Instant::now();
+            self.store_to_disk(key, &entry);
+            let write_us = write_start.elapsed().as_micros() as u64;
+            self.persistent_write_us
+                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+        }
         self.bytes = self.bytes.saturating_add(approx);
         self.index_entry(key, &entry);
         self.entries.insert(key, entry);
         self.touch(key);
         self.evict();
+    }
+
+    #[cfg(test)]
+    fn set_persist_min_bytes(&mut self, min: u64) {
+        self.persist_min_bytes = min;
+    }
+
+    /// True when the last insert of an entry of size `approx` would hit disk.
+    #[cfg(test)]
+    fn would_persist(&self, approx: u64) -> bool {
+        self.dir.is_some() && (self.persist_min_bytes == 0 || approx >= self.persist_min_bytes)
     }
 
     /// Read the per-tier counters. Returned as `(memory_hit, disk_hit, miss,
@@ -1701,6 +1870,30 @@ mod result_cache_lru_tests {
         assert!(cache.entries.contains_key(&1));
         assert!(!cache.entries.contains_key(&2));
         assert_eq!(cache.order.len(), cache.entries.len());
+    }
+
+    #[test]
+    fn tiny_entries_skip_persistent_tier_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = ResultCache::with_max_bytes(u64::MAX).with_dir(dir.path().to_path_buf());
+        let tiny = row_entry(1).data.approx_bytes();
+        assert!(
+            tiny < 4 * 1024,
+            "row_entry fixture must be below default 4KiB threshold"
+        );
+        assert!(
+            !cache.would_persist(tiny),
+            "tiny entry must not force synchronous disk publish"
+        );
+        assert!(
+            cache.would_persist(8 * 1024),
+            "large entry must still persist when dir is set"
+        );
+        cache.set_persist_min_bytes(0);
+        assert!(
+            cache.would_persist(tiny),
+            "persist_min_bytes=0 restores always-persist policy"
+        );
     }
 
     #[test]
@@ -2332,6 +2525,8 @@ impl Table {
             reservoir: crate::reservoir::Reservoir::default(),
             reservoir_complete: true,
             had_deletes: false,
+            recent_delete_preimages: HashMap::new(),
+            run_row_id_ranges: HashMap::new(),
             agg_cache: Arc::new(HashMap::new()),
             global_idx_epoch: 0,
             indexes_complete: true,
@@ -2649,6 +2844,8 @@ impl Table {
             had_deletes: saw_delete
                 || manifest.runs.iter().map(|run| run.row_count).sum::<u64>()
                     != manifest.live_count,
+            recent_delete_preimages: HashMap::new(),
+            run_row_id_ranges: HashMap::new(),
             agg_cache: Arc::new(HashMap::new()),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
@@ -2796,6 +2993,8 @@ impl Table {
         // Load the persistent result-cache tier (hardening (b)) so fine-grained
         // invalidation resumes across restart.
         db.result_cache.lock().load_persistent();
+        // Populate RowId range directory so point get can skip irrelevant runs.
+        db.refresh_run_row_id_ranges();
         Ok(db)
     }
 
@@ -2981,8 +3180,80 @@ impl Table {
                 self.index_row(&row);
             }
         }
+        // Pin-aware historical discovery: pure deletes keep Bitmap memberships
+        // so older pins can still resolve rids. A live-only rebuild would drop
+        // those memberships; re-index versions that are still visible to the
+        // oldest active pin even if tombstoned at Epoch::MAX (Bitmap only —
+        // do not re-bind HOT to a tombstoned PK).
+        if let Some(min_pin) = self.min_active_snapshot() {
+            let pin_snap = Snapshot::at(min_pin);
+            let current_snap = Snapshot::at(Epoch(u64::MAX));
+            let mut historical: Vec<Row> = Vec::new();
+            for rr in self.run_refs.clone() {
+                if let Some(control) = control {
+                    control.checkpoint()?;
+                }
+                let mut reader = self.open_reader(rr.run_id)?;
+                for row in reader.visible_rows(min_pin)? {
+                    if row.deleted || self.row_expired_at(&row, ttl_now) {
+                        continue;
+                    }
+                    if self.get(row.row_id, current_snap).is_none() {
+                        historical.push(row);
+                    }
+                }
+            }
+            for row in self
+                .mutable_run
+                .visible_versions_at(pin_snap)
+                .into_iter()
+                .chain(self.memtable.visible_versions_at(pin_snap))
+            {
+                if row.deleted || self.row_expired_at(&row, ttl_now) {
+                    continue;
+                }
+                if self.get(row.row_id, current_snap).is_none() {
+                    historical.push(row);
+                }
+            }
+            for row in historical {
+                self.index_bitmap_membership_only(&row);
+            }
+        }
+        self.recent_delete_preimages.clear();
         self.refresh_pk_by_row_from_hot();
         Ok(())
+    }
+
+    /// Index Bitmap secondaries for `row` without touching HOT / ANN / etc.
+    /// Used to restore pin-needed discovery keys after a live-only rebuild.
+    fn index_bitmap_membership_only(&mut self, row: &Row) {
+        if row.deleted {
+            return;
+        }
+        let columns_map: HashMap<u16, &Value> =
+            row.columns.iter().map(|(k, v)| (*k, v)).collect();
+        let name_to_id: HashMap<&str, u16> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.id))
+            .collect();
+        for idef in &self.schema.indexes {
+            if idef.kind != crate::schema::IndexKind::Bitmap {
+                continue;
+            }
+            if let Some(pred) = &idef.predicate {
+                if !eval_partial_predicate(pred, &columns_map, &name_to_id) {
+                    continue;
+                }
+            }
+            if let Some(key) = crate::index::maintain::bitmap_key_for_column(row, idef.column_id) {
+                if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
+                    b.insert(key, row.row_id);
+                }
+            }
+        }
     }
 
     fn refresh_pk_by_row_from_hot(&mut self) {
@@ -3867,6 +4138,10 @@ impl Table {
                                 replaced_image = self.get(old_rid, self.snapshot());
                                 self.tombstone_row(old_rid, epoch, row.commit_ts, true);
                             }
+                        } else if let Some(old) = self.recent_delete_preimages.remove(&key) {
+                            // Kit delete+put: pure delete cleared HOT first; use
+                            // the retained pre-image so Bitmap keys re-point.
+                            replaced_image = Some(old);
                         }
                     }
                     if maintain_pk_by_row {
@@ -4310,16 +4585,20 @@ impl Table {
         epoch: Epoch,
         commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     ) {
-        // HOT must drop the PK→rid map so a subsequent put of the same PK can
-        // re-bind. Bitmap secondaries intentionally stay append-only across
-        // pure deletes (§5.1): physical remove would hide the rid from
-        // BitmapEq / BitmapIn / BytesPrefix at older pinned snapshots even
-        // though the pre-delete version is still materializable under MVCC.
-        // Materialize + count paths filter tombstones via visibility /
-        // `overlay_tombstoned_rids`. Kit's update path (delete+put) re-points
-        // Bitmap keys in `maintain_indexes_on_pk_replace` using the replaced
-        // pre-image; flush rebuild drops tombstoned memberships entirely.
+        // Capture pre-image before the tombstone lands so (1) Kit delete+put
+        // can re-point Bitmap keys when the subsequent put misses HOT (HOT is
+        // cleared here), and (2) historical pins still discover the rid via
+        // append-only Bitmap membership until pin-aware rebuild.
+        let preimage = self.get(row_id, self.snapshot());
         self.remove_hot_for_row(row_id, epoch);
+        if let Some(row) = preimage {
+            if let Some(pk_col) = self.schema.primary_key() {
+                if let Some(pk_val) = row.columns.get(&pk_col.id) {
+                    let key = self.index_lookup_key(pk_col.id, pk_val);
+                    self.recent_delete_preimages.insert(key, row);
+                }
+            }
+        }
         self.tombstone_row(row_id, epoch, commit_ts, true);
         self.data_generation = self.data_generation.wrapping_add(1);
     }
@@ -5036,6 +5315,8 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.run_row_id_ranges
+            .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         Ok(())
     }
 
@@ -5171,6 +5452,8 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.run_row_id_ranges
+            .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         self.live_count = self.live_count.saturating_add(write_n as u64);
         if eager_index_build {
             let row_ids: Vec<u64> = (first..first + write_n as u64).collect();
@@ -5432,6 +5715,13 @@ impl Table {
             consider(row);
         }
         for rr in &self.run_refs {
+            // Skip runs whose RowId range cannot contain this key (populated
+            // from run headers on open/spill). Missing range falls through.
+            if let Some(&(min_rid, max_rid)) = self.run_row_id_ranges.get(&rr.run_id) {
+                if row_id.0 < min_rid || row_id.0 > max_rid {
+                    continue;
+                }
+            }
             let Ok(mut reader) = self.open_reader(rr.run_id) else {
                 continue;
             };
@@ -5502,7 +5792,9 @@ impl Table {
         for run in &self.run_refs {
             control.checkpoint()?;
             let reader = self.open_reader(run.run_id)?;
-            // Residual: sorted runs are epoch-keyed on disk (no commit_ts column).
+            // Cursor restores optional SYS_COMMIT_TS into RunVisibleVersion so
+            // merge_controlled_visible_sources can apply HLC authority across
+            // Memory↔Run tiers (P0.5 / Claim-1 residual).
             sources.push(ControlledVisibleSource::run(
                 reader.into_visible_version_cursor(snapshot.epoch)?,
             ));
@@ -9090,18 +9382,26 @@ impl Table {
         for condition in conditions {
             sets.push(self.resolve_condition(condition, snapshot)?);
         }
-        let mut rids = RowIdSet::intersect_many(sets);
-        // §5.1: the in-memory indexes (bitmap/FM/ANN/sparse/minhash) are
-        // append-only across puts (`index_row` adds entries but
-        // `tombstone_row` never removes them), so deletes and PK-displacing
-        // updates leave behind entries for now-tombstoned row-ids. The
-        // materialize paths (`query`, `query_columns_native`) already drop
-        // these via MVCC visibility during row fetch; only the count fast
-        // path trusts raw index cardinality, so prune tombstoned overlay
-        // row-ids here. On a clean table (empty overlay) the bitmap was
-        // rebuilt at flush and is authoritative — the prune is skipped.
-        if !self.memtable.is_empty() || !self.mutable_run.is_empty() {
-            rids.remove_many(self.overlay_tombstoned_rids(snapshot));
+        let rids = RowIdSet::intersect_many(sets);
+        // §5.1: secondary indexes are append-only across pure deletes, so
+        // tombstoned rids linger under equality keys until a pin-aware rebuild
+        // / compaction. Materialize paths already filter via MVCC. The count
+        // path must not trust raw index cardinality whenever deletes have ever
+        // happened (including after flush/spill emptied the overlay and after
+        // reopen of a checkpoint that still carries stale memberships).
+        // `had_deletes` is reconstructed on open from run_count vs live_count.
+        if self.had_deletes
+            || !self.memtable.is_empty()
+            || !self.mutable_run.is_empty()
+        {
+            let sorted = rids.into_sorted_vec();
+            let count = self.rows_for_rids(&sorted, snapshot)?.len() as u64;
+            crate::trace::QueryTrace::record(|t| {
+                t.scan_mode = crate::trace::ScanMode::CountSurvivors;
+                t.survivor_count = Some(count as usize);
+                t.conditions_pushed = conditions.len();
+            });
+            return Ok(Some(count));
         }
         let count = rids.len() as u64;
         crate::trace::QueryTrace::record(|t| {
@@ -9114,8 +9414,9 @@ impl Table {
 
     /// Row-ids whose newest visible overlay version is a tombstone. Used to
     /// prune stale entries left behind by the append-only in-memory indexes
-    /// (see `count_conditions`). Only unflushed tombstones matter — a flush
-    /// rebuilds indexes from runs and excludes tombstoned rows. (§5.1)
+    /// (see point dual-source / overlay merge). Tombstones may also live in
+    /// sorted runs after flush; callers that need full correctness use
+    /// materialize (`rows_for_rids`) instead of this overlay-only set. (§5.1)
     fn overlay_tombstoned_rids(&self, snapshot: Snapshot) -> Vec<u64> {
         let mut out = Vec::new();
         for row in self.memtable.visible_versions(snapshot.epoch) {
@@ -9229,6 +9530,8 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.run_row_id_ranges
+            .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         self.live_count = self.live_count.saturating_add(write_n as u64);
         if eager_index_build {
             let row_ids: Vec<u64> = (first..first + write_n as u64).collect();
@@ -12071,6 +12374,20 @@ impl Table {
 
     pub(crate) fn set_run_refs(&mut self, refs: Vec<RunRef>) {
         self.run_refs = refs;
+        self.refresh_run_row_id_ranges();
+    }
+
+    /// Populate `run_row_id_ranges` from each run's on-disk header so
+    /// [`Self::get`] can skip runs that cannot contain a given RowId.
+    pub(crate) fn refresh_run_row_id_ranges(&mut self) {
+        let mut ranges = HashMap::with_capacity(self.run_refs.len());
+        for rr in &self.run_refs {
+            if let Ok(reader) = self.open_reader(rr.run_id) {
+                let h = reader.header();
+                ranges.insert(rr.run_id, (h.min_row_id, h.max_row_id));
+            }
+        }
+        self.run_row_id_ranges = ranges;
     }
 
     pub(crate) fn compaction_zstd_level(&self) -> i32 {

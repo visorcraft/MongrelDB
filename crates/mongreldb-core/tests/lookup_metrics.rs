@@ -126,9 +126,11 @@ fn result_cache_counters_advance_on_repeat_query() {
         "expected at least one miss on first query, got {}",
         miss_delta
     );
-    assert!(
-        write_delta > 0,
-        "expected persistent write latency > 0 on insert, got {}",
-        write_delta
+    // Tiny one-row PK results stay below the default 4 KiB persist threshold
+    // so a warm miss is not forced to pay synchronous filesystem publish.
+    // Memory-tier insert still happens (proven by the hit on the second call).
+    assert_eq!(
+        write_delta, 0,
+        "tiny one-row result must skip persistent tier (got write_us delta {write_delta})"
     );
 }

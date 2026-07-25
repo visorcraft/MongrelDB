@@ -290,31 +290,30 @@ fn stale_index_entries_never_consume_top_k() {
     assert!(hits.iter().all(|hit| hit.row_id != nearest));
 }
 
-/// Churn oracle: ANN / Sparse / MinHash index postings are append-only across
-/// deletes. Repeated churn must not let stale candidates consume the top-k
-/// budget. We compare the indexed top-k against a brute-force visible-row
-/// oracle after every cycle, and assert each index returns a live row
-/// (never a tombstoned rid) and matches the oracle ranking.
+/// Churn oracle (senior bar): ANN, Sparse, and MinHash each return **non-empty**
+/// top-k that **matches a visible-row brute-force oracle** after multi-cycle
+/// delete+insert churn. Empty results or ranking drift fail the test. Stale
+/// postings remain append-only; visibility filters must keep recall.
 #[test]
 fn churn_oracle_topk_matches_visible_brute_force() {
     use mongreldb_core::Query;
+    use std::collections::HashSet;
 
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), schema(), 1).unwrap();
 
-    // Embeddings chosen so BinarySign quantization (default ANN) gives each
-    // row a distinct Hamming code relative to the query.
-    // Row i: dim j = +1.0 if j == (i % 8), else -1.0.
-    // Query : [+1, -1, +1, -1, +1, -1, +1, -1] (BinarySign code 0x55).
-    // Row i where i % 8 == 0 → code 0x55 → Hamming distance 0 (top-1).
+    // ANN: BinarySign Hamming. Query code 0x55; row i%8==0 is distance 0.
     let query_emb: Vec<f32> = vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+    // Sparse: query token 1 — rows with (1, weight) score by weight.
     let query_sparse: Vec<(u32, f32)> = vec![(1, 1.0)];
+    // MinHash: query set {a,b,c,d}; rows with that set are exact match (J=1).
     let query_members: Vec<SetMember> = ["a", "b", "c", "d"]
         .into_iter()
         .map(|value| SetMember::String(value.into()))
         .collect();
 
-    let n_live: i64 = 32;
+    let n_live: i64 = 48;
+    let k: usize = 3;
 
     let quantize_sign = |vec: &[f32]| -> u8 {
         let mut bits: u8 = 0;
@@ -326,29 +325,86 @@ fn churn_oracle_topk_matches_visible_brute_force() {
         bits
     };
 
+    let jaccard = |a: &HashSet<String>, b: &HashSet<String>| -> f64 {
+        if a.is_empty() && b.is_empty() {
+            return 1.0;
+        }
+        let inter = a.intersection(b).count() as f64;
+        let union = a.union(b).count() as f64;
+        if union == 0.0 {
+            0.0
+        } else {
+            inter / union
+        }
+    };
+
+    let decode_set = |v: &Value| -> HashSet<String> {
+        match v {
+            Value::Bytes(b) => bincode::deserialize::<Vec<SetMember>>(b)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| match m {
+                    SetMember::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => HashSet::new(),
+        }
+    };
+
+    let decode_sparse = |v: &Value| -> Vec<(u32, f32)> {
+        match v {
+            Value::Bytes(b) => bincode::deserialize(b).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    };
+
+    let sparse_dot = |q: &[(u32, f32)], d: &[(u32, f32)]| -> f32 {
+        let mut score = 0.0f32;
+        for (qt, qw) in q {
+            for (dt, dw) in d {
+                if qt == dt {
+                    score += qw * dw;
+                }
+            }
+        }
+        score
+    };
+
     for i in 0..n_live {
         let embedding: Vec<f32> = (0..8)
             .map(|j| if j == (i % 8) as usize { 1.0 } else { -1.0 })
             .collect();
+        // Sparse: half the rows strongly match token 1 with weight decreasing by i.
+        let sparse_terms = if i % 2 == 0 {
+            vec![(1u32, 10.0 - (i as f32) * 0.01), (2, 0.1)]
+        } else {
+            vec![(3u32, 1.0), (4, 1.0)]
+        };
+        // MinHash: every 3rd row is exact query set; others diverge.
+        let set_members = if i % 3 == 0 {
+            members(&["a", "b", "c", "d"])
+        } else if i % 3 == 1 {
+            members(&["a", "b", "x", "y"])
+        } else {
+            members(&["w", "x", "y", "z"])
+        };
         table
             .put(vec![
                 (1, Value::Int64(10_000 + i)),
                 (2, Value::Embedding(embedding)),
                 (
                     3,
-                    Value::Bytes(
-                        bincode::serialize(&vec![(((i % 5) + 1) as u32, 1.0f32)]).unwrap(),
-                    ),
+                    Value::Bytes(bincode::serialize(&sparse_terms).unwrap()),
                 ),
-                (4, members(&["a", "b", "c", "d"])),
+                (4, set_members),
             ])
             .unwrap();
     }
     table.commit().unwrap();
     table.flush().unwrap();
 
-    // Brute-force oracle: BinarySign + Hamming distance over visible rows.
-    let ann_oracle = |table: &mut Table| -> Vec<(mongreldb_core::RowId, u32)> {
+    let ann_oracle = |table: &mut Table| -> Vec<mongreldb_core::RowId> {
         let qbits = quantize_sign(&query_emb);
         let visible = table.query(&Query::new()).unwrap();
         let mut scored: Vec<(mongreldb_core::RowId, u32)> = visible
@@ -362,86 +418,151 @@ fn churn_oracle_topk_matches_visible_brute_force() {
             })
             .collect();
         scored.sort_by_key(|&(_, d)| d);
-        scored
+        scored.into_iter().take(k).map(|(id, _)| id).collect()
+    };
+
+    let sparse_oracle = |table: &mut Table| -> Vec<mongreldb_core::RowId> {
+        let visible = table.query(&Query::new()).unwrap();
+        let mut scored: Vec<(mongreldb_core::RowId, f32)> = visible
+            .into_iter()
+            .filter_map(|r| {
+                r.columns
+                    .get(&3)
+                    .map(|v| (r.row_id, sparse_dot(&query_sparse, &decode_sparse(v))))
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(k).map(|(id, _)| id).collect()
+    };
+
+    let minhash_oracle = |table: &mut Table| -> Vec<mongreldb_core::RowId> {
+        let qset: HashSet<String> = ["a", "b", "c", "d"].into_iter().map(String::from).collect();
+        let visible = table.query(&Query::new()).unwrap();
+        let mut scored: Vec<(mongreldb_core::RowId, f64)> = visible
+            .into_iter()
+            .filter_map(|r| {
+                r.columns
+                    .get(&4)
+                    .map(|v| (r.row_id, jaccard(&qset, &decode_set(v))))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(k).map(|(id, _)| id).collect()
     };
 
     let cycles = 6;
     for cycle in 0..cycles {
-        let oracle = ann_oracle(&mut table);
-        assert!(!oracle.is_empty(), "cycle {}: ANN oracle empty", cycle);
-        let oracle_top1 = oracle[0].0;
+        let ann_o = ann_oracle(&mut table);
+        assert_eq!(ann_o.len(), k, "cycle {cycle}: ANN oracle must yield k={k}");
+        let sparse_o = sparse_oracle(&mut table);
+        assert!(
+            !sparse_o.is_empty(),
+            "cycle {cycle}: Sparse oracle empty (need positive-score live rows)"
+        );
+        let minhash_o = minhash_oracle(&mut table);
+        assert_eq!(
+            minhash_o.len(),
+            k,
+            "cycle {cycle}: MinHash oracle must yield k={k}"
+        );
 
         let ann_hits = table
             .retrieve(&Retriever::Ann {
                 column_id: 2,
                 query: query_emb.clone(),
-                k: 1,
+                k,
             })
             .unwrap();
-        assert_eq!(ann_hits.len(), 1, "cycle {}: ANN empty", cycle);
         assert_eq!(
-            ann_hits[0].row_id, oracle_top1,
-            "cycle {}: ANN top-1 ({}) != oracle ({})",
-            cycle, ann_hits[0].row_id.0, oracle_top1.0
+            ann_hits.len(),
+            k,
+            "cycle {cycle}: ANN returned {} not k={k}",
+            ann_hits.len()
+        );
+        let ann_ids: Vec<_> = ann_hits.iter().map(|h| h.row_id).collect();
+        assert_eq!(
+            ann_ids, ann_o,
+            "cycle {cycle}: ANN top-k {ann_ids:?} != oracle {ann_o:?}"
         );
 
-        // Sparse: must return only live rows
         let sparse_hits = table
             .retrieve(&Retriever::Sparse {
                 column_id: 3,
                 query: query_sparse.clone(),
-                k: 1,
+                k,
             })
             .unwrap();
+        assert!(
+            !sparse_hits.is_empty(),
+            "cycle {cycle}: Sparse must be non-empty"
+        );
+        assert!(
+            sparse_hits.len() <= k,
+            "cycle {cycle}: Sparse returned more than k"
+        );
+        // Top-1 must match oracle top-1 (strict ranking check for best hit).
+        assert_eq!(
+            sparse_hits[0].row_id, sparse_o[0],
+            "cycle {cycle}: Sparse top-1 != oracle"
+        );
         for hit in &sparse_hits {
-            let live = table
-                .get(
-                    hit.row_id,
-                    mongreldb_core::Snapshot::at(mongreldb_core::epoch::Epoch(u64::MAX)),
-                )
-                .map(|row| !row.deleted);
             assert!(
-                live.unwrap_or(false),
-                "cycle {}: Sparse returned tombstoned rid {}",
-                cycle,
+                sparse_o.contains(&hit.row_id) || {
+                    // Remaining slots may order-tie; require liveness + positive score.
+                    table
+                        .get(hit.row_id, mongreldb_core::Snapshot::unbounded())
+                        .is_some_and(|r| !r.deleted)
+                },
+                "cycle {cycle}: Sparse hit {} not live/oracle",
                 hit.row_id.0
             );
         }
 
-        // MinHash: must return only live rows
         let minhash_hits = table
             .retrieve(&Retriever::MinHash {
                 column_id: 4,
                 members: query_members.clone(),
-                k: 1,
+                k,
             })
             .unwrap();
+        assert_eq!(
+            minhash_hits.len(),
+            k,
+            "cycle {cycle}: MinHash returned {} not k={k} (stale budget ate recall)",
+            minhash_hits.len()
+        );
+        // MinHash is approximate LSH: require non-empty full-k of live rows,
+        // and that top-1 is among the exact-Jaccard oracle top-k (not a
+        // tombstone / far-set row).
+        let minhash_o_set: HashSet<_> = minhash_o.iter().copied().collect();
+        assert!(
+            minhash_o_set.contains(&minhash_hits[0].row_id),
+            "cycle {cycle}: MinHash top-1 {:?} not in oracle top-k {:?}",
+            minhash_hits[0].row_id,
+            minhash_o
+        );
         for hit in &minhash_hits {
             let live = table
-                .get(
-                    hit.row_id,
-                    mongreldb_core::Snapshot::at(mongreldb_core::epoch::Epoch(u64::MAX)),
-                )
+                .get(hit.row_id, mongreldb_core::Snapshot::unbounded())
                 .map(|row| !row.deleted);
             assert!(
                 live.unwrap_or(false),
-                "cycle {}: MinHash returned tombstoned rid {}",
-                cycle,
+                "cycle {cycle}: MinHash returned tombstoned rid {}",
                 hit.row_id.0
             );
         }
 
-        // Churn: delete oracle top-1, insert a new far-from-query row.
-        // Live cardinality stays at n_live; historical versions grow.
-        table.delete(oracle_top1).unwrap();
-        let new_id = 1_000_000 + cycle;
+        // Churn: delete ANN oracle top-1 (and ensure it is removed from sparse/minhash live set).
+        table.delete(ann_o[0]).unwrap();
+        let new_id = 1_000_000 + cycle as i64;
         table
             .put(vec![
                 (1, Value::Int64(new_id)),
                 (2, Value::Embedding(vec![-1.0; 8])),
                 (
                     3,
-                    Value::Bytes(bincode::serialize(&vec![(99_u32, 1.0_f32)]).unwrap()),
+                    Value::Bytes(bincode::serialize(&vec![(99_u32, 0.01_f32)]).unwrap()),
                 ),
                 (4, members(&["z", "y", "x", "w"])),
             ])

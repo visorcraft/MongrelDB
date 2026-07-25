@@ -34,11 +34,16 @@ Bitmap membership (then re-merges overlay). That way Bitmap maintenance on
 update keeps product listing-by-FK / listing-by-owner correct even if a
 run/LearnedRange plan would otherwise miss a live row.
 
-### Delete removes Bitmap membership
+### Pure deletes keep Bitmap membership (MVCC)
 
-Live deletes capture the pre-image and drop the row-id from every Bitmap key
-before the tombstone lands (HOT was already cleaned). Flush rebuild remains
-the full authority for sealed runs.
+Pure deletes clear HOT but **do not** physically remove Bitmap memberships.
+Historical pinned snapshots must still discover deleted row-ids via
+`BitmapEq` while the pre-delete version is materializable. Count and
+materialize paths filter tombstones via MVCC visibility (and
+`had_deletes`-aware count materialization). Kit delete+put re-points Bitmap
+keys on the subsequent put using a retained pre-image. Compaction /
+`rebuild_indexes` rebuilds live memberships and re-indexes pin-needed
+historical discovery keys when pins are active.
 
 ### Rebuild after desync
 

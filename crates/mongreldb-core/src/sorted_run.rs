@@ -1943,6 +1943,10 @@ pub(crate) struct RunVisibleVersion {
     pub(crate) row_id: RowId,
     pub(crate) committed_epoch: Epoch,
     pub(crate) deleted: bool,
+    /// Optional HLC from SYS_COMMIT_TS when the run carries that column.
+    /// Used by controlled merge for HLC-authoritative cross-tier winners
+    /// without forcing full materialization first.
+    pub(crate) commit_ts: Option<HlcTimestamp>,
     page_seq: usize,
     within_page: usize,
 }
@@ -1959,6 +1963,10 @@ pub(crate) struct RunVisibleVersionCursor {
     row_ids: Vec<i64>,
     epochs: Vec<i64>,
     deleted: Vec<u8>,
+    /// Per-row optional HLC stamps for the loaded system page (parallel to
+    /// `row_ids`). Empty when the run has no SYS_COMMIT_TS column.
+    commit_ts: Vec<Option<HlcTimestamp>>,
+    has_commit_ts_col: bool,
     lookahead: Option<RunVisibleVersion>,
     materialized_page: Option<usize>,
     materialized_columns: Vec<(u16, columnar::NativeColumn)>,
@@ -1967,6 +1975,7 @@ pub(crate) struct RunVisibleVersionCursor {
 impl RunVisibleVersionCursor {
     fn new(reader: RunReader, snapshot: Epoch) -> Result<Self> {
         let page_row_counts = reader.page_row_counts(SYS_ROW_ID)?;
+        let has_commit_ts_col = reader.has_column(SYS_COMMIT_TS);
         Ok(Self {
             reader,
             snapshot,
@@ -1976,6 +1985,8 @@ impl RunVisibleVersionCursor {
             row_ids: Vec::new(),
             epochs: Vec::new(),
             deleted: Vec::new(),
+            commit_ts: Vec::new(),
+            has_commit_ts_col,
             lookahead: None,
             materialized_page: None,
             materialized_columns: Vec::new(),
@@ -2018,6 +2029,16 @@ impl RunVisibleVersionCursor {
                 columnar::NativeColumn::Bool { data, .. } => data,
                 _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
             };
+            self.commit_ts.clear();
+            if self.has_commit_ts_col {
+                let page = self.reader.read_page(SYS_COMMIT_TS, self.page_seq)?;
+                let native = columnar::decode_page_native(TypeId::Bytes, &page, rows)?;
+                self.commit_ts.reserve(rows);
+                for i in 0..rows {
+                    self.commit_ts
+                        .push(decode_commit_ts_value(native.value_at(i).as_ref()));
+                }
+            }
             self.within_page = 0;
             return Ok(true);
         }
@@ -2031,6 +2052,7 @@ impl RunVisibleVersionCursor {
                 self.row_ids.clear();
                 self.epochs.clear();
                 self.deleted.clear();
+                self.commit_ts.clear();
             }
             if !self.load_system_page(control)? {
                 return Ok(None);
@@ -2041,10 +2063,12 @@ impl RunVisibleVersionCursor {
         }
         let position = self.within_page;
         self.within_page += 1;
+        let commit_ts = self.commit_ts.get(position).copied().flatten();
         Ok(Some(RunVisibleVersion {
             row_id: RowId(self.row_ids[position] as u64),
             committed_epoch: Epoch(self.epochs[position] as u64),
             deleted: self.deleted[position] != 0,
+            commit_ts,
             page_seq: self.page_seq,
             within_page: position,
         }))
@@ -2070,8 +2094,14 @@ impl RunVisibleVersionCursor {
                     break;
                 }
                 if candidate.committed_epoch <= self.snapshot
-                    && best
-                        .is_none_or(|current| candidate.committed_epoch > current.committed_epoch)
+                    && best.is_none_or(|current| {
+                        crate::epoch::Snapshot::version_is_newer(
+                            candidate.committed_epoch,
+                            candidate.commit_ts,
+                            current.committed_epoch,
+                            current.commit_ts,
+                        )
+                    })
                 {
                     best = Some(candidate);
                 }
@@ -2119,18 +2149,22 @@ impl RunVisibleVersionCursor {
                 )
             })
             .collect();
-        // Optional HLC stamp (P0.5-T3): load from SYS_COMMIT_TS when present.
-        let commit_ts = if self.reader.has_column(SYS_COMMIT_TS) {
-            let page = self.reader.read_page(SYS_COMMIT_TS, version.page_seq)?;
-            let native = columnar::decode_page_native(
-                TypeId::Bytes,
-                &page,
-                self.page_row_counts[version.page_seq],
-            )?;
-            decode_commit_ts_value(native.value_at(version.within_page).as_ref())
-        } else {
-            None
-        };
+        // Prefer the stamp already loaded on the candidate; fall back to a
+        // page read for legacy cursors that predate per-candidate stamps.
+        let commit_ts = version.commit_ts.or_else(|| {
+            if self.reader.has_column(SYS_COMMIT_TS) {
+                let page = self.reader.read_page(SYS_COMMIT_TS, version.page_seq).ok()?;
+                let native = columnar::decode_page_native(
+                    TypeId::Bytes,
+                    &page,
+                    self.page_row_counts[version.page_seq],
+                )
+                .ok()?;
+                decode_commit_ts_value(native.value_at(version.within_page).as_ref())
+            } else {
+                None
+            }
+        });
         Ok(Row {
             row_id: version.row_id,
             committed_epoch: version.committed_epoch,
