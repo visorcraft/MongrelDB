@@ -9197,7 +9197,32 @@ impl Table {
                 // that still has a correct Bitmap membership (and vice versa
                 // the overlay merge still covers pure-memtable puts).
                 let mut set = if let Some(li) = self.learned_range.get(column_id) {
-                    RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
+                    if self.run_refs.len() == 1 {
+                        // Single-run: learned_range was built from this run and
+                        // excludes tombstones, so it's MVCC-correct.
+                        RowIdSet::from_unsorted(
+                            li.range(*lo, *hi).into_iter().collect(),
+                        )
+                    } else {
+                        // Multi-run: learned_range only covers run_refs[0]; a
+                        // tombstone in a later run wouldn't strip its alive
+                        // preimage rid from the PGM, and the overlay merge
+                        // (memtable + mutable_run) is empty after a spill, so a
+                        // leaked rid would surface as a wrong hit. Fall through
+                        // to the MVCC-aware multi-run path so deletes land in
+                        // any run are honored.
+                        let mut multi =
+                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        if lo == hi {
+                            self.union_bitmap_point_i64(
+                                &mut multi,
+                                *column_id,
+                                *lo,
+                                snapshot,
+                            );
+                        }
+                        return Ok(multi);
+                    }
                 } else if self.run_refs.len() == 1 {
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
                     r.range_row_id_set_i64(*column_id, *lo, *hi)?
@@ -9297,6 +9322,13 @@ impl Table {
         snapshot: Snapshot,
     ) -> Result<RowIdSet> {
         let mut row_ids = Vec::new();
+        // Collect per-run tombstones whose newest visible version is a
+        // tombstone: they must strip any alive preimage rid that landed in
+        // an older run from the survivor set. Without this, a delete-after-
+        // put whose tombstone lands in a newer run can't override the
+        // preimage that `range_row_ids_visible_i64` happily returned for the
+        // older run — the model filters them out, the engine must too.
+        let mut tomb_rids: HashSet<u64> = HashSet::new();
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
@@ -9306,8 +9338,12 @@ impl Table {
                     row_ids.push(rid);
                 }
             }
+            for rid in reader.tombstoned_row_ids(snapshot.epoch)? {
+                tomb_rids.insert(rid);
+            }
         }
         let mut s = RowIdSet::from_unsorted(row_ids);
+        s.remove_many(tomb_rids);
         self.range_scan_overlay_i64(&mut s, column_id, lo, hi, snapshot);
         Ok(s)
     }
