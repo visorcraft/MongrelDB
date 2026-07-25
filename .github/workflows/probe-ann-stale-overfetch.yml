@@ -29,6 +29,22 @@ jobs:
           cargo fmt
           cargo clippy -p mongreldb-core --test ann_stale_overfetch --all-features -- -D warnings
       - name: Run stale-overfetch regression probe
+        id: probe
+        shell: bash
+        continue-on-error: true
         run: |
+          set -o pipefail
+          mkdir -p /tmp/ann-stale-overfetch
           cargo test -p mongreldb-core --all-features \
-            --test ann_stale_overfetch -- --nocapture
+            --test ann_stale_overfetch -- --nocapture \
+            2>&1 | tee /tmp/ann-stale-overfetch/test.log
+          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ann-stale-overfetch
+          path: /tmp/ann-stale-overfetch
+          if-no-files-found: error
+      - name: Preserve failing probe result
+        if: always()
+        run: test "${{ steps.probe.outputs.status }}" = 0
