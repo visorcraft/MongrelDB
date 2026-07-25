@@ -1,0 +1,149 @@
+name: Validate HNSW connectivity candidate
+
+on:
+  push:
+    branches: [agent/probe-ann-stale-overfetch-ca3]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Apply reciprocal-connectivity invariant
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hnsw-connectivity
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/mongreldb-core/src/index/hnsw.rs')
+          source = path.read_text()
+          old_binary = '''            for &n in &neighbors {
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(Dist, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (hamming(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by_key(|(d, _)| *d);
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                }
+            }
+'''
+          new_binary = '''            for (neighbor_rank, &n) in neighbors.iter().enumerate() {
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(Dist, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (hamming(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by_key(|(d, _)| *d);
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    if neighbor_rank == 0 && !adj.contains(&node) {
+                        adj.pop();
+                        adj.push(node);
+                    }
+                }
+            }
+'''
+          old_dense = '''            for &n in &neighbors {
+                checkpoint()?;
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(f32, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by(|(da, _), (db, _)| da.total_cmp(db));
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                }
+            }
+'''
+          new_dense = '''            for (neighbor_rank, &n) in neighbors.iter().enumerate() {
+                checkpoint()?;
+                let adj = &mut self.graph[n][lc as usize];
+                adj.push(node);
+                if adj.len() > m_layer {
+                    let nv = self.vectors[n].clone();
+                    let neighbor_adj: Vec<usize> = adj.clone();
+                    let mut scored: Vec<(f32, usize)> = neighbor_adj
+                        .iter()
+                        .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
+                        .collect();
+                    scored.sort_by(|(da, _), (db, _)| da.total_cmp(db));
+                    scored.truncate(m_layer);
+                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    if neighbor_rank == 0 && !adj.contains(&node) {
+                        adj.pop();
+                        adj.push(node);
+                    }
+                }
+            }
+'''
+          for label, old, new in [
+              ('binary reciprocal block', old_binary, new_binary),
+              ('dense reciprocal block', old_dense, new_dense),
+          ]:
+              if source.count(old) != 1:
+                  raise SystemExit(f'expected one {label}, found {source.count(old)}')
+              source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+          cargo fmt
+          git diff --check
+          git diff --binary ca3d0b2442bc83759686fa8fd0a449964d7a68a8 -- \
+            crates/mongreldb-core/src/index/hnsw.rs \
+            crates/mongreldb-core/tests/ann_stale_overfetch.rs \
+            > /tmp/hnsw-connectivity/hnsw-connectivity.patch
+          cp crates/mongreldb-core/src/index/hnsw.rs /tmp/hnsw-connectivity/hnsw.rs
+          cp crates/mongreldb-core/tests/ann_stale_overfetch.rs \
+            /tmp/hnsw-connectivity/ann_stale_overfetch.rs
+      - name: Formatting and Clippy
+        run: |
+          cargo fmt --check
+          cargo clippy -p mongreldb-core --all-targets --all-features -- -D warnings
+      - name: Focused regression and recall suites
+        run: |
+          cargo test -p mongreldb-core --all-features \
+            --test ann_stale_overfetch -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            --test retriever -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            --test ai_query_limits -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            index::hnsw -- --nocapture
+      - name: Complete core suite
+        run: cargo test -p mongreldb-core --all-features
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hnsw-connectivity-validation
+          path: /tmp/hnsw-connectivity
+          if-no-files-found: warn
