@@ -3900,18 +3900,8 @@ impl Table {
         if has_partial {
             // Partial predicates make selective unindex subtle; drop old Bitmap
             // memberships then full-index the new image (still cleans tombstone
-            // pollution for Bitmap keys).
-            for idef in &self.schema.indexes {
-                if idef.kind != crate::schema::IndexKind::Bitmap {
-                    continue;
-                }
-                if let Some(key) = crate::index::maintain::bitmap_key_for_column(old, idef.column_id)
-                {
-                    if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
-                        b.remove(&key, old.row_id);
-                    }
-                }
-            }
+            // pollution for Bitmap keys on the replace path only).
+            self.unindex_bitmap_membership(old);
             self.index_row(new);
             return;
         }
@@ -4320,24 +4310,24 @@ impl Table {
         epoch: Epoch,
         commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     ) {
-        // Capture the pre-image *before* the tombstone lands so Bitmap keys
-        // can be cleaned. Indexes are otherwise append-only across deletes
-        // (§5.1): without this, tombstoned row-ids linger under equality keys
-        // until a flush rebuild. Kit's update path is delete+put; leaving the
-        // old rid in the Bitmap and only re-pointing on put races with partial
-        // schema / failed puts and has shown up as "row gone from list".
-        let preimage = self.get(row_id, self.snapshot());
+        // HOT must drop the PK→rid map so a subsequent put of the same PK can
+        // re-bind. Bitmap secondaries intentionally stay append-only across
+        // pure deletes (§5.1): physical remove would hide the rid from
+        // BitmapEq / BitmapIn / BytesPrefix at older pinned snapshots even
+        // though the pre-delete version is still materializable under MVCC.
+        // Materialize + count paths filter tombstones via visibility /
+        // `overlay_tombstoned_rids`. Kit's update path (delete+put) re-points
+        // Bitmap keys in `maintain_indexes_on_pk_replace` using the replaced
+        // pre-image; flush rebuild drops tombstoned memberships entirely.
         self.remove_hot_for_row(row_id, epoch);
-        if let Some(row) = preimage.as_ref() {
-            self.unindex_bitmap_membership(row);
-        }
         self.tombstone_row(row_id, epoch, commit_ts, true);
         self.data_generation = self.data_generation.wrapping_add(1);
     }
 
     /// Drop this row's membership from every Bitmap secondary (best-effort).
-    /// Used on the live delete path so equality keys do not retain tombstoned
-    /// row-ids until the next flush rebuild.
+    /// Used on replace / partial-predicate paths that must re-point equality
+    /// keys; pure deletes keep membership so historical snapshots can still
+    /// discover the rid via BitmapEq (see [`Self::apply_delete_at`]).
     fn unindex_bitmap_membership(&mut self, row: &Row) {
         if row.deleted {
             return;
