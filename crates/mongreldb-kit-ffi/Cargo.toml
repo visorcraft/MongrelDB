@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-kit-ffi"
-version = "0.64.8"
+version = "0.64.9"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -23,7 +23,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-# Engine 0.64.8 and Kit 0.64.8 are both published and aligned, so the adapter
+# Engine 0.64.9 and Kit 0.64.8 are both published and aligned, so the adapter
 # resolves everything from the registry. Re-add the [patch.crates-io] below
 # when a core/query fix must ship before the next engine release.
 kit = { package = "mongreldb-kit", version = "=0.64.8" }
