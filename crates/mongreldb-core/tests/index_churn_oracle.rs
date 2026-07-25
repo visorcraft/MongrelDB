@@ -1111,6 +1111,7 @@ fn churn_oracle_ann_hnsw_dense() {
                 // Encryption on: open an encrypted sibling and confirm the
                 // model + oracle agreement still holds for the plain table.
                 let enc_dir = dir.path().join("enc_check");
+                let _ = std::fs::remove_dir_all(&enc_dir);
                 std::fs::create_dir_all(&enc_dir).unwrap();
                 let mut enc = Table::create_encrypted(
                     &enc_dir,
