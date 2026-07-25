@@ -3716,11 +3716,17 @@ impl Table {
         if cols.is_empty() {
             return Ok(());
         }
+        // Build the PGM from the newest *visible* (non-tombstoned, snapshot-
+        // eligible) row per RowId. The run's raw column pages also hold prior
+        // versions and tombstones (deletes are physical, not logical); feeding
+        // those into the PGM would surface stale rids from `ColumnLearnedRange::
+        // range` that the engine's overlay merge cannot strip — a leaked
+        // tombstone is a wrong hit (tested by `churn_oracle_learned_range`).
+        let snapshot_epoch = self.current_epoch();
         let mut reader = self.open_reader(self.run_refs[0].run_id)?;
-        let row_ids: Vec<u64> = match reader.column_native(crate::sorted_run::SYS_ROW_ID)? {
-            columnar::NativeColumn::Int64 { data, .. } => data.iter().map(|x| *x as u64).collect(),
-            _ => return Ok(()),
-        };
+        let (visible_positions, visible_rids) =
+            reader.visible_positions_with_rids(snapshot_epoch)?;
+        let row_ids: Vec<u64> = visible_rids.iter().map(|r| *r as u64).collect();
         for (column_index, (cid, epsilon)) in cols.into_iter().enumerate() {
             if column_index % 256 == 0 {
                 if let Some(control) = control {
@@ -3737,10 +3743,10 @@ impl Table {
             match ty {
                 TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
                     if let columnar::NativeColumn::Int64 { data, .. } = reader.column_native(cid)? {
-                        let pairs: Vec<(i64, u64)> = data
+                        let pairs: Vec<(i64, u64)> = visible_positions
                             .iter()
                             .zip(row_ids.iter())
-                            .map(|(v, r)| (*v, *r))
+                            .map(|(&p, &r)| (data[p], r))
                             .collect();
                         Arc::make_mut(&mut self.learned_range).insert(
                             cid,
@@ -3752,10 +3758,10 @@ impl Table {
                     if let columnar::NativeColumn::Float64 { data, .. } =
                         reader.column_native(cid)?
                     {
-                        let pairs: Vec<(f64, u64)> = data
+                        let pairs: Vec<(f64, u64)> = visible_positions
                             .iter()
                             .zip(row_ids.iter())
-                            .map(|(v, r)| (*v, *r))
+                            .map(|(&p, &r)| (data[p], r))
                             .collect();
                         Arc::make_mut(&mut self.learned_range).insert(
                             cid,
