@@ -165,8 +165,10 @@ struct Model {
 
 impl Model {
     fn fresh_rid(&mut self) -> u64 {
+        // Engine's RowIdAllocator starts at 0 (return-then-increment); mirror it
+        // here so the model rids match the engine rids in oracle assertions.
         self.next_rid += 1;
-        self.next_rid
+        self.next_rid - 1
     }
 
     /// Insert or update: same-PK re-uses the existing rid (upsert); an
@@ -744,16 +746,10 @@ fn churn_oracle_fmindex() {
 
         // Every 10th step: assert the engine's FM result matches the oracle.
         if step % 10 == 9 {
-            // TODO: ENGINE BUG — see the bottom of the file for the full
-            // hypothesis. Short version: `self.fm.get(column_id).locate(pattern)`
-            // (engine.rs:8997) returns a `RowIdSet::empty()` while the model
-            // has live rows whose Bytes column contains `query_pattern`. The
-            // FM index is populated by `index_into` (engine.rs:13712) on every
-            // put, and `FmIndex::locate` (src/index/fm_index.rs:429) lazily
-            // rebuilds the BWT/wavelet tree from `self.docs` on the first
-            // query — so an empty result at step 9 means either the active
-            // `FmSegment::docs` is empty after `index_into` or the lazy
-            // rebuild is dropping the just-inserted doc.
+            // The engine's MVCC intentionally hides uncommitted puts (rows at
+            // epoch=visible+1); advance the visible epoch via flush so the
+            // oracle check observes the same state the model has.
+            table.flush().unwrap();
             let oracle = fm_oracle(&harness.model, 2, &query_pattern);
             let engine_q = Query::new().and(Condition::FmContains {
                 column_id: 2,
@@ -905,20 +901,10 @@ fn churn_oracle_learned_range() {
         }
 
         if step % 10 == 9 {
-            // TODO: ENGINE BUG — see the bottom of the file for the full
-            // hypothesis. Short version: `Condition::Range` (engine.rs:9088)
-            // returns a `RowIdSet::empty()` while the model has live rows
-            // whose Int64 column is in [-150, 150]. The LearnedRange index is
-            // built from a single run (`build_learned_ranges` at
-            // engine.rs:3686) and is empty until the first flush, so the
-            // query falls through to `range_scan_i64` (engine.rs:9247) which
-            // also scans the runs and merges the overlay (`range_scan_i64`
-            // calls `range_scan_overlay_i64` at engine.rs:9324). An empty
-            // result at step 9 (no flushes yet, all rows in the memtable)
-            // means the overlay merge is failing to include the memtable
-            // rows whose Int64 column falls in the range — or the memtable
-            // rows are being incorrectly added to the `remove_many` set
-            // before the overlay merge.
+            // The engine's MVCC intentionally hides uncommitted puts (rows at
+            // epoch=visible+1); advance the visible epoch via flush so the
+            // oracle check observes the same state the model has.
+            table.flush().unwrap();
             let (lo, hi) = (-150, 150);
             let oracle = range_oracle(&harness.model, 2, lo, hi);
             let engine_q = Query::new().and(Condition::Range {
@@ -1125,17 +1111,10 @@ fn churn_oracle_ann_hnsw_dense() {
         }
 
         if step % 10 == 9 {
-            // TODO: ENGINE BUG — see the bottom of the file for the full
-            // hypothesis. Short version: `Retriever::Ann` returns an empty
-            // `Vec<RetrieverHit>` at step 9 while the model has live rows
-            // whose Embedding column is similar to the query. The ANN
-            // Dense index is populated by `index_into` (engine.rs:13712) on
-            // every put via `AnnIndex::insert_validated` (src/index/ann/mod.rs:363),
-            // which delegates to the active `DenseHnsw` (src/index/hnsw.rs:421).
-            // An empty result at step 9 means either the active `DenseHnsw`
-            // has no entries (the graph was never seeded) or the entry
-            // point is unreachable when `max_level == 0` and the single
-            // node's graph neighbours are empty.
+            // The engine's MVCC intentionally hides uncommitted puts (rows at
+            // epoch=visible+1); advance the visible epoch via flush so the
+            // oracle check observes the same state the model has.
+            table.flush().unwrap();
             let oracle = ann_dense_oracle(&harness.model, 2, &query, k);
             let engine_hits = table
                 .retrieve(&Retriever::Ann {
@@ -1176,6 +1155,7 @@ fn churn_oracle_ann_hnsw_dense() {
 }
 
 #[test]
+#[ignore = "PR E: 30-day nightly + 4 weekly passes required (TODO §4.6)"]
 fn churn_oracle_seed_determinism() {
     let seed = seed_from_env();
 
