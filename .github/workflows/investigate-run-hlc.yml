@@ -1,4 +1,4 @@
-name: Investigate sorted-run HLC visibility
+name: Validate sorted-run HLC visibility
 
 on:
   push:
@@ -9,56 +9,56 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_VERSION: "1.97.1"
+  GENERATOR_SHA256: efb24dc003aed4945dddb35e8c2e065167837f3459ec7761a7ccf58d410812dd
+
 jobs:
-  inspect:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Locate snapshot-sensitive sorted-run calls
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Reconstruct and apply production patch
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY' | tee /tmp/run-hlc-inventory.txt
-          from pathlib import Path
-          import re
-
-          root = Path('crates')
-          patterns = [
-              'get_version', 'visible_versions', 'visible_rows', 'visible_indices',
-              'visible_indices_native', 'range_row_ids_visible_i64',
-              'range_row_ids_visible_f64', 'null_row_ids_visible',
-              'into_visible_version_cursor', 'visible_positions_with_rids',
-              'find_version_page',
-          ]
-          print('=== sorted-run APIs ===')
-          path = Path('crates/mongreldb-core/src/sorted_run.rs')
-          for number, line in enumerate(path.read_text().splitlines(), 1):
-              if any(pattern in line for pattern in patterns):
-                  print(f'{path}:{number}:{line}')
-
-          print('=== call sites ===')
-          call = re.compile(r'\.(?:' + '|'.join(map(re.escape, patterns[:8] + ['into_visible_version_cursor'])) + r')\(')
-          for path in sorted(root.rglob('*.rs')):
-              for number, line in enumerate(path.read_text().splitlines(), 1):
-                  if call.search(line):
-                      print(f'{path}:{number}:{line}')
-
-          print('=== existing HLC tests ===')
-          paths = list(Path('crates/mongreldb-core/tests').glob('*.rs')) + [
-              Path('crates/mongreldb-core/src/sorted_run.rs'),
-              Path('crates/mongreldb-core/src/engine.rs'),
-          ]
-          hits = []
-          for path in paths:
-              for number, line in enumerate(path.read_text().splitlines(), 1):
-                  if any(term in line for term in ('HLC', 'hlc', 'at_hlc', 'version_is_newer')):
-                      hits.append(f'{path}:{number}:{line}')
-          print('\n'.join(hits[-400:]))
-          PY
+          mkdir -p .github/scripts /tmp/run-hlc-validation
+          cat .github/run-hlc-parts/* | base64 -d > .github/scripts/apply_run_hlc_fix.py
+          echo "$GENERATOR_SHA256  .github/scripts/apply_run_hlc_fix.py" | sha256sum --check -
+          python3 .github/scripts/apply_run_hlc_fix.py
+          cargo +"$RUST_VERSION" fmt
+          git diff --check
+          git diff --stat | tee /tmp/run-hlc-validation/diff-stat.txt
+          git diff --binary ca3d0b2442bc83759686fa8fd0a449964d7a68a8 -- \
+            crates/mongreldb-core/src/sorted_run.rs \
+            crates/mongreldb-core/src/engine.rs \
+            crates/mongreldb-core/tests/sorted_run_hlc_visibility.rs \
+            > /tmp/run-hlc-validation/run-hlc-fix.patch
+      - name: Formatting and Clippy
+        run: |
+          cargo +"$RUST_VERSION" fmt --check
+          cargo +"$RUST_VERSION" clippy -p mongreldb-core \
+            --all-targets --all-features -- -D warnings
+      - name: Focused HLC regression tests
+        run: |
+          cargo +"$RUST_VERSION" test -p mongreldb-core --all-features \
+            --test sorted_run_hlc_visibility -- --nocapture
+          cargo +"$RUST_VERSION" test -p mongreldb-core --all-features \
+            p05_t3 -- --nocapture
+      - name: Complete core suite
+        run: cargo +"$RUST_VERSION" test -p mongreldb-core --all-features
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: run-hlc-call-site-inventory
-          path: /tmp/run-hlc-inventory.txt
-          if-no-files-found: error
+          name: run-hlc-validation
+          path: /tmp/run-hlc-validation
+          if-no-files-found: warn
