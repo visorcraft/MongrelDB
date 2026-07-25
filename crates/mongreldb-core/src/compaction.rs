@@ -30,16 +30,72 @@ impl Table {
     /// Conservative so a steady write stream doesn't compact too eagerly.
     pub const AUTO_COMPACT_RUN_THRESHOLD: usize = 8;
 
+    /// Maximum number of L0 runs permitted to overlap one another before
+    /// compaction is forced (TODO §1.2 closure gate). L0 is the mutable-run
+    /// spill tier — every flush that exceeds the mutable-run spill threshold
+    /// produces a fresh L0 run, and once their row-id ranges start to pile up
+    /// the read path pays decode work proportional to the overlap. Compaction
+    /// collapses every L0 (and any L1+ disjoint from the result) into a single
+    /// L1 run with a disjoint range.
+    pub const MAX_L0_OVERLAPPING_RUNS: usize = 64;
+
     /// Whether this table would benefit from compaction right now — the
     /// query-cost signal for §5.9. Pure run-count topology (no per-query
     /// bookkeeping): once runs have accumulated past the threshold, scans and
     /// pushdown queries are paying multi-run fallback cost, so compaction is
     /// worthwhile. A daemon (or any long-lived holder) polls this.
     pub fn should_compact(&self) -> bool {
-        self.run_refs().len() >= Self::AUTO_COMPACT_RUN_THRESHOLD
-            || (self.ttl().is_some()
-                && !self.run_refs().is_empty()
-                && self.has_expired_run_rows().unwrap_or(false))
+        if self.run_refs().len() >= Self::AUTO_COMPACT_RUN_THRESHOLD {
+            return true;
+        }
+        // Force-compact before the L0 overlap cap is exceeded. Reading the
+        // count is O(runs) and cheaper than a TTL scan, so it can run on every
+        // `should_compact` poll without bookkeeping.
+        if self.l0_run_count() >= Self::MAX_L0_OVERLAPPING_RUNS {
+            return true;
+        }
+        self.ttl().is_some()
+            && !self.run_refs().is_empty()
+            && self.has_expired_run_rows().unwrap_or(false)
+    }
+
+    /// Number of run-refs currently at L0 (mutable-run spill tier).
+    pub(crate) fn l0_run_count(&self) -> usize {
+        self.run_refs().iter().filter(|rr| rr.level == 0).count()
+    }
+
+    /// `true` when `candidate` (min_row_id, max_row_id) overlaps any L1+ run
+    /// still alive after `retire` is removed. L1+ runs must stay disjoint so
+    /// the read path can binary-search the level and only open the single
+    /// covering run. `retire` is the set of run-ids this compaction is about
+    /// to supersede — the freshly merged L1 will replace them, so a
+    /// self-overlap against them is expected and ignored.
+    fn l1_range_overlaps(
+        &self,
+        min_row_id: u64,
+        max_row_id: u64,
+        retire: &std::collections::HashSet<u128>,
+    ) -> bool {
+        if min_row_id > max_row_id {
+            return false;
+        }
+        for rr in self.run_refs() {
+            if rr.level < 1 || retire.contains(&rr.run_id) {
+                continue;
+            }
+            if let Some((lo, hi)) = self.run_row_id_range(rr.run_id) {
+                // Two closed intervals [a, b] and [c, d] overlap iff a <= d
+                // and c <= b. Empty existing ranges (row_count == 0) trivially
+                // do not overlap.
+                if rr.row_count == 0 {
+                    continue;
+                }
+                if min_row_id <= hi && lo <= max_row_id {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn has_expired_run_rows(&self) -> Result<bool> {
@@ -194,6 +250,26 @@ impl Table {
 
         let mut staged_run = None;
         if !rows.is_empty() {
+            // L1+ disjointness gate (TODO §1.2): the merged run is destined
+            // for L1, and L1+ runs must cover disjoint row-id ranges so the
+            // read path can binary-search the level. Runs being retired by
+            // this compaction (every L0 plus any L1 being replaced) are
+            // excluded from the check — the new L1 will atomically swap
+            // them out on publish. A self-overlap against a run we own is
+            // expected; a collision with a run we DON'T own means a prior
+            // compaction is still settling, so refuse and let the caller
+            // retry once the topology has calmed.
+            let retire: std::collections::HashSet<u128> =
+                old_refs.iter().map(|rr| rr.run_id).collect();
+            let new_min = rows.first().map(|r| r.row_id.0).unwrap_or(0);
+            let new_max = rows.last().map(|r| r.row_id.0).unwrap_or(0);
+            if self.l1_range_overlaps(new_min, new_max, &retire) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "compaction would publish an L1 run overlapping an existing L1+ \
+                     range [{new_min}, {new_max}]; wait for prior compactions to retire"
+                )));
+            }
+
             let run_id = self.alloc_run_id()?;
             let final_name = format!("r-{run_id}.sr");
             let stage_name = format!(

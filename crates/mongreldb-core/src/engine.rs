@@ -169,6 +169,7 @@ enum ControlledVisibleCursor<'a> {
 }
 
 /// Default batch size for controlled hot-tier sources (memtable / mutable run).
+#[allow(dead_code)] // PR D follow-up: switch hot-tier path to the streaming cursor
 const CONTROLLED_HOT_BATCH: usize = 256;
 
 struct ControlledVisibleSource<'a> {
@@ -189,6 +190,7 @@ impl<'a> ControlledVisibleSource<'a> {
     /// Stream newest-visible hot-tier rows from an ordered map without first
     /// collecting a full intermediate `Vec`. Only `CONTROLLED_HOT_BATCH` rows
     /// occupy the active merge buffer at a time.
+    #[allow(dead_code)] // kept for the legacy map-based callers; new path uses the streaming cursor
     fn memory_from_map(map: BTreeMap<RowId, Row>) -> Self {
         let total = map.len();
         let mut values = map.into_values();
@@ -6229,17 +6231,21 @@ impl Table {
             Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
         checkpoints += 1;
-        // Hot-tier streaming cursors — preferred path. These avoid the full
-        // `BTreeMap` materialisation that `memory_from_map` performs, which
-        // dominated the 1 ms time-to-first-row budget on 100k-row bulk loads.
-        sources.push(ControlledVisibleSource::memtable_cursor(
-            self.memtable.newest_visible_iter(&snapshot),
-        ));
+        // Hot-tier sources. The streaming cursor variants are implemented
+        // (PR D follow-up) but they regress `count()`-style callers
+        // (dml_phase1::update_many_and_delete_many); fall back to the
+        // legacy `newest_visible_map` + `memory_from_map` path until the
+        // bug is fixed.
+        let memtable_map = self.memtable.newest_visible_map(snapshot);
+        if !memtable_map.is_empty() {
+            sources.push(ControlledVisibleSource::memory_from_map(memtable_map));
+        }
         control.checkpoint()?;
         checkpoints += 1;
-        sources.push(ControlledVisibleSource::mutable_run_cursor(
-            self.mutable_run.newest_visible_iter(&snapshot),
-        ));
+        let mutable_map = self.mutable_run.newest_visible_map(snapshot);
+        if !mutable_map.is_empty() {
+            sources.push(ControlledVisibleSource::memory_from_map(mutable_map));
+        }
         for run in &self.run_refs {
             control.checkpoint()?;
             checkpoints += 1;
@@ -12938,6 +12944,13 @@ impl Table {
     pub(crate) fn set_run_refs(&mut self, refs: Vec<RunRef>) {
         self.run_refs = refs;
         self.refresh_run_row_id_ranges();
+    }
+
+    /// `(min_row_id, max_row_id)` for the given run, when known. Used by
+    /// compaction to enforce L1+ disjointness without re-opening every
+    /// existing run header.
+    pub(crate) fn run_row_id_range(&self, run_id: u128) -> Option<(u64, u64)> {
+        self.run_row_id_ranges.get(&run_id).copied()
     }
 
     /// Populate `run_row_id_ranges` from each run's on-disk header so
