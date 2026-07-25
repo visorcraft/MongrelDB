@@ -139,6 +139,18 @@ impl SnapshotRegistry {
         self.live.lock().keys().next().copied().map(Epoch)
     }
 
+    /// Every epoch currently held by a live registry pin (Database::snapshot
+    /// readers), ascending. Used by pin-aware index rebuild so multi-pin
+    /// registry readers — not only the oldest — keep Bitmap discovery keys.
+    pub fn live_pinned_epochs(&self) -> Vec<Epoch> {
+        self.live
+            .lock()
+            .keys()
+            .copied()
+            .map(Epoch)
+            .collect()
+    }
+
     fn release(&self, epoch: Epoch) {
         let mut live = self.live.lock();
         if let Some(count) = live.get_mut(&epoch.0) {
@@ -351,6 +363,18 @@ impl PinRegistry {
     /// active (GC is then gated only by snapshots/history).
     pub fn oldest_pinned(&self) -> Option<Epoch> {
         self.pins.lock().values().map(|entry| entry.epoch).min()
+    }
+
+    /// Distinct epochs currently held by any PinRegistry pin (backup/PITR,
+    /// replication, read-generation, online-index-build, …), ascending.
+    /// Compact honors these via [`crate::engine::Table::min_active_snapshot`];
+    /// pin-aware rebuild must re-index Bitmap membership for each of them.
+    pub fn live_pin_epochs(&self) -> Vec<Epoch> {
+        let mut set = std::collections::BTreeSet::new();
+        for entry in self.pins.lock().values() {
+            set.insert(entry.epoch);
+        }
+        set.into_iter().collect()
     }
 
     /// The oldest epoch held by pins of `source`.

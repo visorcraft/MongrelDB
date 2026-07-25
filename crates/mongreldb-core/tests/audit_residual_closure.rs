@@ -6,7 +6,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Table, Value};
+use mongreldb_core::{Database, Table, Value};
 use tempfile::tempdir;
 
 fn city_schema() -> Schema {
@@ -408,4 +408,102 @@ fn multi_pin_compact_preserves_newer_pin_bitmap_eq() {
 
     db.unpin_snapshot(pin_b);
     db.unpin_snapshot(pin_a);
+}
+
+/// Registry-only pin (`Database::snapshot`) must keep BitmapEq after compact
+/// rebuild — not only the standalone `Table::pin_snapshot` map.
+#[test]
+fn database_snapshot_registry_pin_survives_compact_bitmap_eq() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("cities", city_schema()).unwrap();
+
+    db.transaction(|tx| {
+        for i in 0..20i64 {
+            tx.put(
+                "cities",
+                vec![
+                    (1, Value::Int64(i)),
+                    (
+                        2,
+                        Value::Bytes(if i % 2 == 0 {
+                            b"alpha".to_vec()
+                        } else {
+                            b"beta".to_vec()
+                        }),
+                    ),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    // Spill so compact has durable runs to merge.
+    {
+        let handle = db.table("cities").unwrap();
+        let mut t = handle.lock();
+        t.force_flush().unwrap();
+    }
+
+    // Registry pin only — no Table::pin_snapshot.
+    let (reg_snap, _guard) = db.snapshot();
+    let alpha_before = {
+        let handle = db.table("cities").unwrap();
+        let mut t = handle.lock();
+        t.query_at_with_allowed(&Query::new().and(alpha_cond()), reg_snap, None)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(alpha_before, 10);
+
+    // Delete one alpha after the registry pin.
+    let doomed = {
+        let handle = db.table("cities").unwrap();
+        let mut t = handle.lock();
+        t.query(&Query::new().and(alpha_cond())).unwrap()
+    };
+    assert!(!doomed.is_empty());
+    db.transaction(|tx| {
+        tx.delete("cities", doomed[0].row_id)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // Extra run so compact has work.
+    db.transaction(|tx| {
+        for i in 100..110i64 {
+            tx.put(
+                "cities",
+                vec![
+                    (1, Value::Int64(i)),
+                    (2, Value::Bytes(b"beta".to_vec())),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    {
+        let handle = db.table("cities").unwrap();
+        let mut t = handle.lock();
+        t.force_flush().unwrap();
+    }
+
+    db.compact_table("cities").unwrap();
+
+    let handle = db.table("cities").unwrap();
+    let mut t = handle.lock();
+    let counted = t
+        .count_conditions(std::slice::from_ref(&alpha_cond()), reg_snap)
+        .unwrap()
+        .unwrap();
+    let rows = t
+        .query_at_with_allowed(&Query::new().and(alpha_cond()), reg_snap, None)
+        .unwrap();
+    assert_eq!(counted, rows.len() as u64);
+    assert_eq!(
+        counted, alpha_before as u64,
+        "Database::snapshot registry pin must still discover pre-delete alphas via Bitmap after compact rebuild"
+    );
 }

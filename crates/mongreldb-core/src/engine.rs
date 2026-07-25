@@ -3277,12 +3277,12 @@ impl Table {
                 self.index_row(&row);
             }
         }
-        // Pin-aware historical discovery for EVERY active pin (not only the
-        // oldest). Compact may retain born-then-deleted versions for newer pins
-        // that the oldest pin never observed; live-only rebuild would drop
-        // those Bitmap memberships. Re-index Bitmap for each pin's visible
-        // live pre-image of rids that are not live at Epoch::MAX.
-        let pin_epochs = self.active_local_pin_epochs();
+        // Pin-aware historical discovery for EVERY active pin source that
+        // compact honors via min_active_snapshot — local pin_snapshot pins,
+        // Database SnapshotRegistry pins, PinRegistry (backup/replication/
+        // read-generation/…), and history_floor. Registry-only pins must not
+        // lose BitmapEq after compact rebuild.
+        let pin_epochs = self.active_pin_epochs_for_rebuild();
         if !pin_epochs.is_empty() {
             let current_snap = Snapshot::at(Epoch(u64::MAX));
             for pin_epoch in pin_epochs {
@@ -9233,11 +9233,32 @@ impl Table {
         snap
     }
 
-    /// Every epoch currently held by the standalone [`Self::pin_snapshot`] API,
-    /// sorted ascending. Used by pin-aware index rebuild so multi-pin tables
-    /// restore Bitmap discovery for newer pins, not only the oldest.
-    fn active_local_pin_epochs(&self) -> Vec<Epoch> {
-        self.pinned.keys().copied().collect()
+    /// Every epoch that pin-aware index rebuild must restore Bitmap discovery
+    /// for — the full set of reader/retention pins that
+    /// [`Self::min_active_snapshot`] folds into compaction GC, not just the
+    /// oldest and not just the standalone `pin_snapshot` map.
+    ///
+    /// Sources (union, ascending, deduped):
+    /// - local `self.pinned` ([`Self::pin_snapshot`])
+    /// - [`crate::retention::SnapshotRegistry`] live pins (`Database::snapshot`)
+    /// - [`crate::retention::PinRegistry`] live pins (backup/PITR, replication,
+    ///   read-generation, online-index-build, …)
+    /// - history-retention floor when configured
+    fn active_pin_epochs_for_rebuild(&self) -> Vec<Epoch> {
+        let mut set = BTreeSet::new();
+        for epoch in self.pinned.keys().copied() {
+            set.insert(epoch);
+        }
+        for epoch in self.snapshots.live_pinned_epochs() {
+            set.insert(epoch);
+        }
+        for epoch in self.pins.live_pin_epochs() {
+            set.insert(epoch);
+        }
+        if let Some(floor) = self.snapshots.history_floor(self.current_epoch()) {
+            set.insert(floor);
+        }
+        set.into_iter().collect()
     }
 
     /// P0.5-T6: report the HLC GC floor as named pin sources.
