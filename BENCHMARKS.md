@@ -299,3 +299,44 @@ cargo test --workspace --all-features
 The five-repetition medians and the runner fingerprint are published in
 `docs/06-indexes.md → per-family recall floors` and the per-item sections
 above once the closure PR lands.
+
+## Residual closure evidence
+
+Captured on `ca3d0b2..72cc43e` of master (rustc 1.97.1). The runner
+fingerprint and five-repetition medians replace the placeholder bounds above
+when the closure PR lands on a clean runner.
+
+| Surface | Pass | RED / Ignored |
+|---|---:|---:|
+| core lib | 709 / 709 | 0 |
+| result_cache_async_persistence | 15 / 15 | 0 |
+| controlled_scan_streaming | 7 / 9 | 2 ignored |
+| lookup_metrics | 6 / 6 | 0 |
+| hot_metrics_export (server) | 1 / 1 | 0 |
+| index_churn_oracle | 1 / 4 | 3 RED |
+| run_lookup::tests | 5 / 5 | 0 |
+| trace::tests | 5 / 5 | 0 |
+| result_cache::tests | 10 / 10 | 0 |
+| server (all suites) | 289 / 289 | 0 |
+
+## Closure status
+
+| PR | Item | Status |
+|---|---|---|
+| A | Measurement and trace contracts | DONE |
+| C | Async persistent result cache | DONE (15/15 contract tests) |
+| D | True streaming cursors | test surface DONE (7/9; 2 ignored with explicit gap notes) |
+| F | HOT fallback observability | DONE (6/6 lookup + 1/1 hot_metrics + 289/289 server) |
+| B | Point lookup directory | foundation + 17 tests + 256-run benchmark ship; on-disk checkpoint + L0 bounds in follow-up |
+| E | Non-Bitmap churn oracle | oracle + 1/4 tests ship; 3 RED tests catch real engine bugs in LearnedRange, FmIndex, ANN-Dense; 30-day nightly cadence + engine fixes remain |
+| Final | Closure workflow + docs | workflow with 10 jobs, ADR-0013, design docs, runbook, hot metrics export all shipped |
+
+## Reproducing
+
+```bash
+cargo test -p mongreldb-core                                # 709 lib + 7 controlled_scan + 15 cache_async + 6 lookup + 1 churn seed
+cargo test -p mongreldb-server                              # 289 / 289
+cargo test -p mongreldb-core --test index_churn_oracle -- --include-ignored
+# 1 pass, 3 fail (intentional RED — engine bugs documented)
+```
+
