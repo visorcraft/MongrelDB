@@ -1,4 +1,4 @@
-name: Probe ANN stale overfetch
+name: Validate ANN stale-overfetch fix
 
 on:
   push:
@@ -13,9 +13,9 @@ env:
   RUST_VERSION: "1.97.1"
 
 jobs:
-  probe:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
@@ -24,27 +24,32 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Format and compile probe
-        run: |
-          cargo fmt
-          cargo clippy -p mongreldb-core --test ann_stale_overfetch --all-features -- -D warnings
-      - name: Run stale-overfetch regression probe
-        id: probe
+      - name: Apply minimal production fix
         shell: bash
-        continue-on-error: true
         run: |
-          set -o pipefail
-          mkdir -p /tmp/ann-stale-overfetch
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/mongreldb-core/src/index/ann/mod.rs')
+          source = path.read_text()
+          old = '            for (row_id, distance) in graph.search(query, k, self.ef_search, context)? {\n'
+          new = '            for (row_id, distance) in graph.search(query, k, self.ef_search.max(k), context)? {\n'
+          if source.count(old) != 1:
+              raise SystemExit(f'expected one ANN search target, found {source.count(old)}')
+          path.write_text(source.replace(old, new, 1))
+          PY
+          cargo fmt
+          git diff --check
+      - name: Formatting and Clippy
+        run: |
+          cargo fmt --check
+          cargo clippy -p mongreldb-core --all-targets --all-features -- -D warnings
+      - name: Focused ANN regression tests
+        run: |
           cargo test -p mongreldb-core --all-features \
-            --test ann_stale_overfetch -- --nocapture \
-            2>&1 | tee /tmp/ann-stale-overfetch/test.log
-          echo "status=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ann-stale-overfetch
-          path: /tmp/ann-stale-overfetch
-          if-no-files-found: error
-      - name: Preserve failing probe result
-        if: always()
-        run: test "${{ steps.probe.outputs.status }}" = 0
+            --test ann_stale_overfetch -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            --test retriever -- --nocapture
+          cargo test -p mongreldb-core --all-features \
+            --test ai_query_limits -- --nocapture
+      - name: Complete core suite
+        run: cargo test -p mongreldb-core --all-features
