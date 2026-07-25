@@ -22,10 +22,7 @@ use std::collections::HashMap;
 pub enum BitmapIndexDelta {
     /// Indexed key unchanged: re-point `old_row_id` → `new_row_id` under `key`
     /// when the ids differ; pure no-op when they are equal.
-    Repoint {
-        column_id: u16,
-        key: Vec<u8>,
-    },
+    Repoint { column_id: u16, key: Vec<u8> },
     /// Indexed key changed (or appeared/disappeared): drop old membership and
     /// insert new when present.
     Move {
@@ -48,7 +45,11 @@ pub fn bitmap_key_for_column(row: &Row, column_id: u16) -> Option<Vec<u8>> {
 /// Only `IndexKind::Bitmap` entries in `schema.indexes` are planned. ANN / FM /
 /// Sparse / MinHash / LearnedRange keep their existing full reindex paths for
 /// now (different remove semantics).
-pub fn plan_bitmap_secondary_deltas(schema: &Schema, old: &Row, new: &Row) -> Vec<BitmapIndexDelta> {
+pub fn plan_bitmap_secondary_deltas(
+    schema: &Schema,
+    old: &Row,
+    new: &Row,
+) -> Vec<BitmapIndexDelta> {
     let mut out = Vec::new();
     for idef in &schema.indexes {
         if idef.kind != IndexKind::Bitmap {

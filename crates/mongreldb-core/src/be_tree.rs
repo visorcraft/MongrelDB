@@ -15,6 +15,7 @@
 use crate::epoch::Epoch;
 use crate::memtable::Row;
 use crate::rowid::RowId;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Max children per internal node (`B`).
@@ -80,6 +81,31 @@ impl Node {
 struct Split {
     key: VKey,
     node: Node,
+}
+
+pub(crate) struct LeafVersions<'a> {
+    nodes: Vec<&'a Node>,
+    rows: Option<&'a [Row]>,
+}
+
+impl<'a> Iterator for LeafVersions<'a> {
+    type Item = Cow<'a, Row>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(rows) = self.rows.take() {
+                if let Some((row, rest)) = rows.split_first() {
+                    self.rows = Some(rest);
+                    return Some(Cow::Borrowed(row));
+                }
+            }
+            let node = self.nodes.pop()?;
+            match node {
+                Node::Leaf { rows } => self.rows = Some(rows),
+                Node::Internal { children, .. } => self.nodes.extend(children.iter().rev()),
+            }
+        }
+    }
 }
 
 /// Buffered Bε-tree over `(RowId, Epoch)` → [`Row`].
@@ -172,6 +198,13 @@ impl BeTree {
     /// `(row_id, Epoch::ZERO)..=(row_id, Epoch(u64::MAX))`.
     pub(crate) fn visit_versions(&self, row_id: RowId, mut visit: impl FnMut(Row)) {
         Self::visit_row_versions(&self.root, row_id, &mut visit);
+    }
+
+    pub(crate) fn leaf_versions_iter(&self) -> LeafVersions<'_> {
+        LeafVersions {
+            nodes: vec![&self.root],
+            rows: None,
+        }
     }
 
     /// Every buffered version (non-consuming), in no defined order — leaves

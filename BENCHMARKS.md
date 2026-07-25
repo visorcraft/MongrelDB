@@ -190,3 +190,112 @@ cargo bench --manifest-path crates/mongreldb-query/Cargo.toml \
 
 AI retrieval has a separate reproducible harness and enforced thresholds in
 [`docs/ai/benchmark-methodology.md`](docs/ai/benchmark-methodology.md).
+
+## Residual-closure benchmarks (PR A–F)
+
+The five residual items expose a structural benchmark and a stress benchmark
+per item. Numbers below are placeholder bounds; the closure PR replaces them
+with five-repetition medians on a fixed runner.
+
+### PR B — point-lookup directory (TODO §1.1)
+
+| Run count | Layout | Warm p50 | Warm p95 | Warm p99 | Open runs |
+|---:|---|---:|---:|---:|---:|
+| 1 | disjoint | (≤ 256-run / 1-run × 1.5×) | | | 1 |
+| 64 | disjoint | (≤ 1-run × 1.5×) | | | 64 |
+| 64 | overlapping | (≤ 1-run × 1.5×) | | | 64 |
+| 256 | disjoint | (≤ 1-run × 1.5×) | | | 256 |
+| 256 | overlapping | (≤ 1-run × 1.5×) | | | 256 |
+| 256 | hot-key history | (locator interval only) | | | ≤ 256 |
+| 256 | wide-miss | (≥ hot-key; ≤ 1-run + α) | | | 0 |
+
+`open runs` = immutable run readers opened per lookup. Disjoint + overlapping
+fixtures must not scale with active run count (gate: ≤ 1.5× of the 1-run
+warm p95). Hot-key history opens only the locator interval for the requested
+snapshot (gate: ≤ 16 readers per lookup, even when 256 runs are active).
+Wide-miss opens zero readers (gate: 0).
+
+Memory budget: published under
+`docs/06-indexes.md → per-family recall floors` once the directory is
+checkpointed.
+
+### PR C — async persistent result cache (TODO §2.8)
+
+| Op | Real SSD | +10 ms write | +100 ms sync | Writer blocked |
+|---|---:|---:|---:|---:|
+| request-thread p50 | (≤ memory-only + α) | (≤ memory-only + α) | (≤ memory-only + α) | (no regression) |
+| request-thread p99 | (≤ memory-only + α) | (≤ memory-only + α) | (≤ memory-only + α) | (≤ 10% over memory-only) |
+| background completion p50 | (per file size) | (per file size) | (per file size) | (writer stalled) |
+| background completion p99 | (per file size) | (per file size) | (per file size) | (per file size) |
+
+Gate: request-thread p99 with a blocked writer ≤ 1.10× the memory-only
+insertion p99. Background completion can degrade arbitrarily; the query
+path is the only one that matters.
+
+### PR D — controlled-scan streaming (TODO §3.5)
+
+| Fixture | Discard-visitor peak buffer | Time to first row | Throughput |
+|---|---:|---:|---:|
+| 1M live rows, memtable | (≤ 256) | (≤ 1 ms) | (≥ 1M-row materialized × 0.9) |
+| 1M live rows, mutable run | (≤ 256) | (≤ 1 ms) | (≥ 1M-row materialized × 0.9) |
+| 100k rows × 10 versions | (≤ 256) | (≤ 1 ms) | (≥ 1M-row materialized × 0.9) |
+| 1 row × 1M versions | (≤ 256) | (≤ 1 ms) | (≥ 1M-row materialized × 0.9) |
+
+Gate: peak buffer is independent of total history. Throughput regression
+relative to the materialized implementation ≤ 10% on the small fixture.
+
+### PR E — non-Bitmap churn oracle (TODO §4.6)
+
+| Family | Backends | Recall floor | Status |
+|---|---|---|---|
+| FmIndex | exact | n/a (exact substring) | oracle catches engine mismatch |
+| LearnedRange | exact | n/a (exact range) | oracle catches engine mismatch |
+| Sparse | exact | n/a (exact dot product) | `tests/retriever.rs` |
+| MinHash | LSH | 0.90 | `tests/retriever.rs` |
+| ANN HNSW BinarySign | HNSW | 0.95 | `tests/retriever.rs` |
+| ANN HNSW Dense | HNSW | 0.90 | oracle catches engine mismatch |
+| ANN DiskANN Dense | DiskANN | 0.90 | `src/index/ann/diskann.rs` |
+| ANN IVF Dense | IVF | 0.85 | `src/index/ann/ivf.rs` |
+| ANN Product Quantization | PQ + rerank | 0.80 | `src/index/ann/pq_backend.rs` |
+
+Gate: 30 consecutive nightly passes (100 seeds × 10,000 ops) + 4
+consecutive weekly passes (≥ 1M total churn ops). Wall-clock: 30 days.
+
+### PR F — HOT fallback observability (TODO §5.7)
+
+Healthy current-snapshot PK lookup: 0 fallbacks. Critical reasons
+(`PrimaryKeyMismatch`, `StaleRowId`, `CheckpointRejected`) page on
+detection. Observability overhead: < 2% p50/p95 on the 1M-healthy-PK
+qualification workload (measured with `mongreldb_perf --bench
+hot_overhead`).
+
+## Reproducing the residual-closure evidence
+
+```bash
+# PR B point-lookup structure
+cargo test -p mongreldb-core --test point_lookup_directory --all-features
+cargo test -p mongreldb-core --test point_lookup_runs --release -- --nocapture
+
+# PR C async cache
+cargo test -p mongreldb-core --test result_cache_async_persistence --all-features
+
+# PR D controlled scan
+cargo test -p mongreldb-core --test controlled_scan_streaming --all-features
+
+# PR E churn oracle
+MONGRELDB_ORACLE_SEED=1 cargo test -p mongreldb-core --test index_churn_oracle --all-features
+
+# PR F HOT observability
+cargo test -p mongreldb-core --test lookup_metrics --all-features
+cargo test -p mongreldb-server --all-targets --all-features
+
+# Full closure matrix
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features \
+  --exclude mongreldb-perf -- -D warnings
+cargo test --workspace --all-features
+```
+
+The five-repetition medians and the runner fingerprint are published in
+`docs/06-indexes.md → per-family recall floors` and the per-item sections
+above once the closure PR lands.

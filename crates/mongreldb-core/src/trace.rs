@@ -223,6 +223,127 @@ pub struct QueryTrace {
     pub projection_cells: usize,
     pub work_consumed: usize,
     pub total_nanos: u64,
+
+    // ---- TODO §1: point-lookup directory trace fields --------------------
+    /// Whether the `RunLookupDirectory` was consulted and produced a complete
+    /// candidate set for this get. `false` means the legacy range-scan fallback
+    /// ran (which is acceptable but not optimal).
+    pub directory_complete: bool,
+    /// Number of run locators the directory returned for the queried `RowId`.
+    pub directory_candidates: usize,
+    /// Number of runs rejected by the header-derived `run_row_id_ranges` filter.
+    pub run_range_rejects: usize,
+    /// Number of runs rejected by membership / predicate filters before open.
+    pub membership_filter_rejects: usize,
+    /// How many immutable run readers were actually opened.
+    pub run_readers_opened: usize,
+    /// Set when the lookup short-circuited because the best candidate was
+    /// provably newer than every remaining locator's upper bound.
+    pub early_stop: bool,
+    /// Point cache hits (replay of a recent in-process lookup result).
+    pub point_cache_hits: usize,
+
+    // ---- TODO §3: controlled-scan streaming trace fields ------------------
+    /// Total versions examined across all segments during the scan.
+    pub controlled_scan_versions_examined: usize,
+    /// Rows emitted by the scan (post-filter).
+    pub controlled_scan_rows_emitted: usize,
+    /// Number of times a segment cursor was refilled.
+    pub controlled_scan_source_refills: usize,
+    /// Peak number of buffered rows held by the streaming merge at any moment.
+    pub controlled_scan_peak_source_buffer_rows: usize,
+    /// Peak number of versions seen for any single `RowId` during the scan.
+    pub controlled_scan_peak_same_row_versions: usize,
+    /// Number of `ExecutionControl::checkpoint` calls issued during the scan.
+    pub controlled_scan_checkpoints: usize,
+    /// Wall-clock time to produce the first row, in microseconds.
+    pub controlled_scan_time_to_first_row_us: u64,
+    /// Time from `cancel` to the scan actually observing cancellation, in µs.
+    pub controlled_scan_cancel_latency_us: u64,
+
+    // ---- TODO §5: HOT fallback trace fields ------------------------------
+    /// Whether a HOT lookup was attempted for this query.
+    pub hot_lookup_attempted: bool,
+    /// Whether the HOT lookup was a hit (no fallback).
+    pub hot_lookup_hit: bool,
+    /// Stable reason label when the HOT lookup fell back. `None` on hit.
+    pub hot_fallback_reason: Option<&'static str>,
+    /// Overlay versions examined during the fallback path.
+    pub hot_fallback_overlay_versions: usize,
+    /// Sorted runs considered during the fallback path.
+    pub hot_fallback_runs_considered: usize,
+    /// Sorted run readers actually opened during the fallback path.
+    pub hot_fallback_runs_opened: usize,
+    /// Pages decoded during the fallback path.
+    pub hot_fallback_pages_decoded: usize,
+    /// Rows materialized during the fallback path.
+    pub hot_fallback_rows_materialized: usize,
+    /// Wall-clock time spent on the HOT fast-path lookup, in nanoseconds.
+    pub hot_lookup_nanos: u64,
+    /// Wall-clock time spent on the fallback path, in nanoseconds.
+    pub hot_fallback_nanos: u64,
+
+    // ---- TODO §4: per-family retrieval trace fields ----------------------
+    /// Raw candidates produced by the index backend before dedup.
+    pub raw_candidates: usize,
+    /// Unique candidates after `(RowId)` dedup.
+    pub unique_candidates: usize,
+    /// Duplicate candidates dropped during dedup.
+    pub duplicate_candidates: usize,
+    /// Candidates rejected by `Snapshot::observes_row`.
+    pub visibility_rejected: usize,
+    /// Candidates rejected as tombstones.
+    pub tombstone_rejected: usize,
+    /// Candidates rejected by TTL.
+    pub ttl_rejected: usize,
+    /// Candidates rejected by authorization (RLS / allowed set).
+    pub authorization_rejected: usize,
+    /// Candidates rejected by hard filter.
+    pub hard_filter_rejected: usize,
+    /// Configured candidate cap for the retrieval.
+    pub candidate_cap: usize,
+    /// Whether the candidate cap was hit.
+    pub candidate_cap_hit: bool,
+    /// Final number of hits returned to the caller.
+    pub final_hits: usize,
+}
+
+/// Reasons a HOT (`Hash-Organized Table`) PK lookup may fall back to the slower
+/// overlay + sorted-run path. Stable identifiers; the string literals are the
+/// stable wire/label form (see TODO §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotFallbackReason {
+    MissingMapping,
+    StaleRowId,
+    InvisibleAtSnapshot,
+    HistoricalSnapshot,
+    Tombstone,
+    TtlExpired,
+    PrimaryKeyMismatch,
+    IndexIncomplete,
+    CheckpointRejected,
+}
+
+impl HotFallbackReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HotFallbackReason::MissingMapping => "missing_mapping",
+            HotFallbackReason::StaleRowId => "stale_row_id",
+            HotFallbackReason::InvisibleAtSnapshot => "invisible_at_snapshot",
+            HotFallbackReason::HistoricalSnapshot => "historical_snapshot",
+            HotFallbackReason::Tombstone => "tombstone",
+            HotFallbackReason::TtlExpired => "ttl_expired",
+            HotFallbackReason::PrimaryKeyMismatch => "primary_key_mismatch",
+            HotFallbackReason::IndexIncomplete => "index_incomplete",
+            HotFallbackReason::CheckpointRejected => "checkpoint_rejected",
+        }
+    }
+}
+
+impl fmt::Display for HotFallbackReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl QueryTrace {
@@ -346,6 +467,36 @@ impl fmt::Display for QueryTrace {
         }
         if self.pages_skipped > 0 {
             write!(f, " skipped={}", self.pages_skipped)?;
+        }
+        if self.directory_complete {
+            write!(f, " dir=complete candidates={}", self.directory_candidates)?;
+        }
+        if self.run_readers_opened > 0 {
+            write!(f, " run-readers={}", self.run_readers_opened)?;
+        }
+        if self.early_stop {
+            f.write_str(" early-stop")?;
+        }
+        if self.controlled_scan_versions_examined > 0 {
+            write!(
+                f,
+                " controlled=versions={} emitted={}",
+                self.controlled_scan_versions_examined, self.controlled_scan_rows_emitted
+            )?;
+        }
+        if self.hot_lookup_attempted {
+            if self.hot_lookup_hit {
+                f.write_str(" hot=hit")?;
+            } else {
+                write!(
+                    f,
+                    " hot=fallback reason={}",
+                    self.hot_fallback_reason.unwrap_or("unspecified")
+                )?;
+            }
+        }
+        if self.candidate_cap_hit {
+            write!(f, " cap-hit={}", self.final_hits)?;
         }
         Ok(())
     }

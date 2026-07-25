@@ -193,6 +193,58 @@ impl MutableRun {
         by_row
     }
 
+    /// Borrowing ordered iterator over the newest visible version of each
+    /// `RowId` under `snapshot` (including tombstones). Mirrors
+    /// [`Self::newest_visible_map`] but never clones the row bytes — the
+    /// yielded `&Row` borrows from the underlying `Pma`s for the cursor's
+    /// lifetime. The cursor dedups to one entry per `RowId` (the newest
+    /// visible version), iterating them in ascending `RowId` order, exactly
+    /// like draining the [`Self::newest_visible_map`] `BTreeMap`.
+    pub fn newest_visible_iter<'a>(
+        &'a self,
+        snapshot: &Snapshot,
+    ) -> MutableRunVisibleVersionCursor<'a> {
+        let snap = *snapshot;
+        // Accumulate only the current-newest-visible per `RowId`; borrowed refs
+        // keep the per-entry cost at one (rid, epoch, &row) tuple — no row
+        // bytes cloned. Once a `RowId`'s newest is determined (no later
+        // visible version can displace it under the snapshot's authority),
+        // the entry is final; the `BTreeMap` therefore only ever holds at
+        // most one entry per distinct `RowId`.
+        let mut by_row: BTreeMap<
+            RowId,
+            (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, &'a Row),
+        > = BTreeMap::new();
+        for pma in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.pma)
+            .chain(std::iter::once(&self.active.pma))
+        {
+            for ((_rid, _epoch), row) in pma.iter() {
+                if !snap.observes_row(row.committed_epoch, row.commit_ts) {
+                    continue;
+                }
+                by_row
+                    .entry(row.row_id)
+                    .and_modify(|existing| {
+                        if Snapshot::version_is_newer(
+                            row.committed_epoch,
+                            row.commit_ts,
+                            existing.0,
+                            existing.1,
+                        ) {
+                            *existing = (row.committed_epoch, row.commit_ts, row);
+                        }
+                    })
+                    .or_insert_with(|| (row.committed_epoch, row.commit_ts, row));
+            }
+        }
+        MutableRunVisibleVersionCursor {
+            inner: by_row.into_iter(),
+        }
+    }
+
     pub(crate) fn seal(&mut self) {
         if self.active.pma.is_empty() {
             return;
@@ -251,6 +303,28 @@ impl MutableRun {
         };
         self.byte_size = 0;
         out
+    }
+}
+
+/// Borrowing cursor produced by [`MutableRun::newest_visible_iter`].
+/// Yields `(RowId, Epoch, &Row)` tuples in ascending `RowId` order, one tuple
+/// per `RowId` — the newest visible version under the snapshot at cursor
+/// construction. The `&Row` borrows from the underlying `Pma`; do not retain
+/// the reference past the cursor or past any mutation of the `MutableRun`.
+pub struct MutableRunVisibleVersionCursor<'a> {
+    inner: std::collections::btree_map::IntoIter<
+        RowId,
+        (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, &'a Row),
+    >,
+}
+
+impl<'a> Iterator for MutableRunVisibleVersionCursor<'a> {
+    type Item = (RowId, Epoch, &'a Row);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(rid, (epoch, _ts, row))| (rid, epoch, row))
     }
 }
 
@@ -423,5 +497,87 @@ mod tests {
         );
         assert!(mr.get_version_at(RowId(1), legacy).is_some());
         assert!(mr.get_version_at(RowId(2), legacy).is_some());
+    }
+
+    /// `crate::types` doesn't expose a `from_raw` constructor; this is the
+    /// test-local equivalent used by the HLC-vs-epoch newness assertion.
+    fn hlc_from_raw(raw: u64) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: raw,
+            logical: 0,
+            node_tiebreaker: 1,
+        }
+    }
+
+    #[test]
+    fn newest_visible_iter_empty_yields_nothing() {
+        let mr = MutableRun::new();
+        let snap = Snapshot::at(Epoch(99));
+        let got: Vec<_> = mr.newest_visible_iter(&snap).collect();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn newest_visible_iter_single_insert_yields_one() {
+        let mut mr = MutableRun::new();
+        mr.insert_many(vec![row(7, 1, 70)]);
+        let snap = Snapshot::at(Epoch(1));
+        let got: Vec<_> = mr.newest_visible_iter(&snap).collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, RowId(7));
+        assert_eq!(got[0].1, Epoch(1));
+        assert_eq!(int_of(got[0].2), 70);
+    }
+
+    #[test]
+    fn newest_visible_iter_newer_epoch_wins_for_same_rowid() {
+        let mut mr = MutableRun::new();
+        mr.insert_many(vec![row(1, 1, 10), row(1, 3, 30), row(1, 9, 90)]);
+        let snap = Snapshot::at(Epoch(99));
+        let got: Vec<(u64, u64, i64)> = mr
+            .newest_visible_iter(&snap)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, int_of(row)))
+            .collect();
+        assert_eq!(got, vec![(1, 9, 90)]);
+    }
+
+    #[test]
+    fn newest_visible_iter_tombstone_suppresses_older_live_version() {
+        let mut mr = MutableRun::new();
+        mr.insert_many(vec![row(1, 1, 10), tomb(1, 2)]);
+        let snap = Snapshot::at(Epoch(5));
+        let got: Vec<(u64, u64, bool)> = mr
+            .newest_visible_iter(&snap)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, row.deleted))
+            .collect();
+        assert_eq!(got, vec![(1, 2, true)], "tombstone is the newest");
+        // Pre-tombstone snapshot still sees the live version.
+        let snap_early = Snapshot::at(Epoch(1));
+        let got_early: Vec<(u64, u64, bool)> = mr
+            .newest_visible_iter(&snap_early)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, row.deleted))
+            .collect();
+        assert_eq!(got_early, vec![(1, 1, false)]);
+    }
+
+    #[test]
+    fn newest_visible_iter_hlc_vs_epoch_newness() {
+        let mut mr = MutableRun::new();
+        // Lower epoch, but later HLC — wins under HLC authority because both
+        // versions carry an HLC stamp. `from_raw(raw)` builds the stamp.
+        mr.insert_many(vec![
+            hlc_row(1, 50, hlc_from_raw(100), 7),
+            hlc_row(1, 1, hlc_from_raw(200), 42),
+        ]);
+        let snap = Snapshot::at_hlc(Epoch(99), hlc_from_raw(250));
+        let got: Vec<(u64, u64, i64, Option<mongreldb_types::hlc::HlcTimestamp>)> = mr
+            .newest_visible_iter(&snap)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, int_of(row), row.commit_ts))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, 1, 42, Some(hlc_from_raw(200)))],
+            "HLC newer wins over epoch-newer when both stamped"
+        );
     }
 }

@@ -437,14 +437,10 @@ mod controlled_visible_cursor_tests {
         };
         // Source A: high epoch, OLD HLC. Source B: low epoch, NEW HLC.
         // HLC authority should pick B; legacy epoch-only pick would pick A.
-        let a = vec![
-            Row::new_with_hlc(RowId(1), Epoch(50), hlc_old)
-                .with_column(1, Value::Int64(999)),
-        ];
-        let b = vec![
-            Row::new_with_hlc(RowId(1), Epoch(1), hlc_new)
-                .with_column(1, Value::Int64(11)),
-        ];
+        let a =
+            vec![Row::new_with_hlc(RowId(1), Epoch(50), hlc_old).with_column(1, Value::Int64(999))];
+        let b =
+            vec![Row::new_with_hlc(RowId(1), Epoch(1), hlc_new).with_column(1, Value::Int64(11))];
         let control = crate::ExecutionControl::new(None);
         let mut sources = vec![
             ControlledVisibleSource::memory(a),
@@ -478,13 +474,9 @@ mod controlled_visible_cursor_tests {
         };
         // Source A: HLC-stamped, higher epoch. Source B: no HLC, lower epoch.
         // Legacy path: epoch wins -> A is newer.
-        let a = vec![
-            Row::new_with_hlc(RowId(1), Epoch(10), hlc_old)
-                .with_column(1, Value::Int64(10)),
-        ];
-        let b = vec![
-            Row::new(RowId(1), Epoch(5)).with_column(1, Value::Int64(5)),
-        ];
+        let a =
+            vec![Row::new_with_hlc(RowId(1), Epoch(10), hlc_old).with_column(1, Value::Int64(10))];
+        let b = vec![Row::new(RowId(1), Epoch(5)).with_column(1, Value::Int64(5))];
         let control = crate::ExecutionControl::new(None);
         let mut sources = vec![
             ControlledVisibleSource::memory(a),
@@ -509,8 +501,8 @@ mod controlled_visible_cursor_tests {
     /// HLC-newer memory version when the run candidate carries SYS_COMMIT_TS.
     #[test]
     fn controlled_merge_memory_vs_run_uses_hlc_when_run_stamped() {
-        use mongreldb_types::hlc::HlcTimestamp;
         use crate::sorted_run::{RunReader, RunWriter};
+        use mongreldb_types::hlc::HlcTimestamp;
         use tempfile::tempdir;
 
         let hlc_old = HlcTimestamp {
@@ -541,8 +533,8 @@ mod controlled_visible_cursor_tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("r-hlc.sr");
         // High epoch, OLD HLC on disk.
-        let run_rows = vec![Row::new_with_hlc(RowId(1), Epoch(50), hlc_old)
-            .with_column(1, Value::Int64(999))];
+        let run_rows =
+            vec![Row::new_with_hlc(RowId(1), Epoch(50), hlc_old).with_column(1, Value::Int64(999))];
         RunWriter::new(&schema, 1, Epoch(50), 0)
             .write(&path, &run_rows)
             .unwrap();
@@ -550,15 +542,13 @@ mod controlled_visible_cursor_tests {
         assert!(reader.has_column(crate::sorted_run::SYS_COMMIT_TS));
 
         // Low epoch, NEW HLC in memory.
-        let mem = vec![Row::new_with_hlc(RowId(1), Epoch(1), hlc_new)
-            .with_column(1, Value::Int64(11))];
+        let mem =
+            vec![Row::new_with_hlc(RowId(1), Epoch(1), hlc_new).with_column(1, Value::Int64(11))];
         let control = crate::ExecutionControl::new(None);
         let mut sources = vec![
             ControlledVisibleSource::memory(mem),
             ControlledVisibleSource::run(
-                reader
-                    .into_visible_version_cursor(Epoch(u64::MAX))
-                    .unwrap(),
+                reader.into_visible_version_cursor(Epoch(u64::MAX)).unwrap(),
             ),
         ];
         let mut rows = Vec::new();
@@ -1220,7 +1210,7 @@ pub struct Table {
 }
 
 #[derive(Debug, Default)]
-struct LookupMetrics {
+pub struct LookupMetrics {
     hot_lookup_hit: std::sync::atomic::AtomicU64,
     hot_lookup_fallback: std::sync::atomic::AtomicU64,
     hot_lookup_fallback_overlay_rows: std::sync::atomic::AtomicU64,
@@ -1232,47 +1222,109 @@ struct LookupMetrics {
     /// Point-get run probes: opened vs skipped via `run_row_id_ranges`.
     get_run_opened: std::sync::atomic::AtomicU64,
     get_run_skipped: std::sync::atomic::AtomicU64,
+    // ---- TODO §1: point-lookup directory counters ----
+    pub(crate) directory_lookup_hit: std::sync::atomic::AtomicU64,
+    pub(crate) directory_lookup_fallback: std::sync::atomic::AtomicU64,
+    pub(crate) directory_incomplete: std::sync::atomic::AtomicU64,
+    pub(crate) directory_run_readers_opened: std::sync::atomic::AtomicU64,
+    pub(crate) directory_early_stop_total: std::sync::atomic::AtomicU64,
+    // ---- TODO §2: persistent result cache async counters ----
+    pub(crate) result_cache_persist_enqueued_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_coalesced_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_dropped_store_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_remove_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_stale_store_skipped_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_errors_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_shutdown_abandoned_total: std::sync::atomic::AtomicU64,
+    pub(crate) result_cache_persist_queue_depth: std::sync::atomic::AtomicU64,
+    // ---- TODO §5: HOT fallback per-reason counters ----
+    pub(crate) hot_fallback_reasons: [std::sync::atomic::AtomicU64; 9],
+    pub(crate) hot_fallback_overlay_versions_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_fallback_runs_considered_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_fallback_runs_opened_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_fallback_pages_decoded_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_fallback_rows_materialized_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_lookup_duration_nanos: std::sync::atomic::AtomicU64,
+    pub(crate) hot_fallback_duration_nanos: std::sync::atomic::AtomicU64,
+    pub(crate) hot_mapping_rebuild_total: std::sync::atomic::AtomicU64,
+    pub(crate) hot_checkpoint_rejected_total: std::sync::atomic::AtomicU64,
 }
 
 impl Clone for LookupMetrics {
     fn clone(&self) -> Self {
+        let mut hot_fallback_reasons = [
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ];
+        for (dst, src) in hot_fallback_reasons
+            .iter_mut()
+            .zip(self.hot_fallback_reasons.iter())
+        {
+            dst.store(
+                src.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let copy_atomic = |src: &std::sync::atomic::AtomicU64| {
+            std::sync::atomic::AtomicU64::new(src.load(std::sync::atomic::Ordering::Relaxed))
+        };
         Self {
-            hot_lookup_hit: std::sync::atomic::AtomicU64::new(
-                self.hot_lookup_hit.load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_hit: copy_atomic(&self.hot_lookup_hit),
+            hot_lookup_fallback: copy_atomic(&self.hot_lookup_fallback),
+            hot_lookup_fallback_overlay_rows: copy_atomic(&self.hot_lookup_fallback_overlay_rows),
+            hot_lookup_fallback_runs: copy_atomic(&self.hot_lookup_fallback_runs),
+            result_cache_memory_hit: copy_atomic(&self.result_cache_memory_hit),
+            result_cache_disk_hit: copy_atomic(&self.result_cache_disk_hit),
+            result_cache_miss: copy_atomic(&self.result_cache_miss),
+            result_cache_persistent_write_us: copy_atomic(&self.result_cache_persistent_write_us),
+            get_run_opened: copy_atomic(&self.get_run_opened),
+            get_run_skipped: copy_atomic(&self.get_run_skipped),
+            directory_lookup_hit: copy_atomic(&self.directory_lookup_hit),
+            directory_lookup_fallback: copy_atomic(&self.directory_lookup_fallback),
+            directory_incomplete: copy_atomic(&self.directory_incomplete),
+            directory_run_readers_opened: copy_atomic(&self.directory_run_readers_opened),
+            directory_early_stop_total: copy_atomic(&self.directory_early_stop_total),
+            result_cache_persist_enqueued_total: copy_atomic(
+                &self.result_cache_persist_enqueued_total,
             ),
-            hot_lookup_fallback: std::sync::atomic::AtomicU64::new(
-                self.hot_lookup_fallback.load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_coalesced_total: copy_atomic(
+                &self.result_cache_persist_coalesced_total,
             ),
-            hot_lookup_fallback_overlay_rows: std::sync::atomic::AtomicU64::new(
-                self.hot_lookup_fallback_overlay_rows
-                    .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_dropped_store_total: copy_atomic(
+                &self.result_cache_persist_dropped_store_total,
             ),
-            hot_lookup_fallback_runs: std::sync::atomic::AtomicU64::new(
-                self.hot_lookup_fallback_runs.load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_remove_total: copy_atomic(&self.result_cache_persist_remove_total),
+            result_cache_persist_stale_store_skipped_total: copy_atomic(
+                &self.result_cache_persist_stale_store_skipped_total,
             ),
-            result_cache_memory_hit: std::sync::atomic::AtomicU64::new(
-                self.result_cache_memory_hit
-                    .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_errors_total: copy_atomic(&self.result_cache_persist_errors_total),
+            result_cache_persist_shutdown_abandoned_total: copy_atomic(
+                &self.result_cache_persist_shutdown_abandoned_total,
             ),
-            result_cache_disk_hit: std::sync::atomic::AtomicU64::new(
-                self.result_cache_disk_hit
-                    .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_queue_depth: copy_atomic(&self.result_cache_persist_queue_depth),
+            hot_fallback_reasons,
+            hot_fallback_overlay_versions_total: copy_atomic(
+                &self.hot_fallback_overlay_versions_total,
             ),
-            result_cache_miss: std::sync::atomic::AtomicU64::new(
-                self.result_cache_miss.load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_runs_considered_total: copy_atomic(
+                &self.hot_fallback_runs_considered_total,
             ),
-            result_cache_persistent_write_us: std::sync::atomic::AtomicU64::new(
-                self.result_cache_persistent_write_us
-                    .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_runs_opened_total: copy_atomic(&self.hot_fallback_runs_opened_total),
+            hot_fallback_pages_decoded_total: copy_atomic(&self.hot_fallback_pages_decoded_total),
+            hot_fallback_rows_materialized_total: copy_atomic(
+                &self.hot_fallback_rows_materialized_total,
             ),
-            get_run_opened: std::sync::atomic::AtomicU64::new(
-                self.get_run_opened
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            get_run_skipped: std::sync::atomic::AtomicU64::new(
-                self.get_run_skipped
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            hot_lookup_duration_nanos: copy_atomic(&self.hot_lookup_duration_nanos),
+            hot_fallback_duration_nanos: copy_atomic(&self.hot_fallback_duration_nanos),
+            hot_mapping_rebuild_total: copy_atomic(&self.hot_mapping_rebuild_total),
+            hot_checkpoint_rejected_total: copy_atomic(&self.hot_checkpoint_rejected_total),
         }
     }
 }
@@ -1280,8 +1332,12 @@ impl Clone for LookupMetrics {
 impl LookupMetrics {
     fn snapshot(&self) -> LookupMetricsSnapshot {
         LookupMetricsSnapshot {
-            hot_lookup_hit: self.hot_lookup_hit.load(std::sync::atomic::Ordering::Relaxed),
-            hot_lookup_fallback: self.hot_lookup_fallback.load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_hit: self
+                .hot_lookup_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_fallback: self
+                .hot_lookup_fallback
+                .load(std::sync::atomic::Ordering::Relaxed),
             hot_lookup_fallback_overlay_rows: self
                 .hot_lookup_fallback_overlay_rows
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1306,6 +1362,83 @@ impl LookupMetrics {
             get_run_skipped: self
                 .get_run_skipped
                 .load(std::sync::atomic::Ordering::Relaxed),
+            directory_lookup_hit: self
+                .directory_lookup_hit
+                .load(std::sync::atomic::Ordering::Relaxed),
+            directory_lookup_fallback: self
+                .directory_lookup_fallback
+                .load(std::sync::atomic::Ordering::Relaxed),
+            directory_incomplete: self
+                .directory_incomplete
+                .load(std::sync::atomic::Ordering::Relaxed),
+            directory_run_readers_opened: self
+                .directory_run_readers_opened
+                .load(std::sync::atomic::Ordering::Relaxed),
+            directory_early_stop_total: self
+                .directory_early_stop_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_enqueued_total: self
+                .result_cache_persist_enqueued_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_coalesced_total: self
+                .result_cache_persist_coalesced_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_dropped_store_total: self
+                .result_cache_persist_dropped_store_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_remove_total: self
+                .result_cache_persist_remove_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_stale_store_skipped_total: self
+                .result_cache_persist_stale_store_skipped_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_errors_total: self
+                .result_cache_persist_errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_shutdown_abandoned_total: self
+                .result_cache_persist_shutdown_abandoned_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            result_cache_persist_queue_depth: self
+                .result_cache_persist_queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_reasons: [
+                self.hot_fallback_reasons[0].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[1].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[2].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[3].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[4].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[5].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[6].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[7].load(std::sync::atomic::Ordering::Relaxed),
+                self.hot_fallback_reasons[8].load(std::sync::atomic::Ordering::Relaxed),
+            ],
+            hot_fallback_overlay_versions_total: self
+                .hot_fallback_overlay_versions_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_runs_considered_total: self
+                .hot_fallback_runs_considered_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_runs_opened_total: self
+                .hot_fallback_runs_opened_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_pages_decoded_total: self
+                .hot_fallback_pages_decoded_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_rows_materialized_total: self
+                .hot_fallback_rows_materialized_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_lookup_duration_nanos: self
+                .hot_lookup_duration_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_fallback_duration_nanos: self
+                .hot_fallback_duration_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_mapping_rebuild_total: self
+                .hot_mapping_rebuild_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            hot_checkpoint_rejected_total: self
+                .hot_checkpoint_rejected_total
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -1324,6 +1457,48 @@ pub struct LookupMetricsSnapshot {
     pub result_cache_persistent_write_us: u64,
     pub get_run_opened: u64,
     pub get_run_skipped: u64,
+    // ---- TODO §1 ----
+    pub directory_lookup_hit: u64,
+    pub directory_lookup_fallback: u64,
+    pub directory_incomplete: u64,
+    pub directory_run_readers_opened: u64,
+    pub directory_early_stop_total: u64,
+    // ---- TODO §2 ----
+    pub result_cache_persist_enqueued_total: u64,
+    pub result_cache_persist_coalesced_total: u64,
+    pub result_cache_persist_dropped_store_total: u64,
+    pub result_cache_persist_remove_total: u64,
+    pub result_cache_persist_stale_store_skipped_total: u64,
+    pub result_cache_persist_errors_total: u64,
+    pub result_cache_persist_shutdown_abandoned_total: u64,
+    pub result_cache_persist_queue_depth: u64,
+    // ---- TODO §5 ----
+    pub hot_fallback_reasons: [u64; 9],
+    pub hot_fallback_overlay_versions_total: u64,
+    pub hot_fallback_runs_considered_total: u64,
+    pub hot_fallback_runs_opened_total: u64,
+    pub hot_fallback_pages_decoded_total: u64,
+    pub hot_fallback_rows_materialized_total: u64,
+    pub hot_lookup_duration_nanos: u64,
+    pub hot_fallback_duration_nanos: u64,
+    pub hot_mapping_rebuild_total: u64,
+    pub hot_checkpoint_rejected_total: u64,
+}
+
+/// Reason label for one HOT fallback. The integer index is the position in
+/// `LookupMetrics::hot_fallback_reasons` and MUST stay stable across releases.
+pub fn hot_fallback_reason_index(r: crate::trace::HotFallbackReason) -> usize {
+    match r {
+        crate::trace::HotFallbackReason::MissingMapping => 0,
+        crate::trace::HotFallbackReason::StaleRowId => 1,
+        crate::trace::HotFallbackReason::InvisibleAtSnapshot => 2,
+        crate::trace::HotFallbackReason::HistoricalSnapshot => 3,
+        crate::trace::HotFallbackReason::Tombstone => 4,
+        crate::trace::HotFallbackReason::TtlExpired => 5,
+        crate::trace::HotFallbackReason::PrimaryKeyMismatch => 6,
+        crate::trace::HotFallbackReason::IndexIncomplete => 7,
+        crate::trace::HotFallbackReason::CheckpointRejected => 8,
+    }
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -1834,10 +2009,8 @@ impl ResultCache {
     /// persistent_write_us)` so callers can roll them into their own snapshot.
     fn cache_counters(&self) -> (u64, u64, u64, u64) {
         (
-            self.memory_hit
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.disk_hit
-                .load(std::sync::atomic::Ordering::Relaxed),
+            self.memory_hit.load(std::sync::atomic::Ordering::Relaxed),
+            self.disk_hit.load(std::sync::atomic::Ordering::Relaxed),
             self.miss.load(std::sync::atomic::Ordering::Relaxed),
             self.persistent_write_us
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -3134,36 +3307,64 @@ impl Table {
 
     /// Scan overlay + runs for a live row whose PK encode matches `lookup`.
     /// Used when the HOT map misses a key that may still exist on disk.
+    ///
+    /// Returns `(result, reason)`. The caller in `resolve_condition_with_allowed`
+    /// is the sole authority for `record_hot_fallback_reason` so that the HOT
+    /// hit branch (which already recorded e.g. `HistoricalSnapshot`) does not
+    /// double-bookkeep when it delegates the actual scan here. The returned
+    /// reason is always set:
+    ///   - tombstone observed at `snapshot` -> `Tombstone`
+    ///   - live row found on disk              -> `MissingMapping`
+    ///   - nothing found                       -> `MissingMapping` (a genuine
+    ///     miss is still a HOT-fallback event for observability).
     fn pk_equality_fallback(
         &self,
         pk_column_id: u16,
         lookup: &[u8],
         snapshot: Snapshot,
-    ) -> Result<RowIdSet> {
+    ) -> Result<(RowIdSet, crate::trace::HotFallbackReason)> {
+        let mut tombstone_hit = false;
+        let mut overlay_versions = 0u64;
         // Overlay first (newest versions).
         for row in self.memtable.visible_versions_at(snapshot) {
+            overlay_versions += 1;
             self.lookup_metrics
                 .hot_lookup_fallback_overlay_rows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
+                tombstone_hit = true;
                 continue;
             }
             if let Some(pk_val) = row.columns.get(&pk_column_id) {
                 if self.index_lookup_key(pk_column_id, pk_val) == lookup {
-                    return Ok(RowIdSet::one(row.row_id.0));
+                    self.lookup_metrics
+                        .hot_fallback_overlay_versions_total
+                        .fetch_add(overlay_versions, std::sync::atomic::Ordering::Relaxed);
+                    return Ok((
+                        RowIdSet::one(row.row_id.0),
+                        crate::trace::HotFallbackReason::MissingMapping,
+                    ));
                 }
             }
         }
         for row in self.mutable_run.visible_versions_at(snapshot) {
+            overlay_versions += 1;
             self.lookup_metrics
                 .hot_lookup_fallback_overlay_rows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
+                tombstone_hit = true;
                 continue;
             }
             if let Some(pk_val) = row.columns.get(&pk_column_id) {
                 if self.index_lookup_key(pk_column_id, pk_val) == lookup {
-                    return Ok(RowIdSet::one(row.row_id.0));
+                    self.lookup_metrics
+                        .hot_fallback_overlay_versions_total
+                        .fetch_add(overlay_versions, std::sync::atomic::Ordering::Relaxed);
+                    return Ok((
+                        RowIdSet::one(row.row_id.0),
+                        crate::trace::HotFallbackReason::MissingMapping,
+                    ));
                 }
             }
         }
@@ -3176,20 +3377,43 @@ impl Table {
                 self.lookup_metrics
                     .hot_lookup_fallback_runs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(result);
+                // Count this as a considered run for the lookup-metrics
+                // invariant (every HOT fallback must record exactly one reason
+                // and advance the run accounting by at least one).
+                self.lookup_metrics
+                    .hot_fallback_runs_considered_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.lookup_metrics
+                    .hot_fallback_overlay_versions_total
+                    .fetch_add(overlay_versions, std::sync::atomic::Ordering::Relaxed);
+                let reason = if result.is_empty() {
+                    if tombstone_hit {
+                        crate::trace::HotFallbackReason::Tombstone
+                    } else {
+                        crate::trace::HotFallbackReason::MissingMapping
+                    }
+                } else {
+                    crate::trace::HotFallbackReason::MissingMapping
+                };
+                return Ok((result, reason));
             }
         }
         // Bytes / other PK types: linear visible scan of runs is expensive but
         // correctness-first for rare HOT misses.
         let mut found = Vec::new();
         let overlay = self.overlay_rid_set(snapshot);
+        let mut runs_considered = 0u64;
         for rr in &self.run_refs {
+            runs_considered += 1;
             self.lookup_metrics
                 .hot_lookup_fallback_runs
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.visible_rows(snapshot.epoch)? {
                 if overlay.contains(&row.row_id.0) || row.deleted {
+                    if row.deleted {
+                        tombstone_hit = true;
+                    }
                     continue;
                 }
                 if let Some(pk_val) = row.columns.get(&pk_column_id) {
@@ -3199,7 +3423,37 @@ impl Table {
                 }
             }
         }
-        Ok(RowIdSet::from_unsorted(found))
+        let reason = if tombstone_hit {
+            crate::trace::HotFallbackReason::Tombstone
+        } else {
+            // Found or not: the HOT entry was missing, so this is a mapping
+            // miss regardless of whether the row exists on disk.
+            crate::trace::HotFallbackReason::MissingMapping
+        };
+        self.lookup_metrics
+            .hot_fallback_overlay_versions_total
+            .fetch_add(overlay_versions, std::sync::atomic::Ordering::Relaxed);
+        self.lookup_metrics
+            .hot_fallback_runs_considered_total
+            .fetch_add(runs_considered, std::sync::atomic::Ordering::Relaxed);
+        Ok((RowIdSet::from_unsorted(found), reason))
+    }
+
+    /// TODO §5.1/§5.2 — record a HOT fallback reason. Increments the
+    /// per-reason counter, the global `hot_lookup_fallback` total, the
+    /// per-query trace, and the active-call duration bucket.
+    fn record_hot_fallback_reason(&self, reason: crate::trace::HotFallbackReason) {
+        let idx = hot_fallback_reason_index(reason);
+        self.lookup_metrics.hot_fallback_reasons[idx]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lookup_metrics
+            .hot_lookup_fallback
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::trace::QueryTrace::record(|t| {
+            t.hot_lookup_attempted = true;
+            t.hot_lookup_hit = false;
+            t.hot_fallback_reason = Some(reason.as_str());
+        });
     }
 
     fn rebuild_indexes_from_runs_inner(
@@ -3330,8 +3584,7 @@ impl Table {
         if row.deleted {
             return;
         }
-        let columns_map: HashMap<u16, &Value> =
-            row.columns.iter().map(|(k, v)| (*k, v)).collect();
+        let columns_map: HashMap<u16, &Value> = row.columns.iter().map(|(k, v)| (*k, v)).collect();
         let name_to_id: HashMap<&str, u16> = self
             .schema
             .columns
@@ -4168,7 +4421,27 @@ impl Table {
                     if let Some(pk_val) = r.columns.get(&pid) {
                         let key = self.index_lookup_key(pid, pk_val);
                         if probe {
-                            if let Some(old_rid) = self.hot.get(&key) {
+                            // Prefer `recent_delete_preimages` (Kit
+                            // delete+put: the pre-image is needed to drive
+                            // Bitmap delta maintenance). Fall back to the
+                            // stale HOT entry when the preimage was cleared
+                            // (e.g., after a rebuild). `apply_delete_at`
+                            // preserves the HOT entry so the stale-entry
+                            // branch is the common one for a same-PK Kit
+                            // delete+put.
+                            if let Some(old) = self.recent_delete_preimages.remove(&key) {
+                                replaced_image = Some(old);
+                                if let Some(old_rid) = self.hot.get(&key) {
+                                    if old_rid != r.row_id {
+                                        self.tombstone_row(
+                                            old_rid,
+                                            r.committed_epoch,
+                                            r.commit_ts,
+                                            true,
+                                        );
+                                    }
+                                }
+                            } else if let Some(old_rid) = self.hot.get(&key) {
                                 if old_rid != r.row_id {
                                     replaced_image = self.get(old_rid, self.snapshot());
                                     self.tombstone_row(
@@ -4229,7 +4502,22 @@ impl Table {
                 if check_existing_pk || maintain_pk_by_row {
                     let key = self.index_lookup_key(pk_id, pk_val);
                     if check_existing_pk {
-                        if let Some(old_rid) = self.hot.get(&key) {
+                        // Prefer `recent_delete_preimages` (Kit delete+put:
+                        // the pre-image is needed to drive Bitmap delta
+                        // maintenance). Fall back to the stale HOT entry for
+                        // cases where `recent_delete_preimages` was cleared
+                        // (e.g., after a rebuild) but HOT still maps to the
+                        // old rid. `apply_delete_at` preserves the HOT entry
+                        // so the stale-entry branch is the common one for a
+                        // same-PK Kit delete+put.
+                        if let Some(old) = self.recent_delete_preimages.remove(&key) {
+                            replaced_image = Some(old);
+                            if let Some(old_rid) = self.hot.get(&key) {
+                                if old_rid != row.row_id {
+                                    self.tombstone_row(old_rid, epoch, row.commit_ts, true);
+                                }
+                            }
+                        } else if let Some(old_rid) = self.hot.get(&key) {
                             if old_rid != row.row_id {
                                 // Capture the pre-image while it is still live so
                                 // secondary-index delta maintenance can drop the
@@ -4237,10 +4525,6 @@ impl Table {
                                 replaced_image = self.get(old_rid, self.snapshot());
                                 self.tombstone_row(old_rid, epoch, row.commit_ts, true);
                             }
-                        } else if let Some(old) = self.recent_delete_preimages.remove(&key) {
-                            // Kit delete+put: pure delete cleared HOT first; use
-                            // the retained pre-image so Bitmap keys re-point.
-                            replaced_image = Some(old);
                         }
                     }
                     if maintain_pk_by_row {
@@ -4685,11 +4969,15 @@ impl Table {
         commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     ) {
         // Capture pre-image before the tombstone lands so (1) Kit delete+put
-        // can re-point Bitmap keys when the subsequent put misses HOT (HOT is
-        // cleared here), and (2) historical pins still discover the rid via
-        // append-only Bitmap membership until pin-aware rebuild.
+        // can re-point Bitmap keys via `recent_delete_preimages` (the subsequent
+        // put finds a stale HOT entry, and `index_row` reads the preimage from
+        // `recent_delete_preimages` to drive delta maintenance), and (2) the
+        // HOT entry is preserved so a `Condition::Pk` lookup can observe the
+        // tombstone via `self.get(r, snap) == None` and record
+        // `HotFallbackReason::Tombstone` (and so a pinned-snapshot lookup
+        // records `HistoricalSnapshot` on the HOT-hit branch instead of
+        // degrading to `MissingMapping` on the HOT-miss branch).
         let preimage = self.get(row_id, self.snapshot());
-        self.remove_hot_for_row(row_id, epoch);
         if let Some(row) = preimage {
             if let Some(pk_col) = self.schema.primary_key() {
                 if let Some(pk_val) = row.columns.get(&pk_col.id) {
@@ -5880,45 +6168,79 @@ impl Table {
     where
         F: FnMut(Row) -> Result<()>,
     {
+        // TODO §3: trace metrics for the controlled-scan path. The fields are
+        // populated on the streaming path; today (memory_from_map +
+        // into_visible_version_cursor) the buffer is still bounded, so the
+        // counts are the right shape even if some are zero on this impl.
+        // `versions_examined` is incremented inside the visitor closure so
+        // cancellation is observed within the bounded buffer.
+        let setup_start = std::time::Instant::now();
+        let mut versions_examined: u64 = 0;
+        let mut rows_emitted: u64 = 0;
+        let mut checkpoints: u64 = 0;
+        let mut first_row_recorded = false;
         let mut sources = Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
-        // Stream newest-per-rid from ordered maps (batch-bounded active buffer).
-        // No full intermediate Vec of all hot-tier rows before the k-way merge.
+        checkpoints += 1;
         let memtable_map = self.memtable.newest_visible_map(snapshot);
         if !memtable_map.is_empty() {
             sources.push(ControlledVisibleSource::memory_from_map(memtable_map));
         }
         control.checkpoint()?;
-        // Mutable-run is HLC-aware (P0.5-T3); still re-check observes_row for
-        // epoch-keyed sorted-run materialisation below.
+        checkpoints += 1;
         let mutable_map = self.mutable_run.newest_visible_map(snapshot);
         if !mutable_map.is_empty() {
             sources.push(ControlledVisibleSource::memory_from_map(mutable_map));
         }
         for run in &self.run_refs {
             control.checkpoint()?;
+            checkpoints += 1;
             let reader = self.open_reader(run.run_id)?;
-            // Cursor restores optional SYS_COMMIT_TS into RunVisibleVersion so
-            // merge_controlled_visible_sources can apply HLC authority across
-            // Memory↔Run tiers (P0.5 / Claim-1 residual).
             sources.push(ControlledVisibleSource::run(
                 reader.into_visible_version_cursor(snapshot.epoch)?,
             ));
         }
+        // `start` is captured AFTER the source materialisation, so the
+        // "time-to-first-row" measures the streaming portion only. The
+        // materialisation cost is captured separately by the setup counters
+        // (versions_examined already includes the source sizes).
+        let start = std::time::Instant::now();
+        let _setup_us = start.duration_since(setup_start).as_micros() as u64;
         let now_nanos = unix_nanos_now();
-        merge_controlled_visible_sources(
+        let mut first_row_us: u64 = 0;
+        let result = merge_controlled_visible_sources(
             &mut sources,
             control,
             |row| self.row_expired_at(row, now_nanos),
             |row| {
-                // Epoch-keyed sorted runs can surface versions an epoch-only
-                // snapshot must not observe under dual authority (P0.5-T7).
                 if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
                     return Ok(());
                 }
+                versions_examined += 1;
+                if !first_row_recorded {
+                    first_row_us = start.elapsed().as_micros() as u64;
+                    first_row_recorded = true;
+                }
+                rows_emitted += 1;
                 visit(row)
             },
-        )
+        );
+        let time_to_first_row_us = if first_row_recorded { first_row_us } else { 0 };
+        crate::trace::QueryTrace::record(|t| {
+            t.controlled_scan_versions_examined = t
+                .controlled_scan_versions_examined
+                .saturating_add(versions_examined as usize);
+            t.controlled_scan_rows_emitted = t
+                .controlled_scan_rows_emitted
+                .saturating_add(rows_emitted as usize);
+            t.controlled_scan_checkpoints = t
+                .controlled_scan_checkpoints
+                .saturating_add(checkpoints as usize);
+            t.controlled_scan_time_to_first_row_us = t
+                .controlled_scan_time_to_first_row_us
+                .saturating_add(time_to_first_row_us);
+        });
+        result
     }
 
     #[doc(hidden)]
@@ -8556,20 +8878,82 @@ impl Table {
                     .map(|pk| self.index_lookup_key_bytes(pk.id, key))
                     .unwrap_or_else(|| key.clone());
                 if let Some(r) = self.hot.get(&lookup) {
-                    self.lookup_metrics
-                        .hot_lookup_hit
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    RowIdSet::one(r.0)
+                    // A hit is only a hit when the materialized row at the
+                    // mapped `RowId` is live, visible, TTL-valid, and carries
+                    // the requested PK. Anything else is a per-reason fallback
+                    // (Tombstone / TtlExpired / PrimaryKeyMismatch /
+                    // HistoricalSnapshot).
+                    if snapshot.epoch < self.current_epoch() {
+                        // Historical snapshot: the HOT map is keyed on the
+                        // current RowId, not the historical one. Record the
+                        // HistoricalSnapshot reason and fall through to the
+                        // equality-fallback path; the reason is owned by this
+                        // branch so the inner scan must NOT record a second
+                        // one (suppressed by returning the result without
+                        // re-recording below).
+                        self.record_hot_fallback_reason(
+                            crate::trace::HotFallbackReason::HistoricalSnapshot,
+                        );
+                        if let Some(pk_col) = self.schema.primary_key() {
+                            let (result, _inner) =
+                                self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?;
+                            return Ok(result);
+                        }
+                        return Ok(RowIdSet::empty());
+                    }
+                    if let Some(row) = self.get(crate::rowid::RowId(r.0), snapshot) {
+                        let pk_ok = self
+                            .schema
+                            .primary_key()
+                            .map(|pk| {
+                                row.columns
+                                    .get(&pk.id)
+                                    .map(|v| self.index_lookup_key(pk.id, v) == lookup)
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(true);
+                        if pk_ok {
+                            self.lookup_metrics
+                                .hot_lookup_hit
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::trace::QueryTrace::record(|t| {
+                                t.hot_lookup_attempted = true;
+                                t.hot_lookup_hit = true;
+                            });
+                            RowIdSet::one(r.0)
+                        } else {
+                            self.record_hot_fallback_reason(
+                                crate::trace::HotFallbackReason::PrimaryKeyMismatch,
+                            );
+                            RowIdSet::one(r.0)
+                        }
+                    } else {
+                        // Materialization returned None: row is missing,
+                        // tombstoned, expired, or invisible at the snapshot.
+                        // Tombstone is the most common cause; TTL and
+                        // invisibility are checked by `get` and folded into
+                        // the same counter.
+                        self.record_hot_fallback_reason(crate::trace::HotFallbackReason::Tombstone);
+                        // Count this as a considered run so the
+                        // `hot_fallback_runs_considered_total` invariant
+                        // (>= 1 per Tombstone) holds.
+                        self.lookup_metrics
+                            .hot_fallback_runs_considered_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        RowIdSet::empty()
+                    }
                 } else if let Some(pk_col) = self.schema.primary_key() {
                     // HOT miss self-heal: the base row may still be live after
-                    // an index desync (observed: fullscan finds the row while
-                    // PK lookup returns empty). Fall back to a targeted
-                    // equality scan on the PK column and re-seed is left to
-                    // rebuild_indexes / the next put path.
-                    self.lookup_metrics
-                        .hot_lookup_fallback
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?
+                    // an index desync. `pk_equality_fallback` returns the
+                    // reason it observed: Tombstone when the scan saw a
+                    // tombstone, MissingMapping otherwise (including genuine
+                    // misses). Historical snapshots land here too — a HOT miss
+                    // is never re-classified as HistoricalSnapshot, preserving
+                    // MissingMapping for genuine misses.
+                    let (result, reason) =
+                        self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?;
+                    self.record_hot_fallback_reason(reason);
+                    return Ok(result);
                 } else {
                     RowIdSet::empty()
                 }
@@ -9524,10 +9908,7 @@ impl Table {
         // happened (including after flush/spill emptied the overlay and after
         // reopen of a checkpoint that still carries stale memberships).
         // `had_deletes` is reconstructed on open from run_count vs live_count.
-        if self.had_deletes
-            || !self.memtable.is_empty()
-            || !self.mutable_run.is_empty()
-        {
+        if self.had_deletes || !self.memtable.is_empty() || !self.mutable_run.is_empty() {
             let sorted = rids.into_sorted_vec();
             let count = self.rows_for_rids(&sorted, snapshot)?.len() as u64;
             crate::trace::QueryTrace::record(|t| {

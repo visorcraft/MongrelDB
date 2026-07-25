@@ -143,12 +143,7 @@ impl SnapshotRegistry {
     /// readers), ascending. Used by pin-aware index rebuild so multi-pin
     /// registry readers — not only the oldest — keep Bitmap discovery keys.
     pub fn live_pinned_epochs(&self) -> Vec<Epoch> {
-        self.live
-            .lock()
-            .keys()
-            .copied()
-            .map(Epoch)
-            .collect()
+        self.live.lock().keys().copied().map(Epoch).collect()
     }
 
     fn release(&self, epoch: Epoch) {
