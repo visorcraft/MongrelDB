@@ -175,25 +175,34 @@ impl Model {
     /// explicit `new_rid` flag forces a fresh rid (Kit update shape).
     fn upsert(&mut self, pk: i64, cols: Vec<(u16, ValueRepr)>, new_rid: bool) -> u64 {
         let rid = if new_rid {
-            let fresh = self.fresh_rid();
-            if let Some(prev) = self.live_pks.insert(pk, fresh) {
+            self.fresh_rid()
+        } else if let Some(existing) = self.live_pks.get(&pk).copied() {
+            existing
+        } else {
+            self.fresh_rid()
+        };
+        self.upsert_with_rid(pk, cols, new_rid, rid);
+        rid
+    }
+
+    fn upsert_with_rid(
+        &mut self,
+        pk: i64,
+        cols: Vec<(u16, ValueRepr)>,
+        new_rid: bool,
+        rid: u64,
+    ) {
+        self.next_rid = self.next_rid.max(rid.saturating_add(1));
+        if new_rid {
+            if let Some(prev) = self.live_pks.insert(pk, rid) {
                 self.tombstones.insert(prev);
                 if let Some(row) = self.rows.iter_mut().find(|r| r.rid == prev) {
                     row.deleted = true;
                 }
             }
-            fresh
         } else {
-            // Upsert: re-use the existing rid if the PK is live, otherwise
-            // allocate a fresh one.
-            if let Some(existing) = self.live_pks.get(&pk).copied() {
-                existing
-            } else {
-                let fresh = self.fresh_rid();
-                self.live_pks.insert(pk, fresh);
-                fresh
-            }
-        };
+            self.live_pks.insert(pk, rid);
+        }
         if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
             row.deleted = false;
             for (cid, val) in cols {
@@ -208,7 +217,6 @@ impl Model {
                 cols: cols_map,
             });
         }
-        rid
     }
 
     fn delete(&mut self, pk: i64) -> Option<u64> {
@@ -510,8 +518,10 @@ fn apply_put(table: &mut Table, harness: &mut Harness, pk: i64, cols: Vec<(u16, 
     // HOT entry and allocates a fresh rid. The model mirrors that with
     // new_rid=true (which tombstones the old rid and hands out a new one).
     let already_live = harness.model.live_pks.contains_key(&pk);
-    harness.model.upsert(pk, reprs.clone(), true);
-    table.put(cols).unwrap();
+    let rid = table.put(cols).unwrap();
+    harness
+        .model
+        .upsert_with_rid(pk, reprs.clone(), true, rid.0);
     harness.record(Op::Put {
         pk,
         cols: reprs,
