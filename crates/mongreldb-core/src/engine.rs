@@ -18,8 +18,8 @@ use crate::index::{
     SparseIndex,
 };
 use crate::manifest::{self, Manifest, RunRef, TtlPolicy};
-use crate::memtable::{Memtable, Row, Value};
-use crate::mutable_run::MutableRun;
+use crate::memtable::{Memtable, MemtableVisibleVersionCursor, Row, Value};
+use crate::mutable_run::{MutableRun, MutableRunVisibleVersionCursor};
 use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
@@ -88,15 +88,21 @@ fn derive_next_run_id(
         .ok_or_else(|| MongrelError::Full("run-id namespace exhausted".into()))
 }
 
-enum ControlledVisibleCandidate {
+enum ControlledVisibleCandidate<'a> {
     Memory(Row),
+    /// Newest-visible overlay row borrowed from the streaming memtable cursor.
+    Memtable(RowId, Epoch, &'a Row),
+    /// Newest-visible overlay row borrowed from the streaming mutable-run cursor.
+    MutableRun(RowId, Epoch, &'a Row),
     Run(RunVisibleVersion),
 }
 
-impl ControlledVisibleCandidate {
+impl<'a> ControlledVisibleCandidate<'a> {
     fn row_id(&self) -> RowId {
         match self {
             Self::Memory(row) => row.row_id,
+            Self::Memtable(rid, _, _) => *rid,
+            Self::MutableRun(rid, _, _) => *rid,
             Self::Run(version) => version.row_id,
         }
     }
@@ -104,6 +110,8 @@ impl ControlledVisibleCandidate {
     fn committed_epoch(&self) -> Epoch {
         match self {
             Self::Memory(row) => row.committed_epoch,
+            Self::Memtable(_, epoch, _) => *epoch,
+            Self::MutableRun(_, epoch, _) => *epoch,
             Self::Run(version) => version.committed_epoch,
         }
     }
@@ -111,6 +119,8 @@ impl ControlledVisibleCandidate {
     fn deleted(&self) -> bool {
         match self {
             Self::Memory(row) => row.deleted,
+            Self::Memtable(_, _, row) => row.deleted,
+            Self::MutableRun(_, _, row) => row.deleted,
             Self::Run(version) => version.deleted,
         }
     }
@@ -118,6 +128,8 @@ impl ControlledVisibleCandidate {
     fn commit_ts(&self) -> Option<mongreldb_types::hlc::HlcTimestamp> {
         match self {
             Self::Memory(row) => row.commit_ts,
+            Self::Memtable(_, _, row) => row.commit_ts,
+            Self::MutableRun(_, _, row) => row.commit_ts,
             // Run candidates carry SYS_COMMIT_TS when the cursor loaded it;
             // legacy runs without the column leave this None (epoch fallback).
             Self::Run(version) => version.commit_ts,
@@ -125,7 +137,7 @@ impl ControlledVisibleCandidate {
     }
 }
 
-enum ControlledVisibleCursor {
+enum ControlledVisibleCursor<'a> {
     /// Newest-visible overlay rows, ordered by RowId (full source already small).
     Memory(std::vec::IntoIter<Row>),
     /// Batch-bounded overlay drain of a `BTreeMap` of newest-per-rid rows.
@@ -142,6 +154,12 @@ enum ControlledVisibleCursor {
         #[allow(dead_code)]
         total: usize,
     },
+    /// Streaming cursor over the memtable's newest-visible versions. Yields
+    /// `(RowId, Epoch, &Row)` triples borrowing from the underlying memtable
+    /// storage — no per-row clone and no full materialisation.
+    Memtable(MemtableVisibleVersionCursor<'a>),
+    /// Streaming cursor over the mutable run's newest-visible versions.
+    MutableRun(MutableRunVisibleVersionCursor<'a>),
     Run(Box<RunVisibleVersionCursor>),
     #[cfg(test)]
     Synthetic {
@@ -153,12 +171,12 @@ enum ControlledVisibleCursor {
 /// Default batch size for controlled hot-tier sources (memtable / mutable run).
 const CONTROLLED_HOT_BATCH: usize = 256;
 
-struct ControlledVisibleSource {
-    cursor: ControlledVisibleCursor,
-    current: Option<ControlledVisibleCandidate>,
+struct ControlledVisibleSource<'a> {
+    cursor: ControlledVisibleCursor<'a>,
+    current: Option<ControlledVisibleCandidate<'a>>,
 }
 
-impl ControlledVisibleSource {
+impl<'a> ControlledVisibleSource<'a> {
     /// Test/helper: wrap a pre-built row list (small fixtures only).
     #[cfg(test)]
     fn memory(rows: Vec<Row>) -> Self {
@@ -193,6 +211,26 @@ impl ControlledVisibleSource {
                 cursor: ControlledVisibleCursor::Memory(active.into_iter()),
                 current: None,
             }
+        }
+    }
+
+    /// Wrap a streaming memtable cursor — preferred hot-tier path when the
+    /// memtable carries visible rows. Avoids the full `BTreeMap` materialisation
+    /// that the `memory_from_map` fallback performs.
+    fn memtable_cursor(cursor: MemtableVisibleVersionCursor<'a>) -> Self {
+        Self {
+            cursor: ControlledVisibleCursor::Memtable(cursor),
+            current: None,
+        }
+    }
+
+    /// Wrap a streaming mutable-run cursor — preferred hot-tier path when the
+    /// mutable run carries visible rows. Avoids the full `BTreeMap` clone that
+    /// the `memory_from_map` fallback performs.
+    fn mutable_run_cursor(cursor: MutableRunVisibleVersionCursor<'a>) -> Self {
+        Self {
+            cursor: ControlledVisibleCursor::MutableRun(cursor),
+            current: None,
         }
     }
 
@@ -237,6 +275,12 @@ impl ControlledVisibleSource {
                     }
                 }
             }
+            ControlledVisibleCursor::Memtable(iter) => iter
+                .next()
+                .map(|(rid, epoch, row)| ControlledVisibleCandidate::Memtable(rid, epoch, row)),
+            ControlledVisibleCursor::MutableRun(iter) => iter
+                .next()
+                .map(|(rid, epoch, row)| ControlledVisibleCandidate::MutableRun(rid, epoch, row)),
             ControlledVisibleCursor::Run(cursor) => cursor
                 .next_visible_version(control)?
                 .map(ControlledVisibleCandidate::Run),
@@ -254,7 +298,7 @@ impl ControlledVisibleSource {
         Ok(())
     }
 
-    fn pop(&mut self, control: &crate::ExecutionControl) -> Result<ControlledVisibleCandidate> {
+    fn pop(&mut self, control: &crate::ExecutionControl) -> Result<ControlledVisibleCandidate<'a>> {
         let current = self.current.take().ok_or_else(|| {
             MongrelError::Other("controlled visible source was not primed".into())
         })?;
@@ -264,11 +308,13 @@ impl ControlledVisibleSource {
 
     fn materialize(
         &mut self,
-        candidate: ControlledVisibleCandidate,
+        candidate: ControlledVisibleCandidate<'a>,
         control: &crate::ExecutionControl,
     ) -> Result<Row> {
         match candidate {
             ControlledVisibleCandidate::Memory(row) => Ok(row),
+            ControlledVisibleCandidate::Memtable(_, _, row) => Ok(row.clone()),
+            ControlledVisibleCandidate::MutableRun(_, _, row) => Ok(row.clone()),
             ControlledVisibleCandidate::Run(version) => match &mut self.cursor {
                 ControlledVisibleCursor::Run(cursor) => cursor.materialize(version, control),
                 _ => Err(MongrelError::Other(
@@ -300,8 +346,8 @@ impl ControlledVisibleSource {
     }
 }
 
-fn merge_controlled_visible_sources(
-    sources: &mut [ControlledVisibleSource],
+fn merge_controlled_visible_sources<'a>(
+    sources: &mut [ControlledVisibleSource<'a>],
     control: &crate::ExecutionControl,
     mut expired: impl FnMut(&Row) -> bool,
     mut visit: impl FnMut(Row) -> Result<()>,
@@ -6179,19 +6225,21 @@ impl Table {
         let mut rows_emitted: u64 = 0;
         let mut checkpoints: u64 = 0;
         let mut first_row_recorded = false;
-        let mut sources = Vec::with_capacity(self.run_refs.len() + 2);
+        let mut sources: Vec<ControlledVisibleSource<'_>> =
+            Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
         checkpoints += 1;
-        let memtable_map = self.memtable.newest_visible_map(snapshot);
-        if !memtable_map.is_empty() {
-            sources.push(ControlledVisibleSource::memory_from_map(memtable_map));
-        }
+        // Hot-tier streaming cursors — preferred path. These avoid the full
+        // `BTreeMap` materialisation that `memory_from_map` performs, which
+        // dominated the 1 ms time-to-first-row budget on 100k-row bulk loads.
+        sources.push(ControlledVisibleSource::memtable_cursor(
+            self.memtable.newest_visible_iter(&snapshot),
+        ));
         control.checkpoint()?;
         checkpoints += 1;
-        let mutable_map = self.mutable_run.newest_visible_map(snapshot);
-        if !mutable_map.is_empty() {
-            sources.push(ControlledVisibleSource::memory_from_map(mutable_map));
-        }
+        sources.push(ControlledVisibleSource::mutable_run_cursor(
+            self.mutable_run.newest_visible_iter(&snapshot),
+        ));
         for run in &self.run_refs {
             control.checkpoint()?;
             checkpoints += 1;

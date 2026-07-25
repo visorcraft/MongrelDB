@@ -4066,7 +4066,7 @@ async fn metrics_handler(
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    let body = state.metrics.prometheus_text(
+    let mut body = state.metrics.prometheus_text(
         state.db().table_names().len(),
         state.query_registry.stats(),
         (
@@ -4074,6 +4074,9 @@ async fn metrics_handler(
             state.pre_cancellations.approximate_bytes(),
         ),
     );
+    body.push_str(&metrics::hot_lookup_metrics(
+        &metrics::aggregate_hot_metrics(state.as_ref()),
+    ));
     (
         [(
             header::CONTENT_TYPE,
