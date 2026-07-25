@@ -794,4 +794,111 @@ mod dense_tests {
         let avg = total_recall / queries as f64;
         assert!(avg >= 0.90, "dense HNSW recall@10 too low: {avg:.2}");
     }
+
+    /// Dense ANN top-k after a churn of deletes + reinserts through the
+    /// `search_filtered` visibility filter. HNSW has no cheap node removal,
+    /// so a "delete" is modelled by excluding the row id from the visibility
+    /// predicate; a "reinsert" hands the index a fresh rid. The two searches
+    /// assert the merged HNSW stays consistent with brute-force cosine
+    /// ranking across the visible set (regression target for the
+    /// `churn_oracle_ann_hnsw_dense` integration oracle).
+    #[test]
+    fn dense_topk_after_delete_and_reinsert() {
+        use crate::index::AnnIndex;
+        use crate::schema::AnnQuantization;
+
+        let dim = 8;
+        let mut index = AnnIndex::with_quantization(dim, 16, 64, 64, AnnQuantization::Dense);
+
+        // Deterministic signed-random generator so the assertions are stable.
+        let mut seed = 0xC0FFEE_1234_5678u64;
+        let mut next = |s: &mut u64| {
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((*s >> 33) as u32) as f32 / (u32::MAX as f32);
+            u * 2.0 - 1.0
+        };
+
+        // 1. Insert 100 vectors with known embeddings (rids 0..100).
+        let mut data: Vec<(Vec<f32>, RowId)> = Vec::with_capacity(150);
+        for i in 0..100u64 {
+            let v: Vec<f32> = (0..dim).map(|_| next(&mut seed)).collect();
+            let rid = RowId(i);
+            data.push((v.clone(), rid));
+            index.insert(&v, rid).unwrap();
+        }
+
+        let brute_topk =
+            |query: &[f32], k: usize, pool: &[(Vec<f32>, RowId)]| -> Vec<(RowId, f32)> {
+                let mut scored: Vec<(RowId, f32)> = pool
+                    .iter()
+                    .map(|(v, rid)| (*rid, cosine_distance(query, v)))
+                    .collect();
+                scored.sort_by(|(ra, da), (rb, db)| da.total_cmp(db).then_with(|| ra.0.cmp(&rb.0)));
+                scored.truncate(k);
+                scored
+            };
+
+        // 2. Search top-10 — the 10 closest vectors by cosine among all 100.
+        let query = data[0].0.clone();
+        let expected_first = brute_topk(&query, 10, &data);
+        let first = index.search_filtered(&query, 10, &|_: RowId| true).unwrap();
+        assert_eq!(
+            first.len(),
+            10,
+            "first top-10 should return 10 hits (got {})",
+            first.len()
+        );
+        for (rank, (got_rid, _)) in first.iter().enumerate() {
+            assert_eq!(
+                got_rid.0, expected_first[rank].0 .0,
+                "first-search rank {rank}: got rid {} expected {} (brute: {:?})",
+                got_rid.0, expected_first[rank].0 .0, expected_first
+            );
+        }
+
+        // 3. Delete 50 — visibility excludes the first 50 rids.
+        let deleted: HashSet<u64> = (0..50).collect();
+        let visible = |rid: RowId| !deleted.contains(&rid.0);
+
+        // 4. Re-insert 50 new vectors with fresh rids (100..150).
+        for i in 0..50u64 {
+            let v: Vec<f32> = (0..dim).map(|_| next(&mut seed)).collect();
+            let rid = RowId(100 + i);
+            data.push((v.clone(), rid));
+            index.insert(&v, rid).unwrap();
+        }
+
+        // 5. Search top-10 again — brute-force over the visible set
+        //    (50 original non-deleted + 50 newly-inserted = 100).
+        let visible_pool: Vec<(Vec<f32>, RowId)> = data
+            .iter()
+            .filter(|(_, rid)| !deleted.contains(&rid.0))
+            .cloned()
+            .collect();
+        let expected_second = brute_topk(&query, 10, &visible_pool);
+        let second = index.search_filtered(&query, 10, &visible).unwrap();
+        assert_eq!(
+            second.len(),
+            10,
+            "second top-10 should return 10 hits (got {})",
+            second.len()
+        );
+        for (rank, (got_rid, _)) in second.iter().enumerate() {
+            assert_eq!(
+                got_rid.0, expected_second[rank].0 .0,
+                "second-search rank {rank}: got rid {} expected {} (brute: {:?})",
+                got_rid.0, expected_second[rank].0 .0, expected_second
+            );
+        }
+        // No result may be one of the deleted rids.
+        for (rid, _) in &second {
+            assert!(
+                !deleted.contains(&rid.0),
+                "deleted rid {} leaked into second top-10",
+                rid.0
+            );
+        }
+    }
 }

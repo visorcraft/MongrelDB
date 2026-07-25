@@ -424,11 +424,8 @@ impl Memtable {
         snapshot: crate::epoch::Snapshot,
     ) -> BTreeMap<RowId, Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
-        for segment in self
-            .frozen
-            .iter()
-            .map(|segment| &segment.tree)
-            .chain(std::iter::once(&self.active.tree))
+        for segment in std::iter::once(&self.active.tree)
+            .chain(self.frozen.iter().rev().map(|segment| &segment.tree))
         {
             for row in segment.versions() {
                 if !snapshot.observes_version(row.committed_epoch, row.commit_ts) {
@@ -759,6 +756,20 @@ mod tests {
             .map(|r| r.row_id.0)
             .collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn newest_visible_map_prefers_active_on_equal_version() {
+        let mut m = Memtable::new();
+        let mut deleted = row(1, 2);
+        deleted.deleted = true;
+        m.upsert(deleted);
+        m.seal();
+        m.upsert(row(1, 2));
+
+        let versions = m.visible_versions_at(Snapshot::at(Epoch(2)));
+        assert_eq!(versions.len(), 1);
+        assert!(!versions[0].deleted);
     }
 
     #[test]

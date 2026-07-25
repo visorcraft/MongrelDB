@@ -558,4 +558,34 @@ mod tests {
             assert_eq!(wave.rank(c, n), brute, "rank at tail");
         }
     }
+
+    #[test]
+    fn locate_after_seal_with_unrelated_deletes_preserves_live_hits() {
+        // Regression for `churn_oracle_fmindex` step 9: after a sequence of
+        // insert + insert (tombstoned) + seal + insert + seal, `locate`
+        // must still return every live row whose text contains the pattern.
+        // The engine mirrors the delete by leaving the FM entry in place
+        // (MVCC filters one layer up); the layered `FmIndex::locate` walks
+        // every frozen segment plus the active segment and dedupes by rid.
+        let mut idx = FmIndex::new();
+
+        // 1. Insert "hello world" + flush (seal moves active -> frozen).
+        idx.insert(b"hello world".to_vec(), RowId(1));
+        idx.seal();
+
+        // 2. Insert a different row + flush. The engine tombstones this rid
+        //    on a subsequent delete; the FM index intentionally retains the
+        //    stale `(text, rid)` entry.
+        idx.insert(b"foo bar".to_vec(), RowId(2));
+        idx.seal();
+
+        // 3. Insert another row whose text contains the pattern. This goes
+        //    into the active segment.
+        idx.insert(b"hello there".to_vec(), RowId(3));
+
+        // 4. Search "hello" -> expect 2 hits (RowId 1 + RowId 3).
+        let mut hits = idx.locate(b"hello");
+        hits.sort_by_key(|r| r.0);
+        assert_eq!(hits, vec![RowId(1), RowId(3)]);
+    }
 }

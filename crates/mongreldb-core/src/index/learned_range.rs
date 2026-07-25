@@ -239,4 +239,41 @@ mod tests {
         let negs = idx.range(i64::MIN, -5);
         assert_eq!(negs, [1, 5].into_iter().collect::<HashSet<_>>());
     }
+
+    #[test]
+    fn range_finds_inner_window_after_initial_train_and_retrain() {
+        // Step 1: insert rows with values 1..=100, each value gets a unique
+        // row id equal to the value (mirrors engine row_id assignment for an
+        // append-style load).
+        let pairs: Vec<(i64, u64)> = (1..=100i64).map(|v| (v, v as u64)).collect();
+        let idx = ColumnLearnedRange::build_i64(&pairs);
+
+        // Step 2: query [50, 60]. Expect exactly the 11 row ids whose value
+        // lies in the inclusive window. This exercises the ε-window landing
+        // + local binary search on a single PGM segment with no duplicates.
+        let mid = idx.range(50, 60);
+        let expected_mid: HashSet<u64> = (50u64..=60).collect();
+        assert_eq!(mid, expected_mid, "[50,60] hits mismatch");
+
+        // Step 3: append two more rows (values 95 and 96 with fresh row ids
+        // 101, 102) and re-train. After re-training the index must know about
+        // the new row ids as well as the original 95 and 96.
+        let mut pairs2 = pairs;
+        pairs2.push((95, 101));
+        pairs2.push((96, 102));
+        let idx2 = ColumnLearnedRange::build_i64(&pairs2);
+
+        // Step 4: query [50, 100] — must include 50..=100 plus 101, 102.
+        let full = idx2.range(50, 100);
+        let mut expected_full: HashSet<u64> = (50u64..=100).collect();
+        expected_full.insert(101);
+        expected_full.insert(102);
+        assert_eq!(full, expected_full, "[50,100] hits mismatch after retrain");
+
+        // Sanity: the original-index queries still answer correctly without
+        // retraining (the appended rows must NOT leak into the old index).
+        let mid_old = idx.range(50, 60);
+        assert_eq!(mid_old, expected_mid, "stale index leaked new rows");
+        assert!(idx.range(50, 100).len() == 51, "stale index size regressed");
+    }
 }

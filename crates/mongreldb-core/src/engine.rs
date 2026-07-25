@@ -5086,6 +5086,16 @@ impl Table {
     /// Tombstone `row_id` at `epoch`. When `adjust_live_count` is true the
     /// table's `live_count` is decremented (used on the live write path); during
     /// recovery the manifest is authoritative so the flag is false.
+    ///
+    /// `live_count` is decremented only when the prior visible version of
+    /// `row_id` was a live row. A prior tombstone (either from earlier in this
+    /// commit or from a previous commit) means the live-count adjustment has
+    /// already happened — the cross-table `Transaction` path can call
+    /// `tombstone_row` on the same rid twice in one commit (Delete + the
+    /// Put's stale HOT tombstone), and standalone callers can hit the same
+    /// rid twice across commits. Without this guard `live_count` drifts
+    /// negative (saturating to 0) and `Table::count()` returns a value below
+    /// the true live-row count.
     fn tombstone_row(
         &mut self,
         row_id: RowId,
@@ -5093,6 +5103,14 @@ impl Table {
         commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
         adjust_live_count: bool,
     ) {
+        let prev_was_live = if adjust_live_count {
+            match self.memtable.get_version(row_id, epoch) {
+                Some((_, prev)) => !prev.deleted,
+                None => true,
+            }
+        } else {
+            false
+        };
         let tombstone = Row {
             row_id,
             committed_epoch: epoch,
@@ -5102,7 +5120,7 @@ impl Table {
         };
         self.memtable.upsert(tombstone);
         self.pk_by_row.remove(&row_id);
-        if adjust_live_count {
+        if prev_was_live {
             self.live_count = self.live_count.saturating_sub(1);
         }
         // Track for fine-grained cache invalidation (c).
@@ -7140,10 +7158,24 @@ impl Table {
         snapshot: Snapshot,
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<std::collections::HashSet<RowId>> {
-        if !self.had_deletes
-            && self.ttl.is_none()
-            && self.pending_put_cols.is_empty()
-            && snapshot.epoch == self.snapshot().epoch
+        // Private WAL: the in-flight batch lands in the memtable at
+        // `pending_epoch = visible + 1` (puts and matching tombstones). The
+        // caller's `snapshot` was pinned at the start of the read, so its
+        // epoch predates every pending write and MVCC hides them. Advance the
+        // lookup snapshot to `pending_epoch` so the batch participates in
+        // eligibility — read-your-writes for the in-flight private-WAL batch.
+        // Shared WAL tables keep the original snapshot because their pending
+        // rows live in `pending_rows` and haven't been materialised into the
+        // memtable yet.
+        let lookup_snapshot = if self.is_shared()
+            || (self.pending_put_cols.is_empty() && self.pending_delete_rids.is_empty())
+            || snapshot.epoch.0 >= self.pending_epoch().0
+        {
+            snapshot
+        } else {
+            Snapshot::at(self.pending_epoch())
+        };
+        if !self.had_deletes && self.ttl.is_none() && lookup_snapshot.epoch == self.snapshot().epoch
         {
             return Ok(candidates.iter().copied().collect());
         }
@@ -7158,8 +7190,8 @@ impl Table {
             if let Some(context) = context {
                 context.consume(1)?;
             }
-            let mem = self.memtable.get_version_at(row_id, snapshot);
-            let mutable = self.mutable_run.get_version_at(row_id, snapshot);
+            let mem = self.memtable.get_version_at(row_id, lookup_snapshot);
+            let mutable = self.mutable_run.get_version_at(row_id, lookup_snapshot);
             let overlay = match (mem, mutable) {
                 (Some(left), Some(right)) => Some(
                     if Snapshot::version_is_newer(
