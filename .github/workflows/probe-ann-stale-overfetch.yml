@@ -1,0 +1,34 @@
+name: Probe ANN stale overfetch
+
+on:
+  push:
+    branches: [agent/probe-ann-stale-overfetch-ca3]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Format and compile probe
+        run: |
+          cargo fmt --check
+          cargo clippy -p mongreldb-core --test ann_stale_overfetch --all-features -- -D warnings
+      - name: Run stale-overfetch regression probe
+        run: |
+          cargo test -p mongreldb-core --all-features \
+            --test ann_stale_overfetch -- --nocapture
