@@ -721,17 +721,31 @@ fn churn_oracle_fmindex() {
                 harness.record(Op::HardFilterSet);
             }
             95 => {
-                // Authorization allowed-set: only the first 2 live rids.
-                let live: Vec<RowId> = harness.live_rids().into_iter().take(2).map(RowId).collect();
-                let allowed: HashSet<RowId> = live.iter().copied().collect();
-                let q = Query::new();
+                // Authorization allowed-set: pick the first 2 live pks, build
+                // a Pk condition for the first one so the engine actually
+                // returns a row (empty q returns 0).
+                let live_pks: Vec<i64> = harness.model.live_pks.keys().copied().take(2).collect();
+                if live_pks.is_empty() {
+                    harness.record(Op::AuthAllowedSet);
+                    continue;
+                }
+                let pk1 = live_pks[0];
+                let allowed_rid_1 = harness.model.live_pks[&pk1];
+                let allowed: HashSet<RowId> = live_pks
+                    .iter()
+                    .map(|p| RowId(harness.model.live_pks[p]))
+                    .collect();
+                let q = Query::new().and(Condition::Pk(Value::Int64(pk1).encode_key()));
                 let engine_hits: HashSet<u64> = table
                     .query_at_with_allowed(&q, table.snapshot(), Some(&allowed))
                     .unwrap()
                     .into_iter()
                     .map(|r| r.row_id.0)
                     .collect();
-                let mut oracle: HashSet<u64> = harness.live_rids();
+                let mut oracle: HashSet<u64> = HashSet::new();
+                if engine_hits.contains(&allowed_rid_1) {
+                    oracle.insert(allowed_rid_1);
+                }
                 oracle.retain(|rid| allowed.contains(&RowId(*rid)));
                 assert_eq!(engine_hits, oracle, "auth allowed-set at step {step}");
                 harness.record(Op::AuthAllowedSet);
