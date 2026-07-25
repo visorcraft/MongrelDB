@@ -213,9 +213,8 @@ value is a compatibility selector and does not create an HNSW graph.
   vector to one byte per subvector; search computes an ADC lookup table from
   the query and sums table lookups per candidate.
 
-Equal distances break ties by `RowId` in every mode. Dense and product indexes
-use more memory and checkpoint space than BinarySign; product recovers most of
-that gap via code compression.
+Dense and product indexes use more memory and checkpoint space than BinarySign;
+product recovers most of that gap via code compression.
 
 **Online DDL:** `Database::create_index`, `replace_index`, and `drop_index`
 (and SQL `CREATE INDEX` / `DROP INDEX`) build or remove a secondary index
@@ -322,6 +321,64 @@ recover a missed LSH candidate.
 ```rust
 IndexDef { name: "members_mh".into(), column_id: 8, kind: IndexKind::MinHash }
 ```
+
+## Exact vs approximate guarantees
+
+Exact families must either complete or return an explicit work-budget error;
+they never silently degrade to approximate results. Approximate floors below
+are recall-at-k guarantees on the deterministic oracle corpus and documented
+configuration, not a claim that every production corpus has identical recall.
+
+| Family / mode | Guarantee | Tie-break rule | Candidate-cap behavior | Work-budget behavior | Recall floor |
+|---|---|---|---|---|---|
+| Bitmap | Exact equality or anchored prefix | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
+| LearnedRange | Exact range | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
+| FmIndex | Exact substring | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
+| Sparse | Exact dot-product top-k | Higher score, then `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
+| MinHash | Approximate LSH candidates; exact verification cannot recover missed candidates | Higher verified Jaccard score, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| ANN HNSW BinarySign | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.95 |
+| ANN HNSW Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| ANN DiskANN Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| ANN IVF Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.85 |
+| ANN Product Quantization | Approximate, including reconstructed-vector rerank | Smaller distance, then `RowId` | Rerank candidates may be capped; cap hit must be traced | Bounded scan and rerank; exhaustion must be explicit | 0.80 with rerank |
+
+### Per-family recall floors
+
+- **FmIndex:** exact substring matching; no recall floor.
+- **LearnedRange:** exact range matching; no recall floor.
+- **Sparse:** exact dot-product ranking; no recall floor.
+- **MinHash:** 0.90 on the deterministic corpus.
+- **ANN HNSW BinarySign:** 0.95.
+- **ANN HNSW Dense:** 0.90.
+- **ANN DiskANN Dense:** 0.90.
+- **ANN IVF Dense:** 0.85.
+- **ANN Product Quantization:** 0.80 with rerank.
+
+### Tie-break rules
+
+Equal distances break ties by `RowId` in every mode. ANN ranks smaller distance
+first, then `RowId`. Sparse ranks larger dot product first, then `RowId`, and
+MinHash ranks larger verified Jaccard similarity first, then `RowId`.
+
+### Candidate caps
+
+When a candidate cap is reached, the query trace must report
+`candidate_cap_hit=true`. A result containing fewer than the requested `k`
+rows must include an explicit underfill reason; candidate-cap or work-budget
+exhaustion must never look like a complete result.
+
+### Recall floor enforcement
+
+The `index-churn-oracle-smoke` CI job must verify every documented floor on
+every pull request. The nightly oracle job must verify the same floors on a
+fresh corpus.
+
+### `MONGRELDB_ORACLE_SEED`
+
+Set `MONGRELDB_ORACLE_SEED` to the integer seed printed by a failed oracle run
+to replay its deterministic corpus, queries, and churn sequence. Replay also
+requires the same binary and oracle configuration. Leave it unset for a fresh
+corpus; every run must print its selected seed so a failure can be reproduced.
 
 ## Choosing the Right Index
 

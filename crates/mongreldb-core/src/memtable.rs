@@ -10,8 +10,8 @@
 //! [`crate::epoch::Snapshot::version_is_newer`] when versions carry `commit_ts`
 //! (P0.5-T3); epoch-only APIs remain for dual-model legacy call sites.
 
-use crate::be_tree::BeTree;
-use crate::epoch::Epoch;
+use crate::be_tree::{BeTree, LeafVersions};
+use crate::epoch::{Epoch, Snapshot};
 use crate::rowid::RowId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -180,6 +180,73 @@ impl Row {
         self.columns
             .values()
             .fold(32, |bytes, value| bytes + value.estimated_bytes())
+    }
+}
+
+pub struct MemtableVisibleVersionCursor<'a> {
+    leaves: Vec<LeafVersions<'a>>,
+    leaf_index: usize,
+    snapshot: Snapshot,
+    current_row_id: Option<RowId>,
+    best: Option<&'a Row>,
+    finished: bool,
+}
+
+impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
+    type Item = (RowId, Epoch, &'a Row);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            let next = self
+                .leaves
+                .get_mut(self.leaf_index)
+                .and_then(Iterator::next);
+            let Some(version) = next else {
+                self.leaf_index += 1;
+                if self.leaf_index < self.leaves.len() {
+                    continue;
+                }
+                self.finished = true;
+                return self.take_best();
+            };
+            let row = match version {
+                std::borrow::Cow::Borrowed(row) => row,
+                std::borrow::Cow::Owned(_) => continue,
+            };
+            if !self
+                .snapshot
+                .observes_version(row.committed_epoch, row.commit_ts)
+            {
+                continue;
+            }
+            if self.current_row_id != Some(row.row_id) {
+                let result = self.take_best();
+                self.current_row_id = Some(row.row_id);
+                self.best = Some(row);
+                if result.is_some() {
+                    return result;
+                }
+            } else if self.best.is_none_or(|best| {
+                Snapshot::version_is_newer(
+                    row.committed_epoch,
+                    row.commit_ts,
+                    best.committed_epoch,
+                    best.commit_ts,
+                )
+            }) {
+                self.best = Some(row);
+            }
+        }
+    }
+}
+
+impl<'a> MemtableVisibleVersionCursor<'a> {
+    fn take_best(&mut self) -> Option<(RowId, Epoch, &'a Row)> {
+        let row = self.best.take()?;
+        Some((row.row_id, row.committed_epoch, row))
     }
 }
 
@@ -383,6 +450,26 @@ impl Memtable {
             }
         }
         by_row
+    }
+
+    pub fn newest_visible_iter<'a>(
+        &'a self,
+        snapshot: &Snapshot,
+    ) -> MemtableVisibleVersionCursor<'a> {
+        let leaves = self
+            .frozen
+            .iter()
+            .map(|segment| segment.tree.leaf_versions_iter())
+            .chain(std::iter::once(self.active.tree.leaf_versions_iter()))
+            .collect();
+        MemtableVisibleVersionCursor {
+            leaves,
+            leaf_index: 0,
+            snapshot: *snapshot,
+            current_row_id: None,
+            best: None,
+            finished: false,
+        }
     }
 
     /// Freeze the current write delta so future clones share it by `Arc`.
@@ -672,5 +759,61 @@ mod tests {
             .map(|r| r.row_id.0)
             .collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn newest_visible_iter_empty_memtable_yields_nothing() {
+        let m = Memtable::new();
+        assert!(m
+            .newest_visible_iter(&Snapshot::at(Epoch(9)))
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn newest_visible_iter_single_insert_yields_one() {
+        let mut m = Memtable::new();
+        m.upsert(row(1, 3));
+        let values: Vec<_> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(3)))
+            .map(|(id, epoch, _)| (id, epoch))
+            .collect();
+        assert_eq!(values, vec![(RowId(1), Epoch(3))]);
+    }
+
+    #[test]
+    fn newest_visible_iter_newer_epoch_wins() {
+        let mut m = Memtable::new();
+        m.upsert(row(1, 1));
+        m.upsert(row(1, 2));
+        let values: Vec<_> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(2)))
+            .map(|(_, epoch, _)| epoch)
+            .collect();
+        assert_eq!(values, vec![Epoch(2)]);
+    }
+
+    #[test]
+    fn newest_visible_iter_tombstone_suppresses_older_live_version() {
+        // Mirrors MutableRunVisibleVersionCursor: the cursor yields the
+        // tombstone Row itself (so the caller can classify it as a Tombstone
+        // fallback or a StaleRowId), but the pre-tombstone live version is
+        // suppressed when the tombstone is in scope of the calling snapshot.
+        let mut m = Memtable::new();
+        m.upsert(row(1, 1));
+        m.tombstone(RowId(1), Epoch(2));
+        let snap = Snapshot::at(Epoch(2));
+        let got: Vec<(u64, u64, bool)> = m
+            .newest_visible_iter(&snap)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, row.deleted))
+            .collect();
+        assert_eq!(got, vec![(1, 2, true)], "tombstone is the newest");
+        // Pre-tombstone snapshot still sees the live version.
+        let snap_early = Snapshot::at(Epoch(1));
+        let got_early: Vec<(u64, u64, bool)> = m
+            .newest_visible_iter(&snap_early)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, row.deleted))
+            .collect();
+        assert_eq!(got_early, vec![(1, 1, false)]);
     }
 }

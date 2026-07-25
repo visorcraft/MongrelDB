@@ -2153,7 +2153,10 @@ impl RunVisibleVersionCursor {
         // page read for legacy cursors that predate per-candidate stamps.
         let commit_ts = version.commit_ts.or_else(|| {
             if self.reader.has_column(SYS_COMMIT_TS) {
-                let page = self.reader.read_page(SYS_COMMIT_TS, version.page_seq).ok()?;
+                let page = self
+                    .reader
+                    .read_page(SYS_COMMIT_TS, version.page_seq)
+                    .ok()?;
                 let native = columnar::decode_page_native(
                     TypeId::Bytes,
                     &page,

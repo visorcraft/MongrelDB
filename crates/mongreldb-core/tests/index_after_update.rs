@@ -259,12 +259,7 @@ fn update_many_partial_keeps_int64_bitmap_secondary() {
     })
     .unwrap();
 
-    assert_row_by_pk(
-        &db,
-        "segments",
-        10,
-        Some(b"Golden Jade Suvarnabhumi"),
-    );
+    assert_row_by_pk(&db, "segments", 10, Some(b"Golden Jade Suvarnabhumi"));
     assert_listed_by_trip(&db, "segments", 42, &[10, 11]);
     assert_listed_by_trip(&db, "segments", 99, &[12]);
 
@@ -282,12 +277,7 @@ fn update_many_partial_keeps_int64_bitmap_secondary() {
     })
     .unwrap();
 
-    assert_row_by_pk(
-        &db,
-        "segments",
-        10,
-        Some(b"Golden Jade Family Quadruple"),
-    );
+    assert_row_by_pk(&db, "segments", 10, Some(b"Golden Jade Family Quadruple"));
     assert_listed_by_trip(&db, "segments", 42, &[10, 11]);
 }
 
@@ -442,10 +432,7 @@ fn update_many_moving_trip_id_moves_bitmap_membership() {
     let rid = lookup_pk(&db, "segments", 1);
     db.transaction(|tx| {
         // Change the indexed column itself — delta must Move, not only Repoint.
-        tx.update_many(
-            "segments",
-            vec![(rid, vec![(2, Value::Int64(20))])],
-        )?;
+        tx.update_many("segments", vec![(rid, vec![(2, Value::Int64(20))])])?;
         Ok(())
     })
     .unwrap();
@@ -486,7 +473,10 @@ fn title_only_update_does_not_leave_stale_bitmap_row_id() {
     })
     .unwrap();
     let new_rid = lookup_pk(&db, "segments", 1);
-    assert_ne!(old_rid, new_rid, "update_many normalizes to delete+put (new rid)");
+    assert_ne!(
+        old_rid, new_rid,
+        "update_many normalizes to delete+put (new rid)"
+    );
 
     {
         let handle = db.table("segments").unwrap();
@@ -494,10 +484,7 @@ fn title_only_update_does_not_leave_stale_bitmap_row_id() {
         let rows = guard.query(&trip_index_query(5)).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].row_id, new_rid);
-        assert_eq!(
-            rows[0].columns.get(&3),
-            Some(&Value::Bytes(b"v2".to_vec()))
-        );
+        assert_eq!(rows[0].columns.get(&3), Some(&Value::Bytes(b"v2".to_vec())));
     }
     // No duplicate / ghost rows for the same trip from the tombstoned rid.
     assert_listed_by_trip(&db, "segments", 5, &[1]);

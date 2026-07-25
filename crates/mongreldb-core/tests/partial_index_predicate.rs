@@ -66,9 +66,7 @@ fn lookup_pk(db: &Database, pk: i64) -> mongreldb_core::RowId {
     let handle = db.table("t").unwrap();
     let mut table = handle.lock();
     let rows = table
-        .query(&Query::new().and(Condition::Pk(
-            Value::Int64(pk).encode_key(),
-        )))
+        .query(&Query::new().and(Condition::Pk(Value::Int64(pk).encode_key())))
         .unwrap();
     assert_eq!(rows.len(), 1, "PK {pk} should be present");
     rows[0].row_id
@@ -138,10 +136,7 @@ fn predicate_transition_drop_is_reflected_on_update() {
     assert_eq!(count_indexed(&db, 200), 1);
 
     db.transaction(|t| {
-        t.update_many(
-            "t",
-            vec![(rid, vec![(3, Value::Int64(1_700_000_000))])],
-        )?;
+        t.update_many("t", vec![(rid, vec![(3, Value::Int64(1_700_000_000))])])?;
         Ok(())
     })
     .unwrap();
@@ -182,7 +177,11 @@ fn changing_only_predicate_column_with_unchanged_indexed_value_works() {
     // update_many normalizes to delete+put, so each iteration produces a new
     // rid. Re-lookup via HOT after every transition.
     for new_value in [Value::Int64(100), Value::Null, Value::Int64(200)] {
-        let expected = if matches!(new_value, Value::Null) { 1 } else { 0 };
+        let expected = if matches!(new_value, Value::Null) {
+            1
+        } else {
+            0
+        };
         db.transaction(|t| {
             t.update_many("t", vec![(rid, vec![(3, new_value.clone())])])?;
             Ok(())
@@ -208,10 +207,7 @@ fn predicate_transition_survives_flush_reopen_and_rebuild() {
     let rid = put_row(&db, 1, 500, Value::Null);
 
     db.transaction(|t| {
-        t.update_many(
-            "t",
-            vec![(rid, vec![(3, Value::Int64(1_700_000_000))])],
-        )?;
+        t.update_many("t", vec![(rid, vec![(3, Value::Int64(1_700_000_000))])])?;
         Ok(())
     })
     .unwrap();

@@ -134,3 +134,218 @@ fn result_cache_counters_advance_on_repeat_query() {
         "tiny one-row result must skip persistent tier (got write_us delta {write_delta})"
     );
 }
+
+// Indices into `LookupMetricsSnapshot::hot_fallback_reasons`. They mirror the
+// ordering in `engine::hot_fallback_reason_index` and must stay aligned if a
+// new reason is appended. The 3 ignored tests below reference these; once
+// PR F wires the engine increment sites they are used.
+#[allow(dead_code)]
+const REASON_MISSING_MAPPING: usize = 0;
+#[allow(dead_code)]
+const REASON_STALE_ROW_ID: usize = 1;
+#[allow(dead_code)]
+const REASON_INVISIBLE_AT_SNAPSHOT: usize = 2;
+#[allow(dead_code)]
+const REASON_HISTORICAL_SNAPSHOT: usize = 3;
+#[allow(dead_code)]
+const REASON_TOMBSTONE: usize = 4;
+#[allow(dead_code)]
+const REASON_TTL_EXPIRED: usize = 5;
+#[allow(dead_code)]
+const REASON_PRIMARY_KEY_MISMATCH: usize = 6;
+#[allow(dead_code)]
+const REASON_INDEX_INCOMPLETE: usize = 7;
+#[allow(dead_code)]
+const REASON_CHECKPOINT_REJECTED: usize = 8;
+
+#[test]
+fn healthy_pk_lookup_records_zero_fallback() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    for i in 0..32i64 {
+        put(&mut table, 1000 + i, "alice");
+    }
+    table.commit().unwrap();
+
+    let before = table.lookup_metrics_snapshot();
+
+    for i in 0..32i64 {
+        let _hits = table
+            .query(&Query::new().and(Condition::Pk(pk_bytes(1000 + i))))
+            .unwrap();
+    }
+
+    let after = table.lookup_metrics_snapshot();
+    assert_eq!(
+        after.hot_lookup_hit - before.hot_lookup_hit,
+        32,
+        "expected 32 HOT hits from Pk lookups"
+    );
+    assert_eq!(
+        after.hot_lookup_fallback - before.hot_lookup_fallback,
+        0,
+        "healthy Pk lookups must not trigger fallback"
+    );
+
+    // Every per-reason counter must stay zero on the healthy path.
+    let before_reasons = before.hot_fallback_reasons;
+    let after_reasons = after.hot_fallback_reasons;
+    for (idx, (b, a)) in before_reasons.iter().zip(after_reasons.iter()).enumerate() {
+        assert_eq!(
+            a - b,
+            0,
+            "healthy lookup must not increment reason[{idx}], got delta {}",
+            a - b
+        );
+    }
+    let before_total: u64 = before_reasons.iter().sum();
+    let after_total: u64 = after_reasons.iter().sum();
+    assert_eq!(after_total - before_total, 0);
+    assert_eq!(
+        after.hot_fallback_runs_considered_total - before.hot_fallback_runs_considered_total,
+        0
+    );
+    assert_eq!(
+        after.hot_fallback_runs_opened_total - before.hot_fallback_runs_opened_total,
+        0
+    );
+    assert_eq!(
+        after.hot_fallback_pages_decoded_total - before.hot_fallback_pages_decoded_total,
+        0
+    );
+    assert_eq!(
+        after.hot_fallback_rows_materialized_total - before.hot_fallback_rows_materialized_total,
+        0
+    );
+    assert_eq!(
+        after.hot_mapping_rebuild_total - before.hot_mapping_rebuild_total,
+        0
+    );
+    assert_eq!(
+        after.hot_checkpoint_rejected_total - before.hot_checkpoint_rejected_total,
+        0
+    );
+}
+
+#[test]
+fn deleted_row_increments_tombstone_fallback_reason() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    let row_id = table
+        .put(vec![
+            (1, Value::Int64(7)),
+            (2, Value::Bytes(b"alice".to_vec())),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    table.delete(row_id).unwrap();
+    table.commit().unwrap();
+
+    let before = table.lookup_metrics_snapshot();
+    let _rows = table
+        .query(&Query::new().and(Condition::Pk(pk_bytes(7))))
+        .unwrap();
+    let after = table.lookup_metrics_snapshot();
+
+    assert_eq!(
+        after.hot_fallback_reasons[REASON_TOMBSTONE]
+            - before.hot_fallback_reasons[REASON_TOMBSTONE],
+        1,
+        "deleted-row lookup must increment the Tombstone fallback reason"
+    );
+    assert!(
+        after.hot_fallback_runs_considered_total - before.hot_fallback_runs_considered_total >= 1,
+        "deleted-row lookup must register at least one considered run"
+    );
+}
+
+#[test]
+fn historical_snapshot_records_historical_fallback_reason() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    let row_id = table
+        .put(vec![
+            (1, Value::Int64(11)),
+            (2, Value::Bytes(b"alice".to_vec())),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+
+    // Pin the snapshot BEFORE the delete commits so the lookup must travel
+    // through the historical-snapshot fallback path.
+    let snap = table.snapshot();
+    table.delete(row_id).unwrap();
+    table.commit().unwrap();
+
+    let before = table.lookup_metrics_snapshot();
+    let _rows = table
+        .query_at_with_allowed(&Query::new().and(Condition::Pk(pk_bytes(11))), snap, None)
+        .unwrap();
+    let after = table.lookup_metrics_snapshot();
+
+    assert_eq!(
+        after.hot_fallback_reasons[REASON_HISTORICAL_SNAPSHOT]
+            - before.hot_fallback_reasons[REASON_HISTORICAL_SNAPSHOT],
+        1,
+        "lookup under pre-delete snapshot must record HistoricalSnapshot reason"
+    );
+}
+
+#[test]
+fn snapshot_to_metrics_is_consistent() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+
+    // Healthy lookups (HOT hits) must not perturb the per-reason counters.
+    for i in 0..8i64 {
+        put(&mut table, 2000 + i, "healthy");
+    }
+    table.commit().unwrap();
+    for i in 0..8i64 {
+        let _hits = table
+            .query(&Query::new().and(Condition::Pk(pk_bytes(2000 + i))))
+            .unwrap();
+    }
+
+    // Delete + lookup exercises the tombstone fallback path.
+    let tomb_row = table
+        .put(vec![
+            (1, Value::Int64(99)),
+            (2, Value::Bytes(b"doomed".to_vec())),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    table.delete(tomb_row).unwrap();
+    table.commit().unwrap();
+    let _rows = table
+        .query(&Query::new().and(Condition::Pk(pk_bytes(99))))
+        .unwrap();
+
+    // Lookup under a pre-delete snapshot exercises the historical path.
+    let pinned = table.snapshot();
+    let hist_row = table
+        .put(vec![
+            (1, Value::Int64(101)),
+            (2, Value::Bytes(b"hist".to_vec())),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    table.delete(hist_row).unwrap();
+    table.commit().unwrap();
+    let _rows = table
+        .query_at_with_allowed(
+            &Query::new().and(Condition::Pk(pk_bytes(101))),
+            pinned,
+            None,
+        )
+        .unwrap();
+
+    let metrics = table.lookup_metrics_snapshot();
+    let reason_sum: u64 = metrics.hot_fallback_reasons.iter().sum();
+    assert_eq!(
+        reason_sum, metrics.hot_lookup_fallback,
+        "sum of hot_fallback_reasons[0..9] (={reason_sum}) must equal \
+         hot_lookup_fallback (={})",
+        metrics.hot_lookup_fallback
+    );
+}

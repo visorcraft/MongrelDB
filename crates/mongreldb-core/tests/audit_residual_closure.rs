@@ -57,13 +57,11 @@ fn load_alpha_beta(n: usize) -> Vec<Vec<(u16, Value)>> {
                 (1, Value::Int64(i as i64)),
                 (
                     2,
-                    Value::Bytes(
-                        if i % 2 == 0 {
-                            b"alpha".to_vec()
-                        } else {
-                            b"beta".to_vec()
-                        },
-                    ),
+                    Value::Bytes(if i % 2 == 0 {
+                        b"alpha".to_vec()
+                    } else {
+                        b"beta".to_vec()
+                    }),
                 ),
             ]
         })
@@ -79,9 +77,7 @@ fn r1_count_conditions_after_delete_and_force_flush_matches_materialize() {
     db.bulk_load(load_alpha_beta(100)).unwrap();
     db.flush().unwrap();
 
-    let alpha = db
-        .query(&Query::new().and(alpha_cond()))
-        .unwrap();
+    let alpha = db.query(&Query::new().and(alpha_cond())).unwrap();
     assert_eq!(alpha.len(), 50);
     db.delete(alpha[0].row_id).unwrap();
     db.commit().unwrap();
@@ -475,10 +471,7 @@ fn database_snapshot_registry_pin_survives_compact_bitmap_eq() {
         for i in 100..110i64 {
             tx.put(
                 "cities",
-                vec![
-                    (1, Value::Int64(i)),
-                    (2, Value::Bytes(b"beta".to_vec())),
-                ],
+                vec![(1, Value::Int64(i)), (2, Value::Bytes(b"beta".to_vec()))],
             )?;
         }
         Ok(())

@@ -1,0 +1,181 @@
+# Residual closure — five-item evidence pipeline (TODO §6).
+#
+# This workflow is the structural gate that proves the five residual items
+# (RunLookupDirectory, async persistent result cache, streaming cursors,
+# non-Bitmap churn oracle, HOT fallback observability) all close under one
+# evidence bundle. Each job is intentionally small and self-contained.
+#
+# Triggered:
+#   - on demand: workflow_dispatch
+#   - on PR: pull_request touching mongreldb-core or mongreldb-server
+#   - nightly: schedule (cron 0 4 * * *) for the slow jobs
+
+name: residual-closure
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/mongreldb-core/**"
+      - "crates/mongreldb-server/**"
+      - "crates/mongreldb-core/tests/point_lookup_directory.rs"
+      - "crates/mongreldb-core/tests/result_cache_async_persistence.rs"
+      - "crates/mongreldb-core/tests/controlled_scan_streaming.rs"
+      - "crates/mongreldb-core/tests/index_churn_oracle.rs"
+      - "crates/mongreldb-core/tests/lookup_metrics.rs"
+      - "docs/architecture/point-lookup-directory.md"
+      - "docs/architecture/controlled-cursor.md"
+      - "docs/architecture/adr/0013-persistent-result-cache-publication.md"
+      - "docs/operations/hot-fallback.md"
+  schedule:
+    # nightly at 04:00 UTC; staggered to avoid the qualification window.
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- TODO §1 ---------------------------------------------------------
+  point-lookup-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo fmt --check
+      - run: cargo clippy -p mongreldb-core --all-targets --all-features -- -D warnings
+      - run: cargo test -p mongreldb-core --test point_lookup_directory --all-features
+      - run: cargo test -p mongreldb-core --lib run_lookup::tests --all-features
+
+  point-lookup-release-benchmark:
+    runs-on: ubuntu-latest
+    needs: point-lookup-structure
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --release --test point_lookup_runs -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: point-lookup-results
+          path: |
+            crates/mongreldb-core/tests/point_lookup_runs.jsonl
+            crates/mongreldb-core/tests/point_lookup_reader_bounds.json
+
+  # ---- TODO §2 ---------------------------------------------------------
+  result-cache-async-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --test result_cache_async_persistence --all-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-cache-race
+          path: crates/mongreldb-core/tests/result_cache_async_persistence.log
+
+  result-cache-slow-io-benchmark:
+    runs-on: ubuntu-latest
+    needs: result-cache-async-race
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --release --test result_cache_async_persistence -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-cache-results
+          path: crates/mongreldb-core/tests/result_cache_results.jsonl
+
+  # ---- TODO §3 ---------------------------------------------------------
+  controlled-scan-streaming-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --test controlled_scan_streaming --all-features
+
+  controlled-scan-memory-and-cancellation:
+    runs-on: ubuntu-latest
+    needs: controlled-scan-streaming-structure
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --release --test controlled_scan_streaming -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlled-scan-memory
+          path: |
+            crates/mongreldb-core/tests/controlled_scan_results.jsonl
+            crates/mongreldb-core/tests/controlled_scan_memory.json
+
+  # ---- TODO §4 ---------------------------------------------------------
+  index-churn-oracle-smoke:
+    runs-on: ubuntu-latest
+    env:
+      MONGRELDB_ORACLE_SEEDS: "1,2,3,4,5,6,7,8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --test index_churn_oracle --all-features
+
+  # ---- TODO §5 ---------------------------------------------------------
+  hot-observability-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-core --test lookup_metrics --all-features
+
+  hot-observability-server:
+    runs-on: ubuntu-latest
+    needs: hot-observability-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo test -p mongreldb-server --all-targets --all-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hot-metrics-sample
+          path: |
+            crates/mongreldb-server/tests/hot_metrics_sample.txt
+            crates/mongreldb-server/tests/hot_trace_samples.json
+
+  # ---- full matrix (closure-evidence) ----------------------------------
+  full-core-and-workspace:
+    runs-on: ubuntu-latest
+    needs:
+      - point-lookup-structure
+      - result-cache-async-race
+      - controlled-scan-streaming-structure
+      - index-churn-oracle-smoke
+      - hot-observability-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo fmt --check
+      - run: |
+        cargo clippy --workspace --all-targets --all-features \
+          --exclude mongreldb-perf -- -D warnings \
+          2>&1 | tee clippy.log
+      - run: |
+        cargo test --workspace --all-features 2>&1 | tee workspace-tests.log
+      - run: |
+        cargo test -p mongreldb-server --all-targets 2>&1 | tee server-tests.log
+      - run: |
+        cargo test -p mongreldb-server --all-targets --features cluster 2>&1 | tee server-cluster-tests.log
+      - run: |
+        cargo test -p mongreldb-server --all-targets --all-features 2>&1 | tee server-all-features-tests.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: residual-closure-evidence
+          path: |
+            commit.txt
+            environment.txt
+            toolchain.txt
+            fmt.log
+            clippy.log
+            core-tests.log
+            workspace-tests.log
+            server-tests.log
+            server-cluster-tests.log
+            server-all-features-tests.log
+            BENCHMARKS.md
+            closure-checklist.md

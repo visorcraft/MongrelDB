@@ -390,10 +390,7 @@ fn churn_oracle_topk_matches_visible_brute_force() {
             .put(vec![
                 (1, Value::Int64(10_000 + i)),
                 (2, Value::Embedding(embedding)),
-                (
-                    3,
-                    Value::Bytes(bincode::serialize(&sparse_terms).unwrap()),
-                ),
+                (3, Value::Bytes(bincode::serialize(&sparse_terms).unwrap())),
                 (4, set_members),
             ])
             .unwrap();
@@ -544,7 +541,11 @@ fn churn_oracle_topk_matches_visible_brute_force() {
             let row = table
                 .get(hit.row_id, mongreldb_core::Snapshot::unbounded())
                 .expect("MinHash hit must materialize");
-            assert!(!row.deleted, "cycle {cycle}: MinHash tombstone {}", hit.row_id.0);
+            assert!(
+                !row.deleted,
+                "cycle {cycle}: MinHash tombstone {}",
+                hit.row_id.0
+            );
             let j = jaccard(&qset, &decode_set(row.columns.get(&4).expect("members")));
             assert!(
                 (j - oracle_top_j).abs() < 1e-9,

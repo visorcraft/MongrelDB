@@ -62,9 +62,8 @@ impl BitmapIndex {
         let mut new_frozen: Option<Vec<Arc<BitmapLayer>>> = None;
         for (i, layer) in self.frozen.iter().enumerate() {
             if layer.get(value).is_some_and(|bm| bm.contains(id32)) {
-                let layers = new_frozen.get_or_insert_with(|| {
-                    self.frozen.iter().cloned().collect::<Vec<_>>()
-                });
+                let layers = new_frozen
+                    .get_or_insert_with(|| self.frozen.iter().cloned().collect::<Vec<_>>());
                 let mut owned = (*layers[i]).clone();
                 if let Some(bm) = owned.get_mut(value) {
                     if bm.remove(id32) {
