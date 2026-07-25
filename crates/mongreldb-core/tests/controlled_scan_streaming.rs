@@ -161,7 +161,7 @@ fn cancellation_is_observed_within_256_examined_versions() {
 
 #[test]
 #[test]
-#[ignore = "PR D follow-up: requires MemtableVisibleVersionCursor to be wired into merge_controlled_visible_sources so the k-way merge consumes the memtable + mutable run as a stream, not as a pre-built BTreeMap. The current map materialisation dominates the 1ms budget for 100k rows."]
+#[ignore = "PR D follow-up: bulk_load_columns materialises 100k rows in a sorted run; opening the run reader + decoding the first run page + walking the Pma header exceeds the 1ms budget. Closing this gate requires either a run-level pre-fetched first-page cache, or a dedicated `bulk_load_columns_fast` that pre-warms the cursor's first decode. The streaming memtable + mutable_run cursor work is in place (PR D step 1); the run path is the remaining hot spot."]
 fn controlled_scan_produces_first_row_within_one_millisecond() {
     let directory = tempdir().unwrap();
     let mut table = Table::create(directory.path(), schema(), 1).unwrap();

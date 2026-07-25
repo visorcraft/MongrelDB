@@ -10,6 +10,22 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mongreldb_core::engine::LookupMetricsSnapshot;
+
+/// Stable label names for `hot_fallback_total{reason=...}`. Order MUST match
+/// the indices baked into [`mongreldb_core::engine::hot_fallback_reason_index`].
+const HOT_FALLBACK_REASON_LABELS: [&str; 9] = [
+    "missing_mapping",
+    "stale_row_id",
+    "invisible_at_snapshot",
+    "historical_snapshot",
+    "tombstone",
+    "ttl_expired",
+    "primary_key_mismatch",
+    "index_incomplete",
+    "checkpoint_rejected",
+];
+
 /// Daemon-wide counters, bumped from every instrumented HTTP handler.
 ///
 /// Stored as `Arc<Metrics>` inside `AppState` so all handlers share one set.
@@ -310,6 +326,157 @@ impl Metrics {
         out.push_str(&format!("mongreldb_tables {table_count}\n"));
         out
     }
+}
+
+/// Render the HOT-fallback counters from `snap` as a Prometheus text-format
+/// block. Each metric carries one HELP + TYPE preamble followed by zero or
+/// more sample lines. Callers append this after the SQL/cache block so the
+/// final `/metrics` body remains a single valid exposition.
+pub fn hot_lookup_metrics(snap: &LookupMetricsSnapshot) -> String {
+    let mut out = String::with_capacity(1024);
+    // hot_lookup_total{outcome=...}
+    out.push_str("# HELP hot_lookup_total HOT primary-key lookups by outcome.\n");
+    out.push_str("# TYPE hot_lookup_total counter\n");
+    out.push_str(&format!(
+        "hot_lookup_total{{outcome=\"hit\"}} {}\n",
+        snap.hot_lookup_hit
+    ));
+    out.push_str(&format!(
+        "hot_lookup_total{{outcome=\"fallback\"}} {}\n\n",
+        snap.hot_lookup_fallback
+    ));
+    // hot_fallback_total{reason=...}
+    out.push_str(
+        "# HELP hot_fallback_total HOT lookups that fell back to the row scanner, by reason.\n",
+    );
+    out.push_str("# TYPE hot_fallback_total counter\n");
+    for (idx, reason) in HOT_FALLBACK_REASON_LABELS.iter().enumerate() {
+        out.push_str(&format!(
+            "hot_fallback_total{{reason=\"{reason}\"}} {}\n",
+            snap.hot_fallback_reasons[idx]
+        ));
+    }
+    out.push('\n');
+    // run/page/row counters (no labels).
+    out.push_str("# HELP hot_fallback_overlay_versions_total Overlay row versions consulted during HOT fallback.\n");
+    out.push_str("# TYPE hot_fallback_overlay_versions_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_overlay_versions_total {}\n\n",
+        snap.hot_fallback_overlay_versions_total
+    ));
+    out.push_str(
+        "# HELP hot_fallback_runs_considered_total Sorted runs considered during HOT fallback.\n",
+    );
+    out.push_str("# TYPE hot_fallback_runs_considered_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_runs_considered_total {}\n",
+        snap.hot_fallback_runs_considered_total
+    ));
+    out.push_str("# TYPE hot_fallback_runs_opened_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_runs_opened_total {}\n",
+        snap.hot_fallback_runs_opened_total
+    ));
+    out.push_str("# TYPE hot_fallback_pages_decoded_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_pages_decoded_total {}\n",
+        snap.hot_fallback_pages_decoded_total
+    ));
+    out.push_str("# TYPE hot_fallback_rows_materialized_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_rows_materialized_total {}\n\n",
+        snap.hot_fallback_rows_materialized_total
+    ));
+    // duration counters (reported as fractional seconds; raw nanoseconds live
+    // on the per-table atomics).
+    out.push_str(
+        "# HELP hot_lookup_duration_seconds Cumulative time spent in HOT primary-key lookups.\n",
+    );
+    out.push_str("# TYPE hot_lookup_duration_seconds counter\n");
+    out.push_str(&format!(
+        "hot_lookup_duration_seconds {}\n",
+        snap.hot_lookup_duration_nanos as f64 / 1e9
+    ));
+    out.push_str("# TYPE hot_fallback_duration_seconds counter\n");
+    out.push_str(&format!(
+        "hot_fallback_duration_seconds {}\n\n",
+        snap.hot_fallback_duration_nanos as f64 / 1e9
+    ));
+    // mapping rebuild / checkpoint rejection.
+    out.push_str(
+        "# HELP hot_mapping_rebuild_total HOT->row-id mapping rebuilds triggered by stale state.\n",
+    );
+    out.push_str("# TYPE hot_mapping_rebuild_total counter\n");
+    out.push_str(&format!(
+        "hot_mapping_rebuild_total {}\n",
+        snap.hot_mapping_rebuild_total
+    ));
+    out.push_str("# TYPE hot_checkpoint_rejected_total counter\n");
+    out.push_str(&format!(
+        "hot_checkpoint_rejected_total {}\n",
+        snap.hot_checkpoint_rejected_total
+    ));
+    out
+}
+
+/// Aggregate `Table::lookup_metrics_snapshot()` over every live table on
+/// `state.db()`. Per-reason arrays sum element-wise, scalar counters sum,
+/// and the persist queue depth takes the per-table max. Tolerant of an
+/// empty database (returns `LookupMetricsSnapshot::default()`).
+pub fn aggregate_hot_metrics(state: &crate::AppState) -> LookupMetricsSnapshot {
+    let names = state.db().table_names();
+    if names.is_empty() {
+        return LookupMetricsSnapshot::default();
+    }
+    let mut agg = LookupMetricsSnapshot::default();
+    for name in &names {
+        let Ok(handle) = state.db().table(name) else {
+            continue;
+        };
+        let snap = handle.read().lookup_metrics_snapshot();
+        agg.hot_lookup_hit += snap.hot_lookup_hit;
+        agg.hot_lookup_fallback += snap.hot_lookup_fallback;
+        agg.hot_lookup_fallback_overlay_rows += snap.hot_lookup_fallback_overlay_rows;
+        agg.hot_lookup_fallback_runs += snap.hot_lookup_fallback_runs;
+        agg.result_cache_memory_hit += snap.result_cache_memory_hit;
+        agg.result_cache_disk_hit += snap.result_cache_disk_hit;
+        agg.result_cache_miss += snap.result_cache_miss;
+        agg.result_cache_persistent_write_us += snap.result_cache_persistent_write_us;
+        agg.get_run_opened += snap.get_run_opened;
+        agg.get_run_skipped += snap.get_run_skipped;
+        agg.directory_lookup_hit += snap.directory_lookup_hit;
+        agg.directory_lookup_fallback += snap.directory_lookup_fallback;
+        agg.directory_incomplete += snap.directory_incomplete;
+        agg.directory_run_readers_opened += snap.directory_run_readers_opened;
+        agg.directory_early_stop_total += snap.directory_early_stop_total;
+        agg.result_cache_persist_enqueued_total += snap.result_cache_persist_enqueued_total;
+        agg.result_cache_persist_coalesced_total += snap.result_cache_persist_coalesced_total;
+        agg.result_cache_persist_dropped_store_total +=
+            snap.result_cache_persist_dropped_store_total;
+        agg.result_cache_persist_remove_total += snap.result_cache_persist_remove_total;
+        agg.result_cache_persist_stale_store_skipped_total +=
+            snap.result_cache_persist_stale_store_skipped_total;
+        agg.result_cache_persist_errors_total += snap.result_cache_persist_errors_total;
+        agg.result_cache_persist_shutdown_abandoned_total +=
+            snap.result_cache_persist_shutdown_abandoned_total;
+        for i in 0..agg.hot_fallback_reasons.len() {
+            agg.hot_fallback_reasons[i] += snap.hot_fallback_reasons[i];
+        }
+        agg.hot_fallback_overlay_versions_total += snap.hot_fallback_overlay_versions_total;
+        agg.hot_fallback_runs_considered_total += snap.hot_fallback_runs_considered_total;
+        agg.hot_fallback_runs_opened_total += snap.hot_fallback_runs_opened_total;
+        agg.hot_fallback_pages_decoded_total += snap.hot_fallback_pages_decoded_total;
+        agg.hot_fallback_rows_materialized_total += snap.hot_fallback_rows_materialized_total;
+        agg.hot_lookup_duration_nanos += snap.hot_lookup_duration_nanos;
+        agg.hot_fallback_duration_nanos += snap.hot_fallback_duration_nanos;
+        agg.hot_mapping_rebuild_total += snap.hot_mapping_rebuild_total;
+        agg.hot_checkpoint_rejected_total += snap.hot_checkpoint_rejected_total;
+        // queue_depth is a gauge — track the high-water mark across tables.
+        if snap.result_cache_persist_queue_depth > agg.result_cache_persist_queue_depth {
+            agg.result_cache_persist_queue_depth = snap.result_cache_persist_queue_depth;
+        }
+    }
+    agg
 }
 
 /// Read the slow-query threshold from the `MONGRELBL_SLOW_QUERY_MS` env var,

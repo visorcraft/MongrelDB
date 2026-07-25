@@ -744,6 +744,16 @@ fn churn_oracle_fmindex() {
 
         // Every 10th step: assert the engine's FM result matches the oracle.
         if step % 10 == 9 {
+            // TODO: ENGINE BUG — see the bottom of the file for the full
+            // hypothesis. Short version: `self.fm.get(column_id).locate(pattern)`
+            // (engine.rs:8997) returns a `RowIdSet::empty()` while the model
+            // has live rows whose Bytes column contains `query_pattern`. The
+            // FM index is populated by `index_into` (engine.rs:13712) on every
+            // put, and `FmIndex::locate` (src/index/fm_index.rs:429) lazily
+            // rebuilds the BWT/wavelet tree from `self.docs` on the first
+            // query — so an empty result at step 9 means either the active
+            // `FmSegment::docs` is empty after `index_into` or the lazy
+            // rebuild is dropping the just-inserted doc.
             let oracle = fm_oracle(&harness.model, 2, &query_pattern);
             let engine_q = Query::new().and(Condition::FmContains {
                 column_id: 2,
@@ -755,9 +765,18 @@ fn churn_oracle_fmindex() {
                 .into_iter()
                 .map(|r| r.row_id.0)
                 .collect();
+            let mut engine_rids: Vec<u64> = engine_hits.iter().copied().collect();
+            engine_rids.sort_unstable();
+            let mut oracle_rids: Vec<u64> = oracle.iter().copied().collect();
+            oracle_rids.sort_unstable();
+            let op_log = &harness.log;
             assert_eq!(
-                engine_hits, oracle,
-                "FM oracle diverged at step {step} (engine={engine_hits:?}, oracle={oracle:?})"
+                engine_rids, oracle_rids,
+                "FM oracle diverged at step {step}\n\
+                 ENGINE BUG: <placeholder: FM index returns empty for a pattern that matches live rows>\n\
+                 op_log={op_log:?}\n\
+                 engine_rids={engine_rids:?}\n\
+                 oracle_rids={oracle_rids:?}"
             );
         }
     }
@@ -886,6 +905,20 @@ fn churn_oracle_learned_range() {
         }
 
         if step % 10 == 9 {
+            // TODO: ENGINE BUG — see the bottom of the file for the full
+            // hypothesis. Short version: `Condition::Range` (engine.rs:9088)
+            // returns a `RowIdSet::empty()` while the model has live rows
+            // whose Int64 column is in [-150, 150]. The LearnedRange index is
+            // built from a single run (`build_learned_ranges` at
+            // engine.rs:3686) and is empty until the first flush, so the
+            // query falls through to `range_scan_i64` (engine.rs:9247) which
+            // also scans the runs and merges the overlay (`range_scan_i64`
+            // calls `range_scan_overlay_i64` at engine.rs:9324). An empty
+            // result at step 9 (no flushes yet, all rows in the memtable)
+            // means the overlay merge is failing to include the memtable
+            // rows whose Int64 column falls in the range — or the memtable
+            // rows are being incorrectly added to the `remove_many` set
+            // before the overlay merge.
             let (lo, hi) = (-150, 150);
             let oracle = range_oracle(&harness.model, 2, lo, hi);
             let engine_q = Query::new().and(Condition::Range {
@@ -899,9 +932,18 @@ fn churn_oracle_learned_range() {
                 .into_iter()
                 .map(|r| r.row_id.0)
                 .collect();
+            let mut engine_rids: Vec<u64> = engine_hits.iter().copied().collect();
+            engine_rids.sort_unstable();
+            let mut oracle_rids: Vec<u64> = oracle.iter().copied().collect();
+            oracle_rids.sort_unstable();
+            let op_log = &harness.log;
             assert_eq!(
-                engine_hits, oracle,
-                "LearnedRange oracle diverged at step {step}"
+                engine_rids, oracle_rids,
+                "LearnedRange oracle diverged at step {step}\n\
+                 ENGINE BUG: <placeholder: Range index returns empty even though the memtable has rows in range>\n\
+                 op_log={op_log:?}\n\
+                 engine_rids={engine_rids:?}\n\
+                 oracle_rids={oracle_rids:?}"
             );
         }
     }
@@ -1083,6 +1125,17 @@ fn churn_oracle_ann_hnsw_dense() {
         }
 
         if step % 10 == 9 {
+            // TODO: ENGINE BUG — see the bottom of the file for the full
+            // hypothesis. Short version: `Retriever::Ann` returns an empty
+            // `Vec<RetrieverHit>` at step 9 while the model has live rows
+            // whose Embedding column is similar to the query. The ANN
+            // Dense index is populated by `index_into` (engine.rs:13712) on
+            // every put via `AnnIndex::insert_validated` (src/index/ann/mod.rs:363),
+            // which delegates to the active `DenseHnsw` (src/index/hnsw.rs:421).
+            // An empty result at step 9 means either the active `DenseHnsw`
+            // has no entries (the graph was never seeded) or the entry
+            // point is unreachable when `max_level == 0` and the single
+            // node's graph neighbours are empty.
             let oracle = ann_dense_oracle(&harness.model, 2, &query, k);
             let engine_hits = table
                 .retrieve(&Retriever::Ann {
@@ -1093,11 +1146,18 @@ fn churn_oracle_ann_hnsw_dense() {
                 .unwrap();
             // ANN Dense is exact via cosine over the frozen-visible set, so
             // the engine top-k (rids) must equal the oracle top-k (rids).
-            let engine_rids: Vec<u64> = engine_hits.iter().map(|h| h.row_id.0).collect();
-            let oracle_rids: Vec<u64> = oracle.iter().map(|(r, _)| *r).collect();
+            let mut engine_rids: Vec<u64> = engine_hits.iter().map(|h| h.row_id.0).collect();
+            engine_rids.sort_unstable();
+            let mut oracle_rids: Vec<u64> = oracle.iter().map(|(r, _)| *r).collect();
+            oracle_rids.sort_unstable();
+            let op_log = &harness.log;
             assert_eq!(
                 engine_rids, oracle_rids,
-                "ANN Dense oracle diverged at step {step} (engine={engine_rids:?}, oracle={oracle_rids:?})"
+                "ANN Dense oracle diverged at step {step}\n\
+                 ENGINE BUG: <placeholder: ANN Dense top-k returns empty even though the model has matching vectors>\n\
+                 op_log={op_log:?}\n\
+                 engine_rids={engine_rids:?}\n\
+                 oracle_rids={oracle_rids:?}"
             );
             // Distances must be ascending (sanity on the engine ordering).
             for w in engine_hits.windows(2) {
@@ -1281,6 +1341,48 @@ fn range_cols(pk: i64, score: i64) -> Vec<(u16, Value)> {
         (3, Value::Int64(now_nanos())),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Engine bugs surfaced by churn oracle (intentionally RED — fix in follow-up):
+//
+// 1. FM (`churn_oracle_fmindex` at line 586): the engine returns
+//    `RowIdSet::empty()` for `Condition::FmContains` at step 9 while the
+//    model has live rows whose Bytes column contains "the". The FM index is
+//    populated by `index_into` (engine.rs:13712) for every put, but the
+//    query at engine.rs:8997 returns empty. The likely cause is that the
+//    active `FmSegment::docs` is empty after `index_into` inserts, or the
+//    lazy BWT/wavelet-tree rebuild in `FmIndex::locate` is dropping the
+//    just-inserted doc. Suspected: src/index/fm_index.rs:429
+//    (`FmIndex::locate` / `FmSegment::backward`).
+//
+// 2. LearnedRange (`churn_oracle_learned_range` at line 777): the engine
+//    returns `RowIdSet::empty()` for `Condition::Range` at step 9 while the
+//    model has live rows whose Int64 column is in [-150, 150]. The
+//    per-column PGM is built from a single run (`build_learned_ranges` at
+//    engine.rs:3686) and is empty until the first flush, so the query
+//    falls through to `range_scan_i64` (engine.rs:9247) which calls
+//    `range_scan_overlay_i64` (engine.rs:9324). An empty result at step 9
+//    (no flushes yet, all rows in the memtable) means the overlay merge
+//    is failing to include the memtable rows whose Int64 column falls in
+//    the range — or the run-side `range_row_ids_visible_i64` is returning
+//    hits that the `overlay_rids` `remove_many` then incorrectly strips.
+//    Suspected: src/index/learned_range.rs:127 (`ColumnLearnedRange::range`)
+//    or engine.rs:9324 (`range_scan_overlay_i64`).
+//
+// 3. ANN Dense (`churn_oracle_ann_hnsw_dense` at line 911): the engine
+//    returns an empty `Vec<RetrieverHit>` for `Retriever::Ann` at step 9
+//    while the model has live rows whose Embedding column is similar to
+//    the query. The ANN Dense index is populated by `index_into`
+//    (engine.rs:13712) on every put via `AnnIndex::insert_validated`
+//    (src/index/ann/mod.rs:363), which delegates to the active
+//    `DenseHnsw` (src/index/hnsw.rs:421). An empty result at step 9 means
+//    either the active `DenseHnsw` has no entries (the graph was never
+//    seeded) or the search cannot reach the entry point when
+//    `max_level == 0` and the single node's graph neighbours are empty.
+//    Suspected: src/index/hnsw.rs:561 (`DenseHnsw::search`).
+//
+// These three tests are intentionally RED. They are NOT marked `#[ignore]`.
+// They must stay RED until the engine bugs are fixed in a follow-up task.
 
 // ---------------------------------------------------------------------------
 // TODO (follow-ups, file under 1500-line cap):
