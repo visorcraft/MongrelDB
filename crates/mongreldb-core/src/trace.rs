@@ -260,6 +260,8 @@ pub struct QueryTrace {
     pub controlled_scan_time_to_first_row_us: u64,
     /// Time from `cancel` to the scan actually observing cancellation, in µs.
     pub controlled_scan_cancel_latency_us: u64,
+    /// Wall-clock time spent constructing the controlled-scan sources, in µs.
+    pub controlled_scan_setup_time_us: u64,
 
     // ---- TODO §5: HOT fallback trace fields ------------------------------
     /// Whether a HOT lookup was attempted for this query.

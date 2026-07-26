@@ -132,7 +132,7 @@ impl Value {
 /// [`Self::commit_ts`] is in-memory only (`#[serde(skip)]`); durable HLC for
 /// WAL recovery is `Op::CommitTimestamp`, and sorted runs use the
 /// `SYS_COMMIT_TS` system column (with its own legacy-compatible path).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     pub row_id: RowId,
     pub committed_epoch: Epoch,
