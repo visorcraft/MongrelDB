@@ -1051,6 +1051,32 @@ fn churn_oracle_learned_range() {
 }
 
 #[test]
+fn learned_range_excludes_deleted_row() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), range_schema(), 1).unwrap();
+    let deleted = table.put(range_cols(2058, 42)).unwrap();
+    let live = table.put(range_cols(2059, 43)).unwrap();
+    table.flush().unwrap();
+
+    table.delete(deleted).unwrap();
+    table.flush().unwrap();
+
+    let query = Query::new().and(Condition::Range {
+        column_id: 2,
+        lo: 40,
+        hi: 45,
+    });
+    let row_ids: HashSet<u64> = table
+        .query(&query)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.row_id.0)
+        .collect();
+    assert!(!row_ids.contains(&deleted.0));
+    assert!(row_ids.contains(&live.0));
+}
+
+#[test]
 fn churn_oracle_ann_hnsw_dense() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), ann_dense_schema(), 1).unwrap();

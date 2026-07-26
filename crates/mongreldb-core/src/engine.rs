@@ -7832,10 +7832,6 @@ impl Table {
         } else {
             Snapshot::at(self.pending_epoch())
         };
-        if !self.had_deletes && self.ttl.is_none() && lookup_snapshot.epoch == self.snapshot().epoch
-        {
-            return Ok(candidates.iter().copied().collect());
-        }
         let mut readers: Vec<_> = self
             .run_refs
             .iter()
@@ -9913,7 +9909,7 @@ impl Table {
                 // desynced run/LearnedRange plan can no longer hide a live row
                 // that still has a correct Bitmap membership (and vice versa
                 // the overlay merge still covers pure-memtable puts).
-                let mut set = if let Some(li) = self.learned_range.get(column_id) {
+                let mut set = if let Some(_li) = self.learned_range.get(column_id) {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
@@ -9944,12 +9940,27 @@ impl Table {
                     }
                     return Ok(multi);
                 };
+                if self.learned_range.get(column_id).is_none() && self.run_refs.len() == 1 {
+                    let candidates: Vec<RowId> =
+                        set.into_sorted_vec().into_iter().map(RowId).collect();
+                    set = RowIdSet::from_unsorted(
+                        self.eligible_candidate_ids(&candidates, *column_id, snapshot, None)?
+                            .into_iter()
+                            .map(|row_id| row_id.0)
+                            .collect(),
+                    );
+                }
                 set.remove_many(self.overlay_rid_set(snapshot));
                 self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
                 if lo == hi {
                     self.union_bitmap_point_i64(&mut set, *column_id, *lo, snapshot);
                 }
-                set
+                RowIdSet::from_unsorted(
+                    set.into_sorted_vec()
+                        .into_iter()
+                        .filter(|row_id| self.get(RowId(*row_id), snapshot).is_some())
+                        .collect(),
+                )
             }
             Condition::RangeF64 {
                 column_id,
@@ -10051,8 +10062,24 @@ impl Table {
                 tomb_rids.insert(rid);
             }
         }
+        for row in self
+            .memtable
+            .visible_versions_at(Snapshot::at(self.pending_epoch()))
+            .into_iter()
+            .chain(
+                self.mutable_run
+                    .visible_versions_at(Snapshot::at(self.pending_epoch())),
+            )
+        {
+            if row.deleted {
+                tomb_rids.insert(row.row_id.0);
+            }
+        }
         let mut s = RowIdSet::from_unsorted(row_ids);
         s.remove_many(tomb_rids);
+        let candidates: Vec<RowId> = s.into_sorted_vec().into_iter().map(RowId).collect();
+        let eligible = self.eligible_candidate_ids(&candidates, column_id, snapshot, None)?;
+        let mut s = RowIdSet::from_unsorted(eligible.into_iter().map(|row_id| row_id.0).collect());
         self.range_scan_overlay_i64(&mut s, column_id, lo, hi, snapshot);
         Ok(s)
     }
@@ -10147,7 +10174,7 @@ impl Table {
         for row in newest.values() {
             if !row.deleted {
                 if let Some(Value::Int64(v)) = row.columns.get(&column_id) {
-                    if *v >= lo && *v <= hi {
+                    if *v >= lo && *v <= hi && !self.row_expired_at(row, unix_nanos_now()) {
                         s.insert(row.row_id.0);
                     }
                 }
@@ -10192,7 +10219,7 @@ impl Table {
                 if let Some(Value::Float64(v)) = row.columns.get(&column_id) {
                     let ok_lo = if lo_inclusive { *v >= lo } else { *v > lo };
                     let ok_hi = if hi_inclusive { *v <= hi } else { *v < hi };
-                    if ok_lo && ok_hi {
+                    if ok_lo && ok_hi && !self.row_expired_at(row, unix_nanos_now()) {
                         s.insert(row.row_id.0);
                     }
                 }

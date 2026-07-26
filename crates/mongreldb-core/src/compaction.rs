@@ -465,6 +465,26 @@ fn select_keep(vers: &[Row], min_active: Option<Epoch>) -> Vec<Row> {
                 }
                 keep.insert(0, boundary);
             }
+            // Rid-reuse guard: when a rid is tombstoned and then re-allocated to
+            // a new pk at the same committed_epoch, both versions sit at that
+            // epoch with no way for the sort key to break the tie. If the
+            // version chosen as the "boundary" above is a live row while a
+            // tombstone sits at the same epoch, the live row would survive into
+            // the new run even though the tombstone was the last write to the
+            // old pk. Drop the whole rid so the live row cannot leak into a
+            // range/hit set — pinned snapshots still see the tombstone as
+            // `deleted=true` (the run reader's MVCC pass would too, but only
+            // for the older "deleted" column; a rid reuse leaves the same
+            // physical rid serving a different row, which `visible_rows` and
+            // range scans must reject).
+            if keep.len() == 1
+                && !keep[0].deleted
+                && vers
+                    .iter()
+                    .any(|r| r.deleted && r.committed_epoch == keep[0].committed_epoch)
+            {
+                return Vec::new();
+            }
             keep
         }
     }
