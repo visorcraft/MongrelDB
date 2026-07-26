@@ -32,7 +32,7 @@ pub struct MaintenanceReceipt {
 
 /// A point-in-time read view.
 ///
-/// # Authority model (P0.5-T7)
+/// # Authority model (P0.5-T7 + REM-001)
 ///
 /// **[`HlcTimestamp`](mongreldb_types::hlc::HlcTimestamp) is the sole
 /// cluster-wide visibility authority** when present on a snapshot or row
@@ -42,11 +42,19 @@ pub struct MaintenanceReceipt {
 /// | Snapshot `commit_ts` | Row `commit_ts` | Visibility rule |
 /// |----------------------|-----------------|-----------------|
 /// | non-`ZERO` (`at_hlc`) | `Some(ts)`      | HLC: `ts <= snap.commit_ts` |
-/// | `ZERO` (legacy)      | `Some(_)`       | **not visible** (no epoch fallback) |
+/// | `ZERO` (legacy)      | `Some(_)`       | epoch fallback: `row_epoch <= snap.epoch` (dual-model migration) |
 /// | any                  | `None` (legacy) | epoch: `row_epoch <= snap.epoch` |
 ///
 /// Prefer [`Self::at_hlc`] / [`Self::unbounded`] for product reads. Prefer
 /// [`Self::at`] only for pure-legacy paths that never see HLC-stamped rows.
+///
+/// **Candidate recency** (REM-001 cross-run fold):
+///
+/// - both candidates stamped → HLC wins;
+/// - otherwise → epoch wins.
+///
+/// Centralize that comparison in [`VersionStamp::is_newer_than`] so every
+/// multi-run fold honors the same authority rules as [`Self::version_is_newer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     /// Local sequencing watermark (aid only when HLC is active).
@@ -146,6 +154,23 @@ impl Snapshot {
             (Some(a), Some(b)) => a > b,
             _ => a_epoch > b_epoch,
         }
+    }
+}
+
+/// Compact `(epoch, commit_ts)` stamp used to compare candidates across runs
+/// without losing `commit_ts` at API boundaries (REM-001). Visibility still
+/// flows through [`Snapshot::observes_row`]; this helper only centralizes
+/// recency selection once candidates are admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VersionStamp {
+    pub epoch: Epoch,
+    pub commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+}
+
+impl VersionStamp {
+    #[inline]
+    pub(crate) fn is_newer_than(self, other: Self) -> bool {
+        Snapshot::version_is_newer(self.epoch, self.commit_ts, other.epoch, other.commit_ts)
     }
 }
 
@@ -530,6 +555,44 @@ mod tests {
             Epoch(2),
             None
         ));
+    }
+
+    #[test]
+    fn version_stamp_is_newer_than_matches_snapshot_rule() {
+        let early = hlc(100);
+        let late = hlc(200);
+        // HLC-newer wins despite a smaller epoch.
+        let newer = VersionStamp {
+            epoch: Epoch(9),
+            commit_ts: Some(late),
+        };
+        let older = VersionStamp {
+            epoch: Epoch(50),
+            commit_ts: Some(early),
+        };
+        assert!(newer.is_newer_than(older));
+        assert!(!older.is_newer_than(newer));
+        // Both unstamped: epoch wins.
+        let a = VersionStamp {
+            epoch: Epoch(5),
+            commit_ts: None,
+        };
+        let b = VersionStamp {
+            epoch: Epoch(4),
+            commit_ts: None,
+        };
+        assert!(a.is_newer_than(b));
+        assert!(!b.is_newer_than(a));
+        // Mixed: epoch wins.
+        let stamped = VersionStamp {
+            epoch: Epoch(5),
+            commit_ts: Some(early),
+        };
+        let unstamped = VersionStamp {
+            epoch: Epoch(4),
+            commit_ts: None,
+        };
+        assert!(stamped.is_newer_than(unstamped));
     }
 
     #[test]
