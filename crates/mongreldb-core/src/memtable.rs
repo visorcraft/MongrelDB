@@ -15,7 +15,8 @@ use crate::epoch::{Epoch, Snapshot};
 use crate::rowid::RowId;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
 
 /// A cell value in the in-memory path. The flush path re-encodes these into
@@ -184,13 +185,43 @@ impl Row {
     }
 }
 
+/// Min-heap key used to merge memtable leaf streams in ascending
+/// `(RowId, Epoch)` order. We carry the version's epoch too so that the
+/// dedup pass at emit time has it without re-matching on `Cow`.
+struct MemHead<'a> {
+    rid: RowId,
+    epoch: Epoch,
+    index: u32,
+    row: Cow<'a, Row>,
+}
+
+impl PartialEq for MemHead<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rid, self.epoch, self.index) == (other.rid, other.epoch, other.index)
+    }
+}
+impl Eq for MemHead<'_> {}
+impl PartialOrd for MemHead<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MemHead<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (other.rid, other.epoch, other.index).cmp(&(self.rid, self.epoch, self.index))
+    }
+}
+
 pub struct MemtableVisibleVersionCursor<'a> {
     leaves: Vec<LeafVersions<'a>>,
-    leaf_index: usize,
+    heap: BinaryHeap<MemHead<'a>>,
     snapshot: Snapshot,
-    current_row_id: Option<RowId>,
-    best: Option<Cow<'a, Row>>,
     finished: bool,
+    /// Number of source versions examined during the last `next()` call —
+    /// the dedup pass that picks the newest visible version per RowId.
+    pub(crate) last_examined: usize,
+    /// Peak `last_examined` across all calls so far.
+    pub(crate) peak_examined: usize,
 }
 
 impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
@@ -200,61 +231,71 @@ impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
         if self.finished {
             return None;
         }
+        self.last_examined = 0;
         loop {
-            let next = self
-                .leaves
-                .get_mut(self.leaf_index)
-                .and_then(Iterator::next);
-            let Some(version) = next else {
-                self.leaf_index += 1;
-                if self.leaf_index < self.leaves.len() {
-                    continue;
-                }
-                self.finished = true;
-                return self.take_best();
-            };
-            // Skip versions outside the snapshot's visibility window.
-            let (epoch, commit_ts, row_id) = cow_parts(&version);
-            if !self.snapshot.observes_version(epoch, commit_ts) {
+            let MemHead {
+                rid,
+                epoch,
+                index,
+                row,
+            } = self.heap.pop()?;
+            self.last_examined += 1;
+            // Advance the source the popped head came from.
+            if let Some(next) = self.leaves[index as usize].next() {
+                let (nepoch, _nrow_id) = (next.committed_epoch, next.row_id);
+                self.heap.push(MemHead {
+                    rid: next.row_id,
+                    epoch: nepoch,
+                    index,
+                    row: next,
+                });
+            }
+            if !self.snapshot.observes_version(epoch, row.commit_ts) {
                 continue;
             }
-            if self.current_row_id != Some(row_id) {
-                let result = self.take_best();
-                self.current_row_id = Some(row_id);
-                self.best = Some(version);
-                if result.is_some() {
-                    return result;
+            // Gather every remaining head that shares this rid; pick the
+            // newest visible version among them.
+            let mut best = Some(row);
+            while self.heap.peek().is_some_and(|h| h.rid == rid) {
+                let head = self.heap.pop().unwrap();
+                self.last_examined += 1;
+                if let Some(next) = self.leaves[head.index as usize].next() {
+                    let nepoch = next.committed_epoch;
+                    self.heap.push(MemHead {
+                        rid: next.row_id,
+                        epoch: nepoch,
+                        index: head.index,
+                        row: next,
+                    });
                 }
-            } else if self.best.as_ref().is_none_or(|best| {
-                let (best_epoch, best_ts, _best_id) = cow_parts(best);
-                Snapshot::version_is_newer(epoch, commit_ts, best_epoch, best_ts)
-            }) {
-                self.best = Some(version);
+                if self
+                    .snapshot
+                    .observes_version(head.epoch, head.row.commit_ts)
+                    && best.as_ref().is_none_or(|current| {
+                        Snapshot::version_is_newer(
+                            head.epoch,
+                            head.row.commit_ts,
+                            current.committed_epoch,
+                            current.commit_ts,
+                        )
+                    })
+                {
+                    best = Some(head.row);
+                }
             }
+            let best = best?;
+            let row_id = best.row_id;
+            let epoch = best.committed_epoch;
+            self.peak_examined = self.peak_examined.max(self.last_examined);
+            return Some((row_id, epoch, best));
         }
     }
 }
 
-#[allow(clippy::ptr_arg)] // `Cow<'_, Row>::Deref` doesn't auto-coerce, so keep the type explicit here
-fn cow_parts(cow: &Cow<'_, Row>) -> (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, RowId) {
-    match cow {
-        Cow::Borrowed(r) => (r.committed_epoch, r.commit_ts, r.row_id),
-        Cow::Owned(r) => (r.committed_epoch, r.commit_ts, r.row_id),
-    }
-}
-
 impl<'a> MemtableVisibleVersionCursor<'a> {
-    fn take_best(&mut self) -> Option<(RowId, Epoch, Cow<'a, Row>)> {
-        let best = self.best.take()?;
-        let epoch = match &best {
-            Cow::Borrowed(r) => r.committed_epoch,
-            Cow::Owned(r) => r.committed_epoch,
-        };
-        let row_id = match &best {
-            Cow::Borrowed(r) => r.row_id,
-            Cow::Owned(r) => r.row_id,
-        };
-        Some((row_id, epoch, best))
+    /// Cursor is exhausted when the heap is empty.
+    pub fn is_exhausted(&self) -> bool {
+        self.finished
     }
 }
 
@@ -461,19 +502,30 @@ impl Memtable {
         &'a self,
         snapshot: &Snapshot,
     ) -> MemtableVisibleVersionCursor<'a> {
-        let leaves = self
+        let mut leaves: Vec<LeafVersions<'a>> = self
             .frozen
             .iter()
             .map(|segment| segment.tree.leaf_versions_iter())
             .chain(std::iter::once(self.active.tree.leaf_versions_iter()))
             .collect();
+        let mut heap = BinaryHeap::new();
+        for (index, leaf) in leaves.iter_mut().enumerate() {
+            if let Some(row) = leaf.next() {
+                heap.push(MemHead {
+                    rid: row.row_id,
+                    epoch: row.committed_epoch,
+                    index: index as u32,
+                    row,
+                });
+            }
+        }
         MemtableVisibleVersionCursor {
             leaves,
-            leaf_index: 0,
+            heap,
             snapshot: *snapshot,
-            current_row_id: None,
-            best: None,
             finished: false,
+            last_examined: 0,
+            peak_examined: 0,
         }
     }
 

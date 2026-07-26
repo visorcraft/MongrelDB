@@ -21,7 +21,8 @@ use crate::epoch::{Epoch, Snapshot};
 use crate::memtable::Row;
 use crate::pma::Pma;
 use crate::rowid::RowId;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 
 /// Composite version key — identical to the memtable's, so all versions of one
@@ -205,43 +206,29 @@ impl MutableRun {
         snapshot: &Snapshot,
     ) -> MutableRunVisibleVersionCursor<'a> {
         let snap = *snapshot;
-        // Accumulate only the current-newest-visible per `RowId`; borrowed refs
-        // keep the per-entry cost at one (rid, epoch, &row) tuple — no row
-        // bytes cloned. Once a `RowId`'s newest is determined (no later
-        // visible version can displace it under the snapshot's authority),
-        // the entry is final; the `BTreeMap` therefore only ever holds at
-        // most one entry per distinct `RowId`.
-        let mut by_row: BTreeMap<
-            RowId,
-            (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, &'a Row),
-        > = BTreeMap::new();
-        for pma in self
+        let mut sources: Vec<Box<dyn Iterator<Item = &'a (VersionKey, Row)> + 'a>> = self
             .frozen
             .iter()
-            .map(|segment| &segment.pma)
-            .chain(std::iter::once(&self.active.pma))
-        {
-            for ((_rid, _epoch), row) in pma.iter() {
-                if !snap.observes_row(row.committed_epoch, row.commit_ts) {
-                    continue;
-                }
-                by_row
-                    .entry(row.row_id)
-                    .and_modify(|existing| {
-                        if Snapshot::version_is_newer(
-                            row.committed_epoch,
-                            row.commit_ts,
-                            existing.0,
-                            existing.1,
-                        ) {
-                            *existing = (row.committed_epoch, row.commit_ts, row);
-                        }
-                    })
-                    .or_insert_with(|| (row.committed_epoch, row.commit_ts, row));
+            .map(|segment| Box::new(segment.pma.iter()) as Box<_>)
+            .chain(std::iter::once(Box::new(self.active.pma.iter()) as Box<_>))
+            .collect();
+        let mut heap = BinaryHeap::new();
+        for (index, source) in sources.iter_mut().enumerate() {
+            if let Some(((rid, _epoch), row)) = source.next() {
+                heap.push(PmaHead {
+                    rid: *rid,
+                    index,
+                    row,
+                });
             }
         }
         MutableRunVisibleVersionCursor {
-            inner: by_row.into_iter(),
+            sources,
+            heap,
+            snapshot: snap,
+            current: None,
+            last_examined: 0,
+            peak_examined: 0,
         }
     }
 
@@ -306,25 +293,98 @@ impl MutableRun {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PmaHead<'a> {
+    rid: RowId,
+    index: usize,
+    row: &'a Row,
+}
+
+impl PartialEq for PmaHead<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.rid, self.index) == (other.rid, other.index)
+    }
+}
+impl Eq for PmaHead<'_> {}
+impl PartialOrd for PmaHead<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PmaHead<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (other.rid, other.index).cmp(&(self.rid, self.index))
+    }
+}
+
 /// Borrowing cursor produced by [`MutableRun::newest_visible_iter`].
 /// Yields `(RowId, Epoch, &Row)` tuples in ascending `RowId` order, one tuple
 /// per `RowId` — the newest visible version under the snapshot at cursor
 /// construction. The `&Row` borrows from the underlying `Pma`; do not retain
 /// the reference past the cursor or past any mutation of the `MutableRun`.
 pub struct MutableRunVisibleVersionCursor<'a> {
-    inner: std::collections::btree_map::IntoIter<
-        RowId,
-        (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, &'a Row),
-    >,
+    sources: Vec<Box<dyn Iterator<Item = &'a (VersionKey, Row)> + 'a>>,
+    heap: BinaryHeap<PmaHead<'a>>,
+    snapshot: Snapshot,
+    current: Option<(RowId, Epoch, &'a Row)>,
+    /// Number of source versions examined during the last `next()` call.
+    pub(crate) last_examined: usize,
+    /// Peak `last_examined` across all calls so far.
+    pub(crate) peak_examined: usize,
 }
 
 impl<'a> Iterator for MutableRunVisibleVersionCursor<'a> {
     type Item = (RowId, Epoch, &'a Row);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|(rid, (epoch, _ts, row))| (rid, epoch, row))
+        if let Some(current) = self.current.take() {
+            return Some(current);
+        }
+        self.last_examined = 0;
+        let PmaHead { rid, index, row } = self.heap.pop()?;
+        self.last_examined += 1;
+        if let Some(((next_rid, _), next_row)) = self.sources[index].next() {
+            self.heap.push(PmaHead {
+                rid: *next_rid,
+                index,
+                row: next_row,
+            });
+        }
+        let mut best = if self
+            .snapshot
+            .observes_row(row.committed_epoch, row.commit_ts)
+        {
+            Some(row)
+        } else {
+            None
+        };
+        while self.heap.peek().is_some_and(|h| h.rid == rid) {
+            let head = self.heap.pop().unwrap();
+            self.last_examined += 1;
+            if let Some(((next_rid, _), next_row)) = self.sources[head.index].next() {
+                self.heap.push(PmaHead {
+                    rid: *next_rid,
+                    index: head.index,
+                    row: next_row,
+                });
+            }
+            if self
+                .snapshot
+                .observes_row(head.row.committed_epoch, head.row.commit_ts)
+                && best.is_none_or(|current| {
+                    Snapshot::version_is_newer(
+                        head.row.committed_epoch,
+                        head.row.commit_ts,
+                        current.committed_epoch,
+                        current.commit_ts,
+                    )
+                })
+            {
+                best = Some(head.row);
+            }
+        }
+        self.peak_examined = self.peak_examined.max(self.last_examined);
+        best.map(|row| (row.row_id, row.committed_epoch, row))
     }
 }
 

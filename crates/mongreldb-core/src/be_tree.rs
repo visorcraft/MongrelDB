@@ -30,7 +30,7 @@ type VKey = (RowId, Epoch);
 
 /// A pending mutation pending application to the leaves below a node.
 #[derive(Debug, Clone)]
-enum Message {
+pub(crate) enum Message {
     Upsert(Row),
     Tombstone { row_id: RowId, epoch: Epoch },
 }
@@ -61,7 +61,7 @@ impl Message {
 }
 
 #[derive(Clone)]
-enum Node {
+pub(crate) enum Node {
     Leaf {
         rows: Vec<Row>,
     },
@@ -83,71 +83,63 @@ struct Split {
     node: Node,
 }
 
-/// Walks every row reachable from a `BeTree` root: buffered messages at every
-/// internal node (which have not yet been flushed to children) **plus** the
-/// consolidated leaf rows.
-///
-/// The pre-fix version walked only consolidated leaves, which silently dropped
-/// mutations that were still sitting in an internal-node buffer — visible to
-/// point lookups (which descend root→buffer) but invisible to a full scan.
-/// Buffered `Message::Upsert` rows are yielded as `Cow::Borrowed` (zero-copy,
-/// they live in the buffer); buffered `Message::Tombstone` rows are
-/// synthesized into a `Row` and yielded as `Cow::Owned` because the buffer
-/// only carries `(row_id, epoch)`. The owning cursor must accept both
-/// variants — see [`crate::memtable::MemtableVisibleVersionCursor`].
+/// Walks every row reachable from a `BeTree` root in ascending
+/// `(RowId, Epoch)` order. At construction we walk the tree depth-first
+/// (smallest child first), collect buffered messages and leaf rows into
+/// per-node sorted `Vec`s, and emit a single ascending stream. The build
+/// is `O(mutations)` time; the iterator is then a plain drain of the
+/// prebuilt buffer, so the streaming cost is one element at a time.
 pub(crate) struct LeafVersions<'a> {
-    nodes: Vec<&'a Node>,
-    buffer: Option<std::slice::Iter<'a, Message>>,
-    rows: Option<&'a [Row]>,
+    /// Pre-sorted concatenation of every buffered message and leaf row,
+    /// stored as `Cow<'a, Row>` to avoid cloning leaf row data.
+    iter: std::vec::IntoIter<Cow<'a, Row>>,
+}
+
+impl<'a> LeafVersions<'a> {
+    pub(crate) fn new(root: &'a Node) -> Self {
+        let mut out: Vec<Cow<'a, Row>> = Vec::new();
+        collect_in_order(root, &mut out);
+        out.sort_by_key(|a| (a.row_id, a.committed_epoch));
+        Self {
+            iter: out.into_iter(),
+        }
+    }
+}
+
+fn collect_in_order<'a>(node: &'a Node, out: &mut Vec<Cow<'a, Row>>) {
+    match node {
+        Node::Leaf { rows } => {
+            for row in rows {
+                out.push(Cow::Borrowed(row));
+            }
+        }
+        Node::Internal {
+            children, buffer, ..
+        } => {
+            for msg in buffer {
+                out.push(match msg {
+                    Message::Upsert(row) => Cow::Borrowed(row),
+                    Message::Tombstone { row_id, epoch } => Cow::Owned(Row {
+                        row_id: *row_id,
+                        committed_epoch: *epoch,
+                        columns: HashMap::new(),
+                        deleted: true,
+                        commit_ts: None,
+                    }),
+                });
+            }
+            for child in children {
+                collect_in_order(child, out);
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for LeafVersions<'a> {
     type Item = Cow<'a, Row>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Drain the current node's buffered messages first: buffer rows
-            // are "in flight" and will eventually land in a leaf, but they're
-            // live visible versions right now and must not be skipped.
-            if let Some(buf) = self.buffer.as_mut() {
-                if let Some(msg) = buf.next() {
-                    return Some(match msg {
-                        Message::Upsert(row) => Cow::Borrowed(row),
-                        Message::Tombstone { row_id, epoch } => Cow::Owned(Row {
-                            row_id: *row_id,
-                            committed_epoch: *epoch,
-                            columns: HashMap::new(),
-                            deleted: true,
-                            commit_ts: None,
-                        }),
-                    });
-                }
-                self.buffer = None;
-            }
-            // Then drain any pending leaf rows for the current node.
-            if let Some(rows) = self.rows.take() {
-                if let Some((row, rest)) = rows.split_first() {
-                    self.rows = Some(rest);
-                    return Some(Cow::Borrowed(row));
-                }
-            }
-            // Pop the next node and prime the buffer / leaf / child stack.
-            let node = self.nodes.pop()?;
-            match node {
-                Node::Leaf { rows } => self.rows = Some(rows),
-                Node::Internal {
-                    children, buffer, ..
-                } => {
-                    if !buffer.is_empty() {
-                        self.buffer = Some(buffer.iter());
-                    }
-                    // Children are pushed in reverse so the smallest key
-                    // comes first (matches the leaf ordering the original
-                    // iterator used to yield).
-                    self.nodes.extend(children.iter().rev());
-                }
-            }
-        }
+        self.iter.next()
     }
 }
 
@@ -244,11 +236,7 @@ impl BeTree {
     }
 
     pub(crate) fn leaf_versions_iter(&self) -> LeafVersions<'_> {
-        LeafVersions {
-            nodes: vec![&self.root],
-            buffer: None,
-            rows: None,
-        }
+        LeafVersions::new(&self.root)
     }
 
     /// Every buffered version (non-consuming), in no defined order — leaves
