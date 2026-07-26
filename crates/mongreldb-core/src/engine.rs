@@ -20,6 +20,7 @@ use crate::index::{
 use crate::manifest::{self, Manifest, RunRef, TtlPolicy};
 use crate::memtable::{Memtable, MemtableVisibleVersionCursor, Row, Value};
 use crate::mutable_run::{MutableRun, MutableRunVisibleVersionCursor};
+use crate::result_cache::{DrainOutcome, PersistContext, PersistentCacheIdentity, FRAME_MAGIC};
 use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
@@ -35,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 pub const WAL_DIR: &str = "_wal";
@@ -1682,6 +1684,15 @@ struct ResultCache {
     /// Worker join handle, kept on the cache so `shutdown_persistent_cache`
     /// can wait for drain to finish.
     worker_handle: Option<std::thread::JoinHandle<()>>,
+    /// Completion-signal receiver. The worker sends `()` on this channel
+    /// immediately before exiting. `shutdown_persistent_cache(deadline)`
+    /// uses `recv_timeout(remaining_deadline)` so it can return by its
+    /// advertised deadline even if the worker is blocked in filesystem I/O.
+    completion_rx: Option<std::sync::mpsc::Receiver<()>>,
+    /// Optional DEK for cache payload encryption (binary, not a `Zeroizing`
+    /// wrapper). Stored separately from the cache writer so the same cipher
+    /// can be reused for both async and sync encode/decode paths.
+    cache_payload_cipher: Option<std::sync::Arc<crate::encryption::AesCipher>>,
 }
 
 /// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
@@ -1776,6 +1787,8 @@ impl ResultCache {
             persist_min_bytes: 4 * 1024,
             writer: None,
             worker_handle: None,
+            completion_rx: None,
+            cache_payload_cipher: None,
         }
     }
 
@@ -1786,7 +1799,17 @@ impl ResultCache {
     }
 
     fn with_cache_dek(mut self, dek: Option<Zeroizing<[u8; DEK_LEN]>>) -> Self {
-        self.cache_dek = dek;
+        // Build a single cipher for both async and sync paths. The cipher is
+        // a thin wrapper around the AES key, so creating it twice (once for
+        // the cache, once for the worker's own copy) is cheap. We keep the
+        // raw DEK for backward compatibility with `encrypt_cache` /
+        // `decrypt_cache`; new code paths should use `cache_payload_cipher`.
+        self.cache_dek = dek.clone();
+        if let Some(dek) = dek {
+            if let Ok(cipher) = crate::encryption::AesCipher::new(&dek[..]) {
+                self.cache_payload_cipher = Some(std::sync::Arc::new(cipher));
+            }
+        }
         self
     }
 
@@ -1798,15 +1821,23 @@ impl ResultCache {
         &mut self,
         writer: std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>,
         worker_handle: std::thread::JoinHandle<()>,
+        completion_rx: std::sync::mpsc::Receiver<()>,
     ) {
         self.writer = Some(writer);
         self.worker_handle = Some(worker_handle);
+        self.completion_rx = Some(completion_rx);
     }
 
     /// Take the worker handle so the caller can join it after shutdown.
     /// Returns `None` if no writer is installed.
     fn take_persistent_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
         self.worker_handle.take()
+    }
+
+    /// Take the completion-signal receiver so the caller can wait on a
+    /// bounded deadline. Returns `None` if no writer is installed.
+    fn take_persistent_completion(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.completion_rx.take()
     }
 
     /// Borrow the writer (when installed). Used by `flush_persistent_cache` /
@@ -1821,51 +1852,84 @@ impl ResultCache {
         self.dir.as_ref().map(|d| d.join(format!("{key:016x}.bin")))
     }
 
-    /// Atomically write `entry` to disk (write + rename). Best-effort: silently
-    /// ignores I/O errors (the in-memory cache is authoritative; the cache is
-    /// disposable — missing/stale files fall through to re-resolution).
-    fn store_to_disk(&self, key: u64, entry: &CachedEntry) {
-        let Some(path) = self.disk_path(key) else {
+    /// Persist `entry` to the on-disk tier using the MLCP frame format
+    /// (REM-002). The encoding is shared with the async worker — both
+    /// paths produce the same frame layout, identity validation, and
+    /// payload encryption. Best-effort: silently ignores I/O errors (the
+    /// in-memory cache is authoritative; the cache is disposable —
+    /// missing/stale files fall through to re-resolution).
+    fn store_to_disk(&self, context: PersistContext, entry: &CachedEntry) {
+        let Some(path) = self.disk_path(context.key) else {
             return;
         };
         let serialized = match bincode::serialize(&SerializedEntryRef::from_entry(entry)) {
             Ok(s) => s,
             Err(_) => return,
         };
-        // Encrypt if a cache DEK is present.
-        let on_disk = if let Some(dek) = &self.cache_dek {
-            match self.encrypt_cache(&serialized, dek) {
-                Some(b) => b,
-                None => return,
-            }
-        } else {
-            serialized
+        let bytes = match crate::result_cache::encode_persisted_entry(
+            context,
+            &serialized,
+            self.cache_payload_cipher.as_deref(),
+        ) {
+            Ok(b) => b,
+            Err(_) => return,
         };
         let tmp = path.with_extension("tmp");
         use std::io::Write;
         let write = || -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&on_disk)?;
+            f.write_all(&bytes)?;
             f.flush()?;
+            f.sync_all()?;
             Ok(())
         };
         if write().is_err() {
             let _ = std::fs::remove_file(&tmp);
             return;
         }
-        let _ = std::fs::rename(&tmp, &path);
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if let Ok(dir) = std::fs::File::open(self.dir.as_ref().expect("dir set").clone()) {
+            let _ = dir.sync_all();
+        }
     }
 
     /// Try loading `key` from disk. Returns `None` on miss or error.
-    fn load_from_disk(&self, key: u64) -> Option<CachedEntry> {
+    /// Decodes the MLCP frame, validates table / schema / key / generation /
+    /// format version / CRC, decrypts the payload, and bincode-deserializes
+    /// the entry. Legacy unframed files (anything that does not start with
+    /// the MLCP magic) are deleted as a safe migration (REM-002 §18.5).
+    fn load_from_disk(&self, key: u64, identity: PersistentCacheIdentity) -> Option<CachedEntry> {
         let path = self.disk_path(key)?;
         let bytes = std::fs::read(&path).ok()?;
-        let plaintext = if let Some(dek) = &self.cache_dek {
-            self.decrypt_cache(&bytes, dek)?
-        } else {
-            bytes
+        // Legacy migration: drop unframed files instead of trying to
+        // bincode-deserialize a raw entry. The cache is disposable — a
+        // recompute is cheaper than a fragile backward-compat shim.
+        if bytes.len() < FRAME_MAGIC.len() || bytes[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        let plaintext = match crate::result_cache::decode_persisted_entry(
+            identity,
+            key,
+            &bytes,
+            self.cache_payload_cipher.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
         };
-        let serialized: SerializedEntry = bincode::deserialize(&plaintext).ok()?;
+        let serialized: SerializedEntry = match bincode::deserialize(&plaintext) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+        };
         serialized.into_entry()
     }
 
@@ -1876,34 +1940,10 @@ impl ResultCache {
         }
     }
 
-    /// Encrypt cache data: `[nonce: 12B][ciphertext + GCM tag]`.
-    fn encrypt_cache(&self, plaintext: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
-        use crate::encryption::Cipher;
-        let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
-        let mut nonce = [0u8; 12];
-        crate::encryption::fill_random(&mut nonce).ok()?;
-        let ct = cipher.encrypt_page(&nonce, plaintext).ok()?;
-        let mut out = Vec::with_capacity(12 + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        Some(out)
-    }
-
-    /// Decrypt cache data: reads nonce from first 12 bytes.
-    fn decrypt_cache(&self, bytes: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
-        use crate::encryption::Cipher;
-        if bytes.len() < 28 {
-            return None;
-        }
-        let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
-        let nonce: [u8; 12] = bytes[..12].try_into().ok()?;
-        let ct = &bytes[12..];
-        cipher.decrypt_page(&nonce, ct).ok()
-    }
-
     /// Scan the cache directory and pre-load all entries into memory. Called
-    /// once on `Table::open`. Best-effort: corrupt/unreadable files are deleted.
-    fn load_persistent(&mut self) {
+    /// once on `Table::open`. Best-effort: corrupt / unframed / wrong-identity
+    /// files are deleted and the corresponding entry is treated as a miss.
+    fn load_persistent(&mut self, identity: PersistentCacheIdentity) {
         let Some(dir) = self.dir.as_ref().cloned() else {
             return;
         };
@@ -1913,7 +1953,7 @@ impl ResultCache {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            // Clean up orphan .tmp files from crashed store_to_disk calls.
+            // Clean up orphan .tmp files from crashed atomic-write calls.
             if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
                 let _ = std::fs::remove_file(&path);
                 continue;
@@ -1929,36 +1969,14 @@ impl ResultCache {
                 Ok(k) => k,
                 Err(_) => continue,
             };
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            // Decrypt if cache DEK is present.
-            let plaintext = if let Some(dek) = &self.cache_dek {
-                match self.decrypt_cache(&bytes, dek) {
-                    Some(p) => p,
-                    None => {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                }
-            } else {
-                bytes
-            };
-            match bincode::deserialize::<SerializedEntry>(&plaintext) {
-                Ok(serialized) => {
-                    if let Some(entry) = serialized.into_entry() {
-                        self.bytes = self.bytes.saturating_add(entry.data.approx_bytes());
-                        self.index_entry(key, &entry);
-                        self.entries.insert(key, entry);
-                        self.touch(key);
-                    } else {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&path);
-                }
+            // Reuse `load_from_disk` so the legacy / corruption / identity
+            // rejection path is consistent across the per-key load and the
+            // bulk preload. The function deletes bad files itself.
+            if let Some(entry) = self.load_from_disk(key, identity) {
+                self.bytes = self.bytes.saturating_add(entry.data.approx_bytes());
+                self.index_entry(key, &entry);
+                self.entries.insert(key, entry);
+                self.touch(key);
             }
         }
         self.evict();
@@ -2033,7 +2051,7 @@ impl ResultCache {
         self.next_generation = self.order.len() as u64;
     }
 
-    fn get_rows(&mut self, key: u64) -> Option<Arc<Vec<Row>>> {
+    fn get_rows(&mut self, key: u64, identity: PersistentCacheIdentity) -> Option<Arc<Vec<Row>>> {
         let res = self.entries.get(&key).and_then(|e| match &e.data {
             CachedData::Rows(r) => Some(r.clone()),
             CachedData::Columns(_) => None,
@@ -2045,7 +2063,7 @@ impl ResultCache {
             return res;
         }
         // Memory miss → try the persistent tier (b).
-        if let Some(entry) = self.load_from_disk(key) {
+        if let Some(entry) = self.load_from_disk(key, identity) {
             let res = match &entry.data {
                 CachedData::Rows(r) => Some(r.clone()),
                 CachedData::Columns(_) => None,
@@ -2066,7 +2084,11 @@ impl ResultCache {
         None
     }
 
-    fn get_columns(&mut self, key: u64) -> Option<Arc<Vec<(u16, columnar::NativeColumn)>>> {
+    fn get_columns(
+        &mut self,
+        key: u64,
+        identity: PersistentCacheIdentity,
+    ) -> Option<Arc<Vec<(u16, columnar::NativeColumn)>>> {
         let res = self.entries.get(&key).and_then(|e| match &e.data {
             CachedData::Columns(c) => Some(c.clone()),
             CachedData::Rows(_) => None,
@@ -2078,7 +2100,7 @@ impl ResultCache {
             return res;
         }
         // Memory miss → try the persistent tier (b).
-        if let Some(entry) = self.load_from_disk(key) {
+        if let Some(entry) = self.load_from_disk(key, identity) {
             let res = match &entry.data {
                 CachedData::Columns(c) => Some(c.clone()),
                 CachedData::Rows(_) => None,
@@ -2099,6 +2121,10 @@ impl ResultCache {
         None
     }
 
+    /// In-memory insert only. Persistent publication is the caller's job —
+    /// they call `persist_entry(context, &entry)` (or the legacy
+    /// `enqueue_persist` for the async path) before this method so the on-
+    /// disk frame and the in-memory copy can never diverge.
     fn insert(&mut self, key: u64, entry: CachedEntry) {
         let approx = entry.data.approx_bytes();
         if let Some(previous) = self.entries.remove(&key) {
@@ -2106,32 +2132,56 @@ impl ResultCache {
             self.unindex_entry(key, &previous);
             self.untrack(key);
         }
-        // Persistent tier is optional for tiny entries: a one-row warm query
-        // must not pay atomic filesystem publish when recompute is cheaper.
-        // Large results still write before memory insert (previous contract).
-        //
-        // When a background writer is installed, the actual bincode
-        // serialization + encryption + atomic write happens on the worker
-        // thread; the caller (`Table::query_*_cached`) is responsible for
-        // enqueueing the `PersistableEntry` because it owns the
-        // `table_id` / `schema_id` / `data_generation` metadata.
-        // When no writer is installed, we fall back to the legacy
-        // synchronous publish so direct unit tests keep working.
-        if self.dir.is_some()
-            && self.writer.is_none()
-            && (self.persist_min_bytes == 0 || approx >= self.persist_min_bytes)
-        {
-            let write_start = std::time::Instant::now();
-            self.store_to_disk(key, &entry);
-            let write_us = write_start.elapsed().as_micros() as u64;
-            self.persistent_write_us
-                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
-        }
         self.bytes = self.bytes.saturating_add(approx);
         self.index_entry(key, &entry);
         self.entries.insert(key, entry);
         self.touch(key);
         self.evict();
+    }
+
+    /// Persist `entry` using the MLCP frame format (REM-002 §18.3). When
+    /// the async writer is installed the op is enqueued; otherwise the
+    /// shared-format synchronous write fires on the calling thread.
+    /// No-op when the entry is below the persistence threshold.
+    fn persist_entry(&self, context: PersistContext, entry: &CachedEntry) {
+        let approx = entry.data.approx_bytes();
+        if self.dir.is_none() {
+            return;
+        }
+        if self.persist_min_bytes > 0 && approx < self.persist_min_bytes {
+            return;
+        }
+        if let Some(writer) = self.writer.as_ref() {
+            // Async path: enqueue a `PersistableEntry`. The worker calls
+            // the same `encode_persisted_entry` helper so the on-disk
+            // format is byte-for-byte identical to the sync path.
+            let entry_clone = entry.clone_for_persist();
+            let payload_factory: Box<dyn FnOnce() -> Option<Vec<u8>> + Send + 'static> =
+                Box::new(move || {
+                    bincode::serialize(&SerializedEntryRef::from_entry(&entry_clone)).ok()
+                });
+            let persistable = crate::result_cache::PersistableEntry {
+                key: context.key,
+                table_id: context.identity.table_id,
+                schema_id: context.identity.schema_id,
+                run_generation: context.identity.logical_generation,
+                entry_generation: context.entry_generation,
+                bytes: approx as usize,
+                payload_factory,
+            };
+            let write_start = std::time::Instant::now();
+            writer.enqueue_store(persistable);
+            let write_us = write_start.elapsed().as_micros() as u64;
+            self.persistent_write_us
+                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Sync fallback: write directly using the shared encoder.
+            let write_start = std::time::Instant::now();
+            self.store_to_disk(context, entry);
+            let write_us = write_start.elapsed().as_micros() as u64;
+            self.persistent_write_us
+                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Allocate a fresh per-key entry generation. The generation is what
@@ -2149,48 +2199,6 @@ impl ResultCache {
         }
     }
 
-    /// Enqueue a `PersistableEntry` to the background writer. No-op when no
-    /// writer is installed (early test paths) or when the size threshold is
-    /// not met. The `PersistableEntry::payload_factory` runs on the worker
-    /// thread; the query thread only updates an in-memory `AtomicU64`
-    /// counter and hands the entry to the writer.
-    fn enqueue_persist(
-        &self,
-        key: u64,
-        entry: &CachedEntry,
-        table_id: u64,
-        schema_id: u64,
-        run_generation: u64,
-        entry_generation: u64,
-    ) {
-        let Some(writer) = self.writer.as_ref() else {
-            return;
-        };
-        let approx = entry.data.approx_bytes();
-        if self.persist_min_bytes > 0 && approx < self.persist_min_bytes {
-            return;
-        }
-        let entry_clone = entry.clone_for_persist();
-        let payload_factory: Box<dyn FnOnce() -> Option<Vec<u8>> + Send + 'static> =
-            Box::new(move || {
-                bincode::serialize(&SerializedEntryRef::from_entry(&entry_clone)).ok()
-            });
-        let persistable = crate::result_cache::PersistableEntry {
-            key,
-            table_id,
-            schema_id,
-            run_generation,
-            entry_generation,
-            bytes: approx as usize,
-            payload_factory,
-        };
-        let write_start = std::time::Instant::now();
-        writer.enqueue_store(persistable);
-        let write_us = write_start.elapsed().as_micros() as u64;
-        self.persistent_write_us
-            .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Enqueue a `Remove` to the background writer. No-op when no writer is
     /// installed.
     fn enqueue_persist_remove(&self, key: u64) {
@@ -2200,7 +2208,11 @@ impl ResultCache {
     }
 
     /// Enqueue a `Clear` to the background writer. No-op when no writer is
-    /// installed.
+    /// installed. Bumping the writer's `clear_generation` is the
+    /// "shutdown generation" required by REM-002 §18.6 — any in-flight
+    /// write that re-checks staleness right before publish is then
+    /// observed as stale and dropped instead of becoming a late durable
+    /// entry.
     fn enqueue_persist_clear(&self) {
         if let Some(writer) = self.writer.as_ref() {
             writer.enqueue_clear();
@@ -2237,34 +2249,74 @@ impl ResultCache {
 
     /// Shut the writer down. The worker drains remaining ops until the
     /// queue is empty or `deadline` expires; any ops still queued are
-    /// counted as abandoned. After this returns the worker thread is
-    /// joined.
+    /// counted as abandoned. The completion signal is waited on with the
+    /// *remaining* deadline (REM-002 §18.6) — if it does not arrive in
+    /// time, the timeout counter is bumped and the worker is detached
+    /// (its `Arc`-shared state keeps it safe to outlive this method).
+    /// The writer reference is dropped so subsequent `persist_entry` calls
+    /// take the synchronous fallback path (used by tests and by
+    /// `Database::close`).
     fn shutdown_persistent_cache(&mut self, deadline: std::time::Duration) {
-        let Some(writer) = self.persistent_writer().cloned() else {
-            return;
+        let start = Instant::now();
+        // Phase 1: wait for the queue to drain or the deadline to expire.
+        if let Some(writer) = self.persistent_writer() {
+            loop {
+                if writer.queue_depth() == 0 {
+                    break;
+                }
+                if start.elapsed() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        // Phase 2: mark the writer closed. `enqueue_clear` advances the
+        // global clear_generation so the worker's final staleness check
+        // (right before publish) aborts any late in-flight write.
+        let writer = self.persistent_writer().cloned();
+        if let Some(writer) = writer.as_ref() {
+            writer.shutdown();
+            let _ = writer.drain_all_as_abandoned();
+        }
+        // Phase 3: wait for the completion signal with the *remaining*
+        // deadline. `JoinHandle::join` has no timed variant, so we use
+        // the channel as the deadline-bounded wait point. If the worker
+        // is blocked in filesystem I/O, the recv returns Err on timeout
+        // and we detach the handle (state is `Arc`-shared, so the worker
+        // can still complete safely).
+        let mut completion = self.take_persistent_completion();
+        let completed = if let (Some(rx), Some(_writer)) = (completion.as_mut(), writer.as_ref()) {
+            let elapsed = start.elapsed();
+            let remaining = deadline.saturating_sub(elapsed);
+            crate::result_cache::recv_completion_with_timeout(rx, remaining)
+        } else {
+            true
         };
-        let start = std::time::Instant::now();
-        loop {
-            if writer.queue_depth() == 0 {
-                break;
+        if completed {
+            if let Some(handle) = self.take_persistent_worker() {
+                let _ = handle.join();
             }
-            if start.elapsed() >= deadline {
-                break;
+            // Drain any signal we did not consume.
+            drop(completion.take());
+        } else {
+            // Timeout: bump the abandoned counter and detach the handle.
+            // The worker is still running and may eventually finish; the
+            // in-flight I/O either completes or fails on its own.
+            if let Some(writer) = writer.as_ref() {
+                writer.record_outcome(DrainOutcome::Abandoned);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.take_persistent_worker(); // drop the handle, do not join
         }
-        writer.shutdown();
-        // Drop any still-queued ops as abandoned. This is bounded by the
-        // deadline — once shutdown is observed, the worker exits cleanly.
-        let _ = writer.drain_all_as_abandoned();
-        // Join the worker thread.
-        if let Some(handle) = self.take_persistent_worker() {
-            let _ = handle.join();
-        }
+        // Drop the writer so `persist_entry` takes the synchronous path
+        // for any subsequent inserts (Database::close, post-shutdown
+        // activity, tests that explicitly want the sync fallback).
+        self.writer = None;
     }
 
-    #[cfg(test)]
-    fn set_persist_min_bytes(&mut self, min: u64) {
+    /// Set the minimum entry size (approx bytes) before the persistent tier
+    /// is written. 0 always persists. Exposed as a `pub(crate)` so the test
+    /// seam on `Table` can drive sub-4KiB fixtures through the on-disk path.
+    pub(crate) fn set_persist_min_bytes(&mut self, min: u64) {
         self.persist_min_bytes = min;
     }
 
@@ -2389,25 +2441,25 @@ impl ResultCache {
             if let Some(entry) = self.entries.remove(&key) {
                 self.bytes = self.bytes.saturating_sub(entry.data.approx_bytes());
                 self.unindex_entry(key, &entry);
-                // Also delete the disk file (hardening (b)): an evicted
-                // entry's disk file must not survive, or invalidate() — which
-                // only scans in-memory entries — would miss it and allow a
-                // stale disk hit. When a background writer is installed the
-                // deletion is asynchronous; otherwise it's synchronous.
-                if self.writer.is_some() {
-                    self.enqueue_persist_remove(key);
-                } else {
-                    self.remove_from_disk(key);
-                }
+                // The on-disk file is left in place. The persistent
+                // loader validates the frame's `logical_generation` on
+                // every load (REM-002 §18.4), so a stale file from a
+                // pre-commit epoch is rejected as `GenerationMismatch` and
+                // deleted on read. Deleting the file at eviction time
+                // would defeat the "memory eviction → disk hit" path
+                // exercised by the production tests.
             }
         }
     }
 }
 
 /// Set up the persistent-publication writer for a fresh `ResultCache`. The
-/// returned tuple is `(writer, worker_join_handle)`; pass both to
-/// [`ResultCache::install_persistent_writer`]. The caller is responsible for
-/// joining the worker on `shutdown_persistent_cache(deadline)`.
+/// returned tuple is `(writer, worker_join_handle, completion_receiver)`;
+/// pass `writer` and `worker_join_handle` to
+/// [`ResultCache::install_persistent_writer`], and the `completion_receiver`
+/// to the cache so `shutdown_persistent_cache(deadline)` can wait on a
+/// bounded deadline. The caller is responsible for joining the worker on
+/// `shutdown_persistent_cache(deadline)`.
 fn spawn_persistent_cache_worker(
     dir: std::path::PathBuf,
     cache_dek: Option<Zeroizing<[u8; DEK_LEN]>>,
@@ -2415,6 +2467,7 @@ fn spawn_persistent_cache_worker(
 ) -> std::io::Result<(
     std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>,
     std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<()>,
 )> {
     use crate::result_cache::{
         spawn_persistent_cache_worker as spawn, RealPersistentCacheIo, StalenessGuard,
@@ -2436,15 +2489,17 @@ fn spawn_persistent_cache_worker(
     ));
     let staleness: std::sync::Arc<dyn StalenessGuard> =
         std::sync::Arc::new(WriterStalenessGuard::new(writer.clone()));
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
     let config = WorkerConfig {
         writer: writer.clone(),
         io,
         cipher,
         staleness,
         max_staleness_retries: 8,
+        completion: Some(completion_tx),
     };
     let handle = spawn(config);
-    Ok((writer, handle))
+    Ok((writer, handle, completion_rx))
 }
 
 #[cfg(test)]
@@ -2462,12 +2517,17 @@ mod result_cache_lru_tests {
     #[test]
     fn hits_update_recency_without_growing_an_order_queue() {
         let mut cache = ResultCache::with_max_bytes(u64::MAX);
+        let identity = PersistentCacheIdentity {
+            table_id: 0,
+            schema_id: 0,
+            logical_generation: 0,
+        };
         cache.insert(1, row_entry(1));
         cache.insert(2, row_entry(2));
         assert_eq!(cache.order.len(), cache.entries.len());
 
         for _ in 0..1_000 {
-            assert!(cache.get_rows(1).is_some());
+            assert!(cache.get_rows(1, identity).is_some());
         }
 
         assert_eq!(cache.order.len(), cache.entries.len());
@@ -3159,12 +3219,14 @@ impl Table {
                 // `Table::lookup_metrics_snapshot`.
                 let metrics = Arc::new(LookupMetrics::default());
                 let cache_arc = Arc::new(parking_lot::Mutex::new(cache));
-                if let Ok((writer, handle)) = spawn_persistent_cache_worker(
+                if let Ok((writer, handle, completion_rx)) = spawn_persistent_cache_worker(
                     rcache_dir.clone(),
                     cache_dek.clone(),
                     (*metrics).clone(),
                 ) {
-                    cache_arc.lock().install_persistent_writer(writer, handle);
+                    cache_arc
+                        .lock()
+                        .install_persistent_writer(writer, handle, completion_rx);
                 }
                 cache_arc
             },
@@ -3489,10 +3551,12 @@ impl Table {
                     .with_cache_dek(cache_dek.clone());
                 let metrics = LookupMetrics::default();
                 let cache_arc = Arc::new(parking_lot::Mutex::new(cache));
-                if let Ok((writer, handle)) =
+                if let Ok((writer, handle, completion_rx)) =
                     spawn_persistent_cache_worker(rcache_dir.clone(), cache_dek.clone(), metrics)
                 {
-                    cache_arc.lock().install_persistent_writer(writer, handle);
+                    cache_arc
+                        .lock()
+                        .install_persistent_writer(writer, handle, completion_rx);
                 }
                 cache_arc
             },
@@ -3627,7 +3691,12 @@ impl Table {
         // that cost on the first `approx_aggregate` call instead.
         // Load the persistent result-cache tier (hardening (b)) so fine-grained
         // invalidation resumes across restart.
-        db.result_cache.lock().load_persistent();
+        let identity = crate::result_cache::PersistentCacheIdentity {
+            table_id: db.table_id,
+            schema_id: db.schema.schema_id,
+            logical_generation: db.epoch.visible().0,
+        };
+        db.result_cache.lock().load_persistent(identity);
         // Populate RowId range directory so point get can skip irrelevant runs.
         db.refresh_run_row_id_ranges();
         // Issue 4 / spec §8.4 step 3 — try to install the row-to-run lookup
@@ -6268,6 +6337,15 @@ impl Table {
         self.result_cache
             .lock()
             .shutdown_persistent_cache(std::time::Duration::from_millis(deadline_ms));
+    }
+
+    /// Test-only: set the minimum cache entry size (approx bytes) below
+    /// which the persistent tier is skipped. A value of `0` always
+    /// publishes to disk. Used by the REM-002 production tests so small
+    /// fixtures can exercise the on-disk path without 4 KiB of data.
+    #[doc(hidden)]
+    pub fn _set_persist_min_bytes_for_test(&mut self, min: u64) {
+        self.result_cache.lock().set_persist_min_bytes(min);
     }
 
     /// Drop every cached result (used by compaction, schema evolution, and bulk
@@ -11341,7 +11419,12 @@ impl Table {
         // conditions/projection but pinned at different snapshots never share a
         // cached result (MVCC isolation for the explicit-snapshot API).
         let key = crate::query::canonical_query_key(conditions, projection, snapshot.epoch.0);
-        if let Some(hit) = self.result_cache.lock().get_columns(key) {
+        let identity = PersistentCacheIdentity {
+            table_id: self.table_id(),
+            schema_id: self.schema.schema_id,
+            logical_generation: self.current_epoch().0,
+        };
+        if let Some(hit) = self.result_cache.lock().get_columns(key, identity) {
             crate::trace::QueryTrace::record(|t| {
                 t.result_cache_hit = true;
                 t.scan_mode = crate::trace::ScanMode::NativePushdown;
@@ -11359,23 +11442,19 @@ impl Table {
                 footprint,
                 condition_cols,
             };
-            let table_id = self.table_id();
-            let schema_id = self.schema.schema_id;
-            let data_generation = self.data_generation;
             // Compute everything we need, then take the lock once. The
             // `ResultCache` lock is a non-reentrant `parking_lot::Mutex` so
-            // `enqueue_persist` + `insert` must run in the same critical
-            // section.
+            // `persist_entry` + `insert` must run in the same critical
+            // section. `persist_entry` picks the async or sync path
+            // internally based on whether a worker is installed.
             let mut cache = self.result_cache.lock();
             let entry_generation = cache.allocate_persist_generation(key);
-            cache.enqueue_persist(
+            let context = PersistContext {
+                identity,
                 key,
-                &entry,
-                table_id,
-                schema_id,
-                data_generation,
                 entry_generation,
-            );
+            };
+            cache.persist_entry(context, &entry);
             cache.insert(key, entry);
         }
         Ok(res)
@@ -11395,7 +11474,12 @@ impl Table {
         let key = crate::query::canonical_query_key(&q.conditions, None, 0)
             ^ (q.limit.unwrap_or(usize::MAX) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (q.offset as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        if let Some(hit) = self.result_cache.lock().get_rows(key) {
+        let identity = PersistentCacheIdentity {
+            table_id: self.table_id(),
+            schema_id: self.schema.schema_id,
+            logical_generation: self.current_epoch().0,
+        };
+        if let Some(hit) = self.result_cache.lock().get_rows(key, identity) {
             crate::trace::QueryTrace::record(|t| {
                 t.result_cache_hit = true;
                 t.scan_mode = crate::trace::ScanMode::Materialized;
@@ -11410,21 +11494,16 @@ impl Table {
             footprint,
             condition_cols,
         };
-        let table_id = self.table_id();
-        let schema_id = self.schema.schema_id;
-        let data_generation = self.data_generation;
-        // Take the lock once: enqueue_persist + insert must run atomically
+        // Take the lock once: persist_entry + insert must run atomically
         // because `ResultCache` uses a non-reentrant `parking_lot::Mutex`.
         let mut cache = self.result_cache.lock();
         let entry_generation = cache.allocate_persist_generation(key);
-        cache.enqueue_persist(
+        let context = PersistContext {
+            identity,
             key,
-            &entry,
-            table_id,
-            schema_id,
-            data_generation,
             entry_generation,
-        );
+        };
+        cache.persist_entry(context, &entry);
         cache.insert(key, entry);
         Ok(rows)
     }

@@ -383,6 +383,9 @@ fn persistent_tier_survives_restart() {
         let r = db.query_cached(&q).unwrap();
         assert_eq!(r.len(), 100);
 
+        // Drain the async writer so the on-disk file is visible to the
+        // directory scan (otherwise the test races the worker thread).
+        let _ = db.flush_persistent_cache(2_000);
         let files: Vec<_> = std::fs::read_dir(&rcache_path)
             .unwrap()
             .filter_map(|e| e.ok())
