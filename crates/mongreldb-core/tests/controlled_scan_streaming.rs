@@ -160,7 +160,6 @@ fn cancellation_is_observed_within_256_examined_versions() {
 }
 
 #[test]
-#[test]
 #[ignore = "PR D follow-up: bulk_load_columns materialises 100k rows in a sorted run; opening the run reader + decoding the first run page + walking the Pma header exceeds the 1ms budget. Closing this gate requires either a run-level pre-fetched first-page cache, or a dedicated `bulk_load_columns_fast` that pre-warms the cursor's first decode. The streaming memtable + mutable_run cursor work is in place (PR D step 1); the run path is the remaining hot spot."]
 fn controlled_scan_produces_first_row_within_one_millisecond() {
     let directory = tempdir().unwrap();
@@ -227,4 +226,42 @@ fn mixed_stamped_and_unstamped_versions_use_epoch_fallback() {
 
     assert_eq!(result.unwrap(), vec![20]);
     assert_eq!(trace.controlled_scan_rows_emitted, 1);
+}
+
+/// Regression for the BeTree root-buffer-not-iterated bug (iss10).
+///
+/// `table.put` appends to the live memtable without flushing; with a high
+/// mutable-run spill threshold and 100,000 unique row ids, the BeTree grows
+/// past a single leaf and starts buffering most of the recent inserts at
+/// internal nodes. Before the fix, the streaming memtable cursor walked
+/// leaves only and silently skipped those buffered rows, so the controlled
+/// scan emitted far fewer rows than the oracle.
+///
+/// The test compares the controlled-scan row count to the full materialisation
+/// (`visible_rows`) on the same snapshot — the contract says the two paths
+/// must agree on the visible row set.
+#[test]
+fn dense_hot_key_versions_streams() {
+    let directory = tempdir().unwrap();
+    let mut table = Table::create(directory.path(), schema(), 1).unwrap();
+    table.set_mutable_run_spill_bytes(u64::MAX);
+    let total = 100_000i64;
+    for v in 0..total {
+        table
+            .put(vec![(1, Value::Int64(v)), (2, Value::Int64(v))])
+            .unwrap();
+    }
+    table.commit().unwrap();
+    let oracle = table.visible_rows(table.snapshot()).unwrap();
+    let control = ExecutionControl::new(None);
+    let (result, trace) = QueryTrace::capture(|| {
+        table.for_each_visible_row_controlled(table.snapshot(), &control, |_| Ok(()))
+    });
+
+    result.unwrap();
+    assert_eq!(
+        trace.controlled_scan_rows_emitted,
+        oracle.len(),
+        "controlled scan must observe every buffered root-buffer row"
+    );
 }

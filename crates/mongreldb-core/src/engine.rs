@@ -28,6 +28,7 @@ use crate::txn::{GroupCommit, OwnedRow};
 use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
 use arc_swap::ArcSwap;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -91,7 +92,11 @@ fn derive_next_run_id(
 enum ControlledVisibleCandidate<'a> {
     Memory(Row),
     /// Newest-visible overlay row borrowed from the streaming memtable cursor.
-    Memtable(RowId, Epoch, &'a Row),
+    /// The cursor yields `Cow<'a, Row>` (borrowed for leaf and buffered-upsert
+    /// rows, owned for buffer tombstones that have to be synthesized on the
+    /// fly); this carries the lifetime parameter so the borrowing variant
+    /// stays zero-copy.
+    Memtable(RowId, Epoch, Cow<'a, Row>),
     /// Newest-visible overlay row borrowed from the streaming mutable-run cursor.
     MutableRun(RowId, Epoch, &'a Row),
     Run(RunVisibleVersion),
@@ -219,6 +224,7 @@ impl<'a> ControlledVisibleSource<'a> {
     /// Wrap a streaming memtable cursor — preferred hot-tier path when the
     /// memtable carries visible rows. Avoids the full `BTreeMap` materialisation
     /// that the `memory_from_map` fallback performs.
+    #[allow(dead_code)] // wired in once the hot tier switches to streaming
     fn memtable_cursor(cursor: MemtableVisibleVersionCursor<'a>) -> Self {
         Self {
             cursor: ControlledVisibleCursor::Memtable(cursor),
@@ -229,6 +235,7 @@ impl<'a> ControlledVisibleSource<'a> {
     /// Wrap a streaming mutable-run cursor — preferred hot-tier path when the
     /// mutable run carries visible rows. Avoids the full `BTreeMap` clone that
     /// the `memory_from_map` fallback performs.
+    #[allow(dead_code)] // wired in once the hot tier switches to streaming
     fn mutable_run_cursor(cursor: MutableRunVisibleVersionCursor<'a>) -> Self {
         Self {
             cursor: ControlledVisibleCursor::MutableRun(cursor),
@@ -315,7 +322,7 @@ impl<'a> ControlledVisibleSource<'a> {
     ) -> Result<Row> {
         match candidate {
             ControlledVisibleCandidate::Memory(row) => Ok(row),
-            ControlledVisibleCandidate::Memtable(_, _, row) => Ok(row.clone()),
+            ControlledVisibleCandidate::Memtable(_, _, row) => Ok(row.into_owned()),
             ControlledVisibleCandidate::MutableRun(_, _, row) => Ok(row.clone()),
             ControlledVisibleCandidate::Run(version) => match &mut self.cursor {
                 ControlledVisibleCursor::Run(cursor) => cursor.materialize(version, control),
@@ -9200,9 +9207,7 @@ impl Table {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
-                        RowIdSet::from_unsorted(
-                            li.range(*lo, *hi).into_iter().collect(),
-                        )
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
                         // Multi-run: learned_range only covers run_refs[0]; a
                         // tombstone in a later run wouldn't strip its alive
@@ -9211,15 +9216,9 @@ impl Table {
                         // leaked rid would surface as a wrong hit. Fall through
                         // to the MVCC-aware multi-run path so deletes land in
                         // any run are honored.
-                        let mut multi =
-                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
                         if lo == hi {
-                            self.union_bitmap_point_i64(
-                                &mut multi,
-                                *column_id,
-                                *lo,
-                                snapshot,
-                            );
+                            self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
                         }
                         return Ok(multi);
                     }
