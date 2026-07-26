@@ -1,0 +1,167 @@
+# Prometheus alert rules for the MongrelDB HOT fallback observability surface.
+#
+# Hooked into Prometheus via the standard rules file mount:
+#   /etc/prometheus/rules.d/hot-fallback-alerts.yaml
+# or via the Prometheus operator's `PrometheusRule` CRD with `spec.groups`.
+#
+# The MongrelDB `/metrics` endpoint exposes the per-reason counter series
+# `hot_fallback_total{reason="..."}` (see `crates/mongreldb-server/src/metrics.rs`).
+# Each rule below targets one specific reason (or aggregate) with a threshold
+# and `for:` window that matches the documented runbook in
+# `docs/operations/hot-fallback.md`.
+
+groups:
+  - name: mongreldb-hot-fallback
+    interval: 30s
+    rules:
+      # Page on-call: any non-zero rate of `primary_key_mismatch` is a
+      # definite index-corruption signal. Threshold intentionally very low so
+      # a single occurrence trips the alert.
+      - alert: MongrelDBHotPrimaryKeyMismatch
+        expr: rate(hot_fallback_total{reason="primary_key_mismatch"}[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT primary-key mismatches detected"
+          description: |
+            HOT primary-key mismatches were observed at a rate of {{ $value | printf "%.4f" }} per
+            second over the last 5 minutes (threshold: 0.01/s for 2m). A non-zero rate of
+            `primary_key_mismatch` means the HOT map is pointing at a row whose materialized
+            PK does not match the requested PK — a definite index-corruption signal.
+            Action: page on-call and run `mongreldb-server table-rebuild-indexes <db_dir>`.
+          dashboard: mongreldb-hot-fallback
+
+      # Page on-call: stale `RowId` mappings are a sibling corruption signal
+      # to primary-key mismatch. The threshold matches the runbook
+      # (`stale_row_id > 0` → page on-call).
+      - alert: MongrelDBHotStaleRowId
+        expr: rate(hot_fallback_total{reason="stale_row_id"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT stale-row-id fallbacks detected"
+          description: |
+            Stale-RowId HOT fallbacks observed at {{ $value | printf "%.4f" }}/s over the last
+            5 minutes. The HOT map is pointing at a superseded `RowId`. Action: page on-call
+            and run `mongreldb-server table-rebuild-indexes <db_dir>`, then compare the HOT
+            mapping with the materialized PK via `mongreldb-server index-hot-compare`.
+
+      # Page on-call: index checkpoints being rejected on reopen means the
+      # durability layer is silently losing HOT map state. Run rebuild
+      # immediately; if rejected again, page — the checkpoint file may be
+      # corrupt.
+      - alert: MongrelDBHotCheckpointRejected
+        expr: rate(hot_fallback_total{reason="checkpoint_rejected"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT index checkpoint being rejected on reopen"
+          description: |
+            HOT index checkpoints were rejected at {{ $value | printf "%.4f" }}/s over the
+            last 5 minutes. Run `mongreldb-server table-rebuild-indexes <db_dir>`. If the
+            rejection persists, page on-call — the checkpoint file may be corrupt.
+
+      # Investigation: TTL-expired rows triggering the fallback path is
+      # *expected* for TTL workloads. The threshold filters out the steady
+      # state but catches a 5x spike that suggests a TTL policy mismatch
+      # (e.g., duration unit wrong).
+      - alert: MongrelDBHotTtlExpired
+        expr: rate(hot_fallback_total{reason="ttl_expired"}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT TTL-expired fallbacks are elevated"
+          description: |
+            TTL-expired HOT fallbacks observed at {{ $value | printf "%.4f" }}/s over the
+            last 5 minutes (threshold: 0.05/s for 5m). This is expected at a low rate for
+            TTL workloads; a sustained elevation usually means the TTL policy duration or
+            column is misconfigured. Run `mongreldb-cli index hot-compare <table> --pk=<pk>`
+            to confirm.
+
+      # Investigation: aggregate fallback rate. A current-snapshot workload
+      # should have *zero* fallbacks. Any sustained rate is a regression to
+      # investigate.
+      - alert: MongrelDBHotFallbackRateHigh
+        expr: rate(hot_lookup_fallback[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT fallback rate is elevated"
+          description: |
+            HOT fallbacks observed at {{ $value | printf "%.4f" }}/s over the last 5 minutes
+            (threshold: 0.1/s for 10m). On a current-snapshot workload the expected rate is
+            zero; sustained fallbacks suggest index drift. Capture a trace with
+            `mongreldb-server trace-query <db_dir>` to identify the dominant reason.
+
+      # Page on-call: when stale-row-id falls dominate the fallback mix the
+      # HOT map is structurally broken. Threshold is "stale-row-id accounts
+      # for > 50% of fallbacks sustained for 15 minutes".
+      - alert: MongrelDBHotFallbackStaleStoreRatio
+        expr: |
+          sum(rate(hot_fallback_total{reason="stale_row_id"}[5m]))
+            /
+          sum(rate(hot_fallback_total[5m]))
+            > 0.5
+        for: 15m
+        labels:
+          severity: critical
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT fallbacks are dominated by stale-row-id"
+          description: |
+            {{ $value | printf "%.2f" }} of HOT fallbacks are stale-row-id over the last
+            5 minutes (threshold: 0.5 sustained for 15m). The HOT map is structurally
+            broken. Action: page on-call and run `mongreldb-server table-rebuild-indexes
+            <db_dir>`.
+
+      # Investigation: a high rate of `missing_mapping` usually means the
+      # index was dropped or never built. The threshold is intentionally
+      # lenient; combine with `index_incomplete` to confirm.
+      - alert: MongrelDBHotMissingMappingClimb
+        expr: rate(hot_fallback_total{reason="missing_mapping"}[5m]) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT missing-mapping fallbacks are climbing"
+          description: |
+            Missing-mapping HOT fallbacks observed at {{ $value | printf "%.4f" }}/s over
+            the last 5 minutes (threshold: 0.1/s for 15m). Check the index schema for the
+            table; the HOT index may have been dropped, or a recent bulk-load reset
+            `indexes_complete`. Run `mongreldb-server index-checkpoint-state <db_dir>`.
+
+      # Investigation: long-running `index_incomplete` usually means a
+      # large orphan catalog. Pair with `hot_mapping_rebuild_total` to see
+      # if a rebuild is in progress.
+      - alert: MongrelDBHotIndexIncompleteLongRunning
+        expr: rate(hot_fallback_total{reason="index_incomplete"}[5m]) > 0.05
+        for: 30m
+        labels:
+          severity: warning
+          service: mongreldb
+          runbook: docs/operations/hot-fallback.md
+        annotations:
+          summary: "MongrelDB HOT index-incomplete fallback is long-running"
+          description: |
+            Index-incomplete HOT fallbacks observed at {{ $value | printf "%.4f" }}/s over
+            the last 5 minutes (threshold: 0.05/s for 30m). Long-running rebuilds usually
+            mean a large orphan catalog. Check `hot_mapping_rebuild_total` and the rebuild
+            log; consider `mongreldb-server table-rebuild-indexes <db_dir>`.

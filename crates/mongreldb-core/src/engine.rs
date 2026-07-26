@@ -3349,6 +3349,41 @@ impl Table {
         self.rebuild_indexes_from_runs_inner(None)
     }
 
+    /// Test-only fault-injection seam: install an arbitrary HOT mapping.
+    ///
+    /// Bypasses the per-row index maintenance path so regression tests for the
+    /// HOT fallback (issue 2) can deliberately corrupt the HOT map and assert
+    /// that the [`Self::resolve_pk_with_hot_fallback`] path still returns the
+    /// correct, scanned row instead of the mismatched mapped one.
+    ///
+    /// Always public so integration tests in `tests/` can reach it; the
+    /// `__` prefix + the explicit "for_test" name is the convention used
+    /// elsewhere in the codebase to discourage production callers.
+    pub fn __force_hot_map_for_test(&mut self, pk_bytes: &[u8], row_id: RowId) {
+        self.hot.insert(pk_bytes.to_vec(), row_id);
+    }
+
+    /// Test-only helper: drop a single HOT mapping so a test can simulate
+    /// the missing-mapping fallback path without tearing down the table.
+    pub fn hot_for_test_remove(&mut self, pk_bytes: &[u8]) {
+        self.hot.remove(pk_bytes);
+    }
+
+    /// Test-only helper: force the `indexes_complete` flag to `false` so a
+    /// test can drive the `IndexIncomplete` branch of the fallback path.
+    pub fn set_indexes_incomplete_for_test(&mut self) {
+        self.indexes_complete = false;
+    }
+
+    /// Test-only helper: bump the `hot_checkpoint_rejected_total` counter by
+    /// one so a test can drive the `CheckpointRejected` path. The counter
+    /// is `pub(crate)` so the helper bumps it directly.
+    pub fn bump_hot_checkpoint_rejected_for_test(&self) {
+        self.lookup_metrics
+            .hot_checkpoint_rejected_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.rebuild_indexes_from_runs_inner(None)
     }
@@ -3365,6 +3400,20 @@ impl Table {
     ///   - live row found on disk              -> `MissingMapping`
     ///   - nothing found                       -> `MissingMapping` (a genuine
     ///     miss is still a HOT-fallback event for observability).
+    ///
+    /// Correctness contract:
+    ///   - obeys the full `Snapshot` (epoch + HLC) through `visible_*`
+    ///     iterators and `range_scan_i64`;
+    ///   - ignores deleted rows in the overlay and durable runs;
+    ///   - ignores TTL-expired rows via [`Self::row_expired_at`];
+    ///   - compares the **materialized** PK against the requested encoded
+    ///     key (post-HMAC tokenization) so that HMAC-eq columns and bytes
+    ///     PKs both produce exact matches;
+    ///   - dedups the resulting `RowId` set so a row referenced from
+    ///     multiple paths (overlay + run, multi-run) is reported once;
+    ///   - works across the memtable, mutable-run, and every sorted run;
+    ///   - preserves historical snapshots — pinned-snapshot readers see the
+    ///     historical row, not the latest.
     fn pk_equality_fallback(
         &self,
         pk_column_id: u16,
@@ -3373,6 +3422,7 @@ impl Table {
     ) -> Result<(RowIdSet, crate::trace::HotFallbackReason)> {
         let mut tombstone_hit = false;
         let mut overlay_versions = 0u64;
+        let now_nanos = unix_nanos_now();
         // Overlay first (newest versions).
         for row in self.memtable.visible_versions_at(snapshot) {
             overlay_versions += 1;
@@ -3381,6 +3431,9 @@ impl Table {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
                 tombstone_hit = true;
+                continue;
+            }
+            if self.row_expired_at(&row, now_nanos) {
                 continue;
             }
             if let Some(pk_val) = row.columns.get(&pk_column_id) {
@@ -3402,6 +3455,9 @@ impl Table {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if row.deleted {
                 tombstone_hit = true;
+                continue;
+            }
+            if self.row_expired_at(&row, now_nanos) {
                 continue;
             }
             if let Some(pk_val) = row.columns.get(&pk_column_id) {
@@ -3448,7 +3504,7 @@ impl Table {
         }
         // Bytes / other PK types: linear visible scan of runs is expensive but
         // correctness-first for rare HOT misses.
-        let mut found = Vec::new();
+        let mut found: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         let overlay = self.overlay_rid_set(snapshot);
         let mut runs_considered = 0u64;
         for rr in &self.run_refs {
@@ -3464,9 +3520,12 @@ impl Table {
                     }
                     continue;
                 }
+                if self.row_expired_at(&row, now_nanos) {
+                    continue;
+                }
                 if let Some(pk_val) = row.columns.get(&pk_column_id) {
                     if self.index_lookup_key(pk_column_id, pk_val) == lookup {
-                        found.push(row.row_id.0);
+                        found.insert(row.row_id.0);
                     }
                 }
             }
@@ -3484,7 +3543,7 @@ impl Table {
         self.lookup_metrics
             .hot_fallback_runs_considered_total
             .fetch_add(runs_considered, std::sync::atomic::Ordering::Relaxed);
-        Ok((RowIdSet::from_unsorted(found), reason))
+        Ok((RowIdSet::from_unsorted(found.into_iter().collect()), reason))
     }
 
     /// TODO §5.1/§5.2 — record a HOT fallback reason. Increments the
@@ -8942,6 +9001,146 @@ impl Table {
         Ok(RowIdSet::intersect_many(sets).len() as u64)
     }
 
+    /// Inspect the row at `rid` directly — without going through
+    /// [`Self::get`] (which collapses tombstones and TTL-expired rows into
+    /// `None`). Used by [`Self::resolve_pk_with_hot_fallback`] so the
+    /// fallback reason can distinguish Tombstone from TtlExpired.
+    fn inspect_row_at(&self, rid: RowId, snapshot: Snapshot) -> Option<crate::memtable::Row> {
+        let mut best: Option<crate::memtable::Row> = None;
+        let mut consider = |row: crate::memtable::Row| {
+            if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+                return;
+            }
+            if best.as_ref().is_none_or(|current| {
+                Snapshot::version_is_newer(
+                    row.committed_epoch,
+                    row.commit_ts,
+                    current.committed_epoch,
+                    current.commit_ts,
+                )
+            }) {
+                best = Some(row);
+            }
+        };
+        if let Some((_, row)) = self.memtable.get_version_at(rid, snapshot) {
+            consider(row);
+        }
+        if let Some((_, row)) = self.mutable_run.get_version_at(rid, snapshot) {
+            consider(row);
+        }
+        for rr in &self.run_refs {
+            if let Some(&(min_rid, max_rid)) = self.run_row_id_ranges.get(&rr.run_id) {
+                if rid.0 < min_rid || rid.0 > max_rid {
+                    continue;
+                }
+            }
+            let Ok(mut reader) = self.open_reader(rr.run_id) else {
+                continue;
+            };
+            let Ok(Some((_, row))) = reader.get_version(rid, snapshot.epoch) else {
+                continue;
+            };
+            consider(row);
+        }
+        best
+    }
+
+    fn resolve_pk_with_hot_fallback(
+        &self,
+        pk_column_id: u16,
+        lookup: &[u8],
+        snapshot: Snapshot,
+    ) -> Result<RowIdSet> {
+        // Indexes incomplete: record `IndexIncomplete` and run the scanner
+        // directly. The HOT map may be stale or absent, but the scanner's
+        // result is still correct because it reads durable runs.
+        if !self.indexes_complete {
+            let (result, _inner) = self.pk_equality_fallback(pk_column_id, lookup, snapshot)?;
+            self.record_hot_fallback_reason(crate::trace::HotFallbackReason::IndexIncomplete);
+            return Ok(result);
+        }
+        // Step 1 — HOT hit attempt. Look up the mapped `RowId`; if absent,
+        // delegate straight to the scanner (which classifies the reason).
+        let mapped = self.hot.get(lookup);
+        let Some(r) = mapped else {
+            let (result, reason) = self.pk_equality_fallback(pk_column_id, lookup, snapshot)?;
+            self.record_hot_fallback_reason(reason);
+            return Ok(result);
+        };
+        // Step 2 — historical snapshot: the HOT map is keyed on the latest
+        // RowId, not the historical one. The historical branch records its
+        // own reason and runs the scanner; the inner scanner is suppressed
+        // from recording a second reason (see `pk_equality_fallback`).
+        if snapshot.epoch < self.current_epoch() {
+            self.record_hot_fallback_reason(crate::trace::HotFallbackReason::HistoricalSnapshot);
+            let (result, _inner) = self.pk_equality_fallback(pk_column_id, lookup, snapshot)?;
+            return Ok(result);
+        }
+        // Step 3 — materialize the mapped candidate and classify it.
+        // `inspect_row_at` does not collapse TTL-expired rows into `None`,
+        // so the inspection can distinguish Tombstone from TtlExpired.
+        let materialized = self.inspect_row_at(r, snapshot);
+        let now_nanos = unix_nanos_now();
+        let inspection = crate::trace::inspect_hot_candidate(
+            materialized.as_ref(),
+            snapshot,
+            self.ttl,
+            now_nanos,
+            pk_column_id,
+            lookup,
+            |row| {
+                let pk_value = row.columns.get(&pk_column_id);
+                pk_value
+                    .map(|v| self.index_lookup_key(pk_column_id, v))
+                    .unwrap_or_default()
+            },
+        );
+        match inspection {
+            crate::trace::HotCandidateInspection::Hit(row) => {
+                self.lookup_metrics
+                    .hot_lookup_hit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::trace::QueryTrace::record(|t| {
+                    t.hot_lookup_attempted = true;
+                    t.hot_lookup_hit = true;
+                });
+                Ok(RowIdSet::one(row.row_id.0))
+            }
+            failure => {
+                let reason = match &failure {
+                    crate::trace::HotCandidateInspection::Hit(_) => unreachable!(),
+                    crate::trace::HotCandidateInspection::MissingRow => {
+                        // `inspect_row_at` could not find any version at this
+                        // RowId. The HOT map pointed at a `RowId` that does
+                        // not exist; the closest label is Tombstone (the row
+                        // used to be there and is now gone).
+                        crate::trace::HotFallbackReason::Tombstone
+                    }
+                    crate::trace::HotCandidateInspection::Invisible => {
+                        crate::trace::HotFallbackReason::InvisibleAtSnapshot
+                    }
+                    crate::trace::HotCandidateInspection::Tombstone => {
+                        crate::trace::HotFallbackReason::Tombstone
+                    }
+                    crate::trace::HotCandidateInspection::TtlExpired => {
+                        crate::trace::HotFallbackReason::TtlExpired
+                    }
+                    crate::trace::HotCandidateInspection::PrimaryKeyMismatch { .. } => {
+                        crate::trace::HotFallbackReason::PrimaryKeyMismatch
+                    }
+                };
+                // The HOT map may have a stale RowId; the inner scanner is
+                // the only source of the verified RowIdSet. Suppress the
+                // inner `record_hot_fallback_reason` call by passing
+                // `snapshot` unchanged — the historical/PK-mismatch branches
+                // already short-circuit before re-recording.
+                let (result, _inner) = self.pk_equality_fallback(pk_column_id, lookup, snapshot)?;
+                self.record_hot_fallback_reason(reason);
+                Ok(result)
+            }
+        }
+    }
+
     /// Resolve a single condition to its row-id set. Index-served conditions use
     /// the in-memory indexes; `Range`/`RangeF64` prefer the learned (PGM) index
     /// or the reader's page-index-skipping path on the single-run fast path, and
@@ -8969,86 +9168,13 @@ impl Table {
                     .primary_key()
                     .map(|pk| self.index_lookup_key_bytes(pk.id, key))
                     .unwrap_or_else(|| key.clone());
-                if let Some(r) = self.hot.get(&lookup) {
-                    // A hit is only a hit when the materialized row at the
-                    // mapped `RowId` is live, visible, TTL-valid, and carries
-                    // the requested PK. Anything else is a per-reason fallback
-                    // (Tombstone / TtlExpired / PrimaryKeyMismatch /
-                    // HistoricalSnapshot).
-                    if snapshot.epoch < self.current_epoch() {
-                        // Historical snapshot: the HOT map is keyed on the
-                        // current RowId, not the historical one. Record the
-                        // HistoricalSnapshot reason and fall through to the
-                        // equality-fallback path; the reason is owned by this
-                        // branch so the inner scan must NOT record a second
-                        // one (suppressed by returning the result without
-                        // re-recording below).
-                        self.record_hot_fallback_reason(
-                            crate::trace::HotFallbackReason::HistoricalSnapshot,
-                        );
-                        if let Some(pk_col) = self.schema.primary_key() {
-                            let (result, _inner) =
-                                self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?;
-                            return Ok(result);
-                        }
-                        return Ok(RowIdSet::empty());
-                    }
-                    if let Some(row) = self.get(crate::rowid::RowId(r.0), snapshot) {
-                        let pk_ok = self
-                            .schema
-                            .primary_key()
-                            .map(|pk| {
-                                row.columns
-                                    .get(&pk.id)
-                                    .map(|v| self.index_lookup_key(pk.id, v) == lookup)
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(true);
-                        if pk_ok {
-                            self.lookup_metrics
-                                .hot_lookup_hit
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            crate::trace::QueryTrace::record(|t| {
-                                t.hot_lookup_attempted = true;
-                                t.hot_lookup_hit = true;
-                            });
-                            RowIdSet::one(r.0)
-                        } else {
-                            self.record_hot_fallback_reason(
-                                crate::trace::HotFallbackReason::PrimaryKeyMismatch,
-                            );
-                            RowIdSet::one(r.0)
-                        }
-                    } else {
-                        // Materialization returned None: row is missing,
-                        // tombstoned, expired, or invisible at the snapshot.
-                        // Tombstone is the most common cause; TTL and
-                        // invisibility are checked by `get` and folded into
-                        // the same counter.
-                        self.record_hot_fallback_reason(crate::trace::HotFallbackReason::Tombstone);
-                        // Count this as a considered run so the
-                        // `hot_fallback_runs_considered_total` invariant
-                        // (>= 1 per Tombstone) holds.
-                        self.lookup_metrics
-                            .hot_fallback_runs_considered_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        RowIdSet::empty()
-                    }
-                } else if let Some(pk_col) = self.schema.primary_key() {
-                    // HOT miss self-heal: the base row may still be live after
-                    // an index desync. `pk_equality_fallback` returns the
-                    // reason it observed: Tombstone when the scan saw a
-                    // tombstone, MissingMapping otherwise (including genuine
-                    // misses). Historical snapshots land here too — a HOT miss
-                    // is never re-classified as HistoricalSnapshot, preserving
-                    // MissingMapping for genuine misses.
-                    let (result, reason) =
-                        self.pk_equality_fallback(pk_col.id, &lookup, snapshot)?;
-                    self.record_hot_fallback_reason(reason);
-                    return Ok(result);
-                } else {
-                    RowIdSet::empty()
+                if let Some(pk_col) = self.schema.primary_key() {
+                    return self.resolve_pk_with_hot_fallback(pk_col.id, &lookup, snapshot);
                 }
+                // No primary key column — HOT is meaningless. Match the
+                // legacy behavior: every PK condition collapses to an empty
+                // set.
+                RowIdSet::empty()
             }
             Condition::BitmapEq { column_id, value } => {
                 let lookup = self.index_lookup_key_bytes(*column_id, value);
@@ -9200,9 +9326,7 @@ impl Table {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
-                        RowIdSet::from_unsorted(
-                            li.range(*lo, *hi).into_iter().collect(),
-                        )
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
                         // Multi-run: learned_range only covers run_refs[0]; a
                         // tombstone in a later run wouldn't strip its alive
@@ -9211,15 +9335,9 @@ impl Table {
                         // leaked rid would surface as a wrong hit. Fall through
                         // to the MVCC-aware multi-run path so deletes land in
                         // any run are honored.
-                        let mut multi =
-                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
                         if lo == hi {
-                            self.union_bitmap_point_i64(
-                                &mut multi,
-                                *column_id,
-                                *lo,
-                                snapshot,
-                            );
+                            self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
                         }
                         return Ok(multi);
                     }
