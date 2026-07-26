@@ -6786,6 +6786,9 @@ impl Table {
                     self.lookup_metrics
                         .directory_run_readers_opened
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.lookup_metrics
+                        .get_run_opened
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Ok(mut reader) = self.open_reader(locator.run_id) else {
                         continue;
                     };

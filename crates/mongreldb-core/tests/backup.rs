@@ -235,7 +235,7 @@ fn backup_rejects_nested_stage_symlink_without_writing_outside() {
                 .unwrap()
                 .path();
             let runs = stage.join("tables/0/_runs");
-            std::fs::remove_dir(&runs).unwrap();
+            std::fs::remove_dir_all(&runs).unwrap();
             symlink(&outside, runs).unwrap();
         }
     });
