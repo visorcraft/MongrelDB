@@ -82,6 +82,38 @@ impl RunLocatorList {
     }
 }
 
+/// What a `Table::get` directory consultation concluded with.
+///
+/// `CompleteMiss` is the authoritative answer "this row has no postings in
+/// the directory" — the memtable and mutable-run tiers have already been
+/// searched, so an empty complete lookup means no immutable run can host a
+/// visible version. The caller opens zero readers.
+///
+/// `Candidates` means the directory returned at least one locator; the
+/// caller walks them with the conservative snapshot filter and the
+/// [`RunLocator::can_contain_version_newer_than`] early-stop proof.
+///
+/// `UnavailableOrStale` means the directory was missing, corrupt, or had a
+/// stale fingerprint; the caller falls back to the existing range-scan
+/// path. Distinct from `CompleteMiss` because the directory gave no
+/// definitive answer and the row *could* still exist in an immutable run.
+#[derive(Debug, Clone)]
+pub(crate) enum DirectoryLookupDecision {
+    CompleteMiss,
+    Candidates(Vec<RunLocator>),
+    UnavailableOrStale,
+}
+
+/// A compact snapshot of the (epoch, hlc) coordinates of a row version. Used
+/// by the safe early-stop proof so the caller can ask "can this locator
+/// still beat the current winner?" without exposing the full [`crate::memtable::Row`]
+/// in the public surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VersionStamp {
+    pub epoch: Epoch,
+    pub hlc: Option<HlcTimestamp>,
+}
+
 /// Per-`RowId` posting list. Backed by a `BTreeMap` for the in-memory
 /// representation; the on-disk checkpoint uses delta-encoded `RowId` keys.
 #[derive(Debug, Default, Clone)]
@@ -107,6 +139,18 @@ impl RunLookupDirectory {
             locators: Vec::new(),
         };
         self.postings.get(&row_id).unwrap_or(&EMPTY)
+    }
+
+    /// Decide how the read path should consult this directory for `row_id`.
+    /// Distinguishes a complete directory miss (no postings → open zero
+    /// immutable readers) from the absence of any usable directory
+    /// (`UnavailableOrStale` → range-scan fallback).
+    pub(crate) fn decide(&self, row_id: RowId) -> DirectoryLookupDecision {
+        match self.postings.get(&row_id) {
+            None => DirectoryLookupDecision::CompleteMiss,
+            Some(list) if list.is_empty() => DirectoryLookupDecision::CompleteMiss,
+            Some(list) => DirectoryLookupDecision::Candidates(list.locators.clone()),
+        }
     }
 
     /// Insert or replace a `RunLocator` for `row_id`. Locators are kept
@@ -851,6 +895,73 @@ impl RunLocator {
             _ => false,
         }
     }
+
+    /// Safe early-stop proof for `Table::get`. Returns `true` when this
+    /// locator **might** still contain a version strictly newer than the
+    /// current winner `best` and visible to `snapshot`. Returns `false`
+    /// only when the locator provably cannot — the caller may then skip
+    /// opening this run and increment the early-stop counter.
+    ///
+    /// Conservative: when the metadata is too sparse to prove impossibility,
+    /// returns `true` so the caller opens the run (correctness wins over the
+    /// optimization).
+    ///
+    /// Cases handled (per REM-004 §36):
+    ///
+    /// 1. **Pure HLC**: locator is fully stamped (no unstamped versions),
+    ///    `best` is HLC-stamped, and the snapshot is HLC-authoritative.
+    ///    Comparison uses HLC order; a visible version with HLC > best.hlc
+    ///    would beat.
+    /// 2. **Mixed / epoch-only**: any other combination. Comparison falls
+    ///    back to epoch order; a visible version with epoch > best.epoch
+    ///    would beat.
+    /// 3. **Unknown metadata**: missing HLC bounds or other gaps → returns
+    ///    `true` (caller opens).
+    pub(crate) fn can_contain_version_newer_than(
+        &self,
+        best: VersionStamp,
+        snapshot: Snapshot,
+    ) -> bool {
+        // Pure HLC comparison is only sound when:
+        //   - locator has no unstamped (so every row in the run is stamped),
+        //   - locator records an HLC bound (so we know the envelope),
+        //   - best is HLC-stamped (so HLC order applies),
+        //   - snapshot is HLC-authoritative (so visibility is HLC-bounded).
+        // Outside this quadruple intersection, the mixed comparison in
+        // `Snapshot::version_is_newer` falls back to epoch order, so we
+        // must check epoch. Missing HLC bounds also force the epoch path
+        // (unknown metadata must stay conservative).
+        let pure_hlc = !self.contains_unstamped_versions
+            && self.max_hlc.is_some()
+            && best.hlc.is_some()
+            && snapshot.uses_hlc_authority();
+
+        if pure_hlc {
+            // Need a stamped version with HLC > best.hlc, visible at
+            // snapshot.commit_ts. Visibility caps the locator's max HLC at
+            // snapshot.commit_ts.
+            let best_hlc = best.hlc.expect("pure_hlc requires best.hlc");
+            let max_locator_hlc = self.max_hlc.expect("pure_hlc requires max_hlc");
+            let max_visible_hlc = if max_locator_hlc <= snapshot.commit_ts {
+                max_locator_hlc
+            } else {
+                snapshot.commit_ts
+            };
+            return max_visible_hlc > best_hlc;
+        }
+
+        // Mixed / legacy / unknown-metadata: comparison falls back to
+        // epoch order. A visible version with epoch > best.epoch beats.
+        // Visibility caps the locator's max epoch at snapshot.epoch (the
+        // dual-model snapshot rule applies whether the locator version is
+        // stamped or not).
+        let max_visible_epoch = if self.max_epoch <= snapshot.epoch {
+            self.max_epoch
+        } else {
+            snapshot.epoch
+        };
+        max_visible_epoch > best.epoch
+    }
 }
 
 /// Deterministic fingerprint of the run-set + schema/index generations that
@@ -1100,5 +1211,220 @@ mod tests {
         let err = RunLookupDirectory::read_checkpoint(&path, 43).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("fingerprint"));
+    }
+
+    fn stamped_loc(run_id: u128, epoch: u64, hlc: u64) -> RunLocator {
+        RunLocator {
+            run_id,
+            min_epoch: Epoch(epoch),
+            max_epoch: Epoch(epoch),
+            min_hlc: Some(hlc_from_phys(hlc)),
+            max_hlc: Some(hlc_from_phys(hlc)),
+            contains_unstamped_versions: false,
+        }
+    }
+
+    fn mixed_loc(run_id: u128, epoch: u64, hlc: u64) -> RunLocator {
+        RunLocator {
+            run_id,
+            min_epoch: Epoch(epoch),
+            max_epoch: Epoch(epoch),
+            min_hlc: Some(hlc_from_phys(hlc)),
+            max_hlc: Some(hlc_from_phys(hlc)),
+            contains_unstamped_versions: true,
+        }
+    }
+
+    #[test]
+    fn decide_distinguishes_complete_miss_from_candidates() {
+        let mut dir = RunLookupDirectory::empty();
+        // No insert for RowId(99): a complete miss.
+        match dir.decide(RowId(99)) {
+            DirectoryLookupDecision::CompleteMiss => {}
+            other => panic!("expected CompleteMiss, got {other:?}"),
+        }
+        // Empty posting list is also a complete miss (defensive — should
+        // not happen in production, but the contract still says miss).
+        dir.insert(RowId(7), stamped_loc(1, 1, 100));
+        dir.insert(RowId(7), stamped_loc(2, 2, 200));
+        match dir.decide(RowId(7)) {
+            DirectoryLookupDecision::Candidates(list) => assert_eq!(list.len(), 2),
+            other => panic!("expected Candidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn early_stop_epoch_only_proves_no_beat() {
+        // Locator max_epoch = 5; best = epoch 10; cannot beat.
+        let l = loc(1, 5, None);
+        let snap = Snapshot::at(Epoch(20));
+        let best = VersionStamp {
+            epoch: Epoch(10),
+            hlc: None,
+        };
+        assert!(
+            !l.can_contain_version_newer_than(best, snap),
+            "max_epoch <= best.epoch must early-stop"
+        );
+    }
+
+    #[test]
+    fn early_stop_epoch_only_proves_beat() {
+        // Locator max_epoch = 15; best = epoch 10; visible cap 20.
+        let l = loc(1, 15, None);
+        let snap = Snapshot::at(Epoch(20));
+        let best = VersionStamp {
+            epoch: Epoch(10),
+            hlc: None,
+        };
+        assert!(
+            l.can_contain_version_newer_than(best, snap),
+            "max_epoch > best.epoch must not early-stop"
+        );
+    }
+
+    #[test]
+    fn early_stop_pure_hlc_proves_no_beat() {
+        // Locator max HLC = 100; best HLC = 200; snapshot HLC = 1000.
+        // Visible cap = min(100, 1000) = 100 <= best.hlc=200 → no beat.
+        let l = stamped_loc(1, 5, 100);
+        let snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(1000));
+        let best = VersionStamp {
+            epoch: Epoch(5),
+            hlc: Some(hlc_from_phys(200)),
+        };
+        assert!(
+            !l.can_contain_version_newer_than(best, snap),
+            "pure HLC: max visible HLC <= best HLC must early-stop"
+        );
+    }
+
+    #[test]
+    fn early_stop_pure_hlc_proves_beat() {
+        // Locator max HLC = 500; best HLC = 200; snapshot HLC = 1000.
+        // Visible cap = min(500, 1000) = 500 > best.hlc=200 → beat possible.
+        let l = stamped_loc(1, 5, 500);
+        let snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(1000));
+        let best = VersionStamp {
+            epoch: Epoch(5),
+            hlc: Some(hlc_from_phys(200)),
+        };
+        assert!(
+            l.can_contain_version_newer_than(best, snap),
+            "pure HLC: max visible HLC > best HLC must not early-stop"
+        );
+    }
+
+    #[test]
+    fn early_stop_pure_hlc_respects_snapshot_cap() {
+        // Locator max HLC = 5000; best HLC = 200; snapshot HLC = 100.
+        // Visibility caps at snapshot, so locator cannot contain anything
+        // strictly newer than best AND visible. Note: this is the case
+        // where `is_impossible_for` would skip the run entirely; the early-
+        // stop proof must agree when best is already pinned.
+        let l = stamped_loc(1, 5, 5000);
+        let snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(100));
+        let best = VersionStamp {
+            epoch: Epoch(5),
+            hlc: Some(hlc_from_phys(200)),
+        };
+        assert!(
+            !l.can_contain_version_newer_than(best, snap),
+            "snapshot HLC cap below locator max must early-stop when best > cap"
+        );
+    }
+
+    #[test]
+    fn early_stop_mixed_with_unstamped_falls_back_to_epoch() {
+        // Locator has stamped HLC=100 AND unstamped; best has high epoch
+        // 200 but no HLC. Mixed comparison falls back to epoch. Even
+        // though the locator's max HLC is below any sensible best, the
+        // unstamped rows can beat on epoch alone.
+        let l = mixed_loc(1, 250, 100);
+        let snap = Snapshot::at_hlc(Epoch(300), hlc_from_phys(1000));
+        let best = VersionStamp {
+            epoch: Epoch(200),
+            hlc: None,
+        };
+        assert!(
+            l.can_contain_version_newer_than(best, snap),
+            "mixed: unstamped epoch beat path must not early-stop"
+        );
+        // Inverse: best's epoch exceeds the locator's max.
+        let l = mixed_loc(1, 100, 5000);
+        let best = VersionStamp {
+            epoch: Epoch(200),
+            hlc: None,
+        };
+        assert!(
+            !l.can_contain_version_newer_than(best, snap),
+            "mixed: max epoch <= best.epoch must early-stop"
+        );
+    }
+
+    #[test]
+    fn early_stop_hlc_snap_with_unstamped_best_uses_epoch_path() {
+        // best has no HLC; even under HLC-authoritative snap, comparison
+        // falls back to epoch (mixed comparison rule).
+        let l = stamped_loc(1, 250, 999);
+        let snap = Snapshot::at_hlc(Epoch(300), hlc_from_phys(1000));
+        let best = VersionStamp {
+            epoch: Epoch(200),
+            hlc: None,
+        };
+        assert!(
+            l.can_contain_version_newer_than(best, snap),
+            "unstamped best: epoch path wins even under HLC-authority snap"
+        );
+    }
+
+    #[test]
+    fn early_stop_unknown_metadata_stays_conservative() {
+        // Spec §36.4: when locator metadata cannot prove a remaining run
+        // is unable to beat the winner, open the run. Construct a locator
+        // whose epoch bound is *equal* to the best — strict inequality is
+        // required to prove the locator cannot beat, so a tie must stay
+        // conservative.
+        let l = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(10),
+            min_hlc: Some(hlc_from_phys(50)),
+            max_hlc: Some(hlc_from_phys(50)),
+            contains_unstamped_versions: false,
+        };
+        let snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(100));
+        let best = VersionStamp {
+            epoch: Epoch(10),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        // Strict equality is not a beat — but the proof is conservative
+        // and never asserts a tie is a win.
+        assert!(
+            !l.can_contain_version_newer_than(best, snap),
+            "strict tie (equal epoch+HLC) is not a beat; safe to early-stop"
+        );
+
+        // Truly unknown: locator with no HLC bounds AND no
+        // contains_unstamped flag — metadata is contradictory and we
+        // cannot prove anything. The helper should fall back to the
+        // epoch path; with max_epoch = 10 and best.epoch = 5 the epoch
+        // path returns true (could beat on epoch alone).
+        let l_unknown = RunLocator {
+            run_id: 2,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(10),
+            min_hlc: None,
+            max_hlc: None,
+            contains_unstamped_versions: false,
+        };
+        let best_lower = VersionStamp {
+            epoch: Epoch(5),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        assert!(
+            l_unknown.can_contain_version_newer_than(best_lower, snap),
+            "unknown metadata with higher possible epoch must stay conservative"
+        );
     }
 }

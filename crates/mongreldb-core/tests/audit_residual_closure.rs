@@ -272,7 +272,11 @@ fn r4_delete_then_put_same_pk_bitmap_lists_one_live() {
 }
 
 /// Point get skips runs outside the RowId range directory — proven via
-/// `get_run_skipped` / `get_run_opened` counters on the shipped metrics path.
+/// `get_run_skipped` / `get_run_opened` counters on the shipped metrics
+/// path. REM-004 distinguishes complete directory miss (zero opens) from
+/// `UnavailableOrStale` (range-scan fallback). This test exercises the
+/// fallback path by removing every directory shard before the out-of-range
+/// get, so the run-range filter is the only thing left to skip runs.
 #[test]
 fn get_skips_runs_outside_row_id_range_directory() {
     let dir = tempdir().unwrap();
@@ -314,20 +318,55 @@ fn get_skips_runs_outside_row_id_range_directory() {
         "in-range get must open at least one run"
     );
 
-    // Out-of-range rid: both runs' ranges exclude it → both skipped, zero opens.
+    // REM-004: with the directory complete, an out-of-range rid is a
+    // complete miss — the directory has no posting for `u64::MAX/2` so
+    // zero readers open. This is the new authoritative answer.
     let before_miss = db.lookup_metrics_snapshot();
     let missing = db.get(mongreldb_core::RowId(u64::MAX / 2), snap);
     assert!(missing.is_none());
     let after_miss = db.lookup_metrics_snapshot();
-    let skipped = after_miss.get_run_skipped - before_miss.get_run_skipped;
     let opened = after_miss.get_run_opened - before_miss.get_run_opened;
-    assert!(
-        skipped >= 2,
-        "out-of-range get must skip both runs via range directory (skipped={skipped})"
-    );
     assert_eq!(
         opened, 0,
-        "out-of-range get must not open_reader any run (opened={opened})"
+        "complete directory miss must open zero immutable runs (opened={opened})"
+    );
+    assert!(
+        after_miss.directory_complete_miss_total > before_miss.directory_complete_miss_total,
+        "complete directory miss must bump directory_complete_miss_total"
+    );
+
+    // Now exercise the fallback path by removing every directory shard
+    // and reopening, so the next `get` consults the run-row-id ranges
+    // directly. Both runs' ranges exclude the missing rid → both skipped,
+    // zero opens.
+    db.close().unwrap();
+    let runs_dir = dir.path().join("_runs");
+    for entry in std::fs::read_dir(&runs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if name.starts_with("directory.shard-") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let db = Table::open(dir.path()).unwrap();
+    let before_fallback = db.lookup_metrics_snapshot();
+    let missing_fb = db.get(mongreldb_core::RowId(u64::MAX / 2), db.snapshot());
+    assert!(missing_fb.is_none());
+    let after_fallback = db.lookup_metrics_snapshot();
+    let skipped = after_fallback.get_run_skipped - before_fallback.get_run_skipped;
+    let opened_fb = after_fallback.get_run_opened - before_fallback.get_run_opened;
+    assert!(
+        skipped >= 2,
+        "out-of-range get under fallback must skip both runs via range directory (skipped={skipped})"
+    );
+    assert_eq!(
+        opened_fb, 0,
+        "out-of-range get under fallback must not open_reader any run (opened={opened_fb})"
+    );
+    assert!(
+        after_fallback.directory_lookup_fallback > before_fallback.directory_lookup_fallback,
+        "fallback path must bump directory_lookup_fallback"
     );
 }
 

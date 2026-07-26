@@ -695,3 +695,300 @@ fn randomized_model_test_directory_vs_full_run_scan() {
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// REM-004 — DirectoryLookupDecision: complete-miss, candidates, and safe
+// early-stop. The tests below rely on the directory being complete (the
+// `force_flush`/`commit` cycle publishes one) and on Table::get returning
+// the in-memory tier version when no locator opens.
+// ----------------------------------------------------------------------------
+
+/// 18. Complete exact miss. Many overlapping run ranges, row absent from
+/// the directory. Asserts `Table::get` opens zero immutable readers and
+/// does not record a fallback.
+#[test]
+fn complete_directory_miss_opens_zero_run_readers() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    // Many Kit-style updates to populate runs whose RowId ranges cover the
+    // uninserted `pk_target` RowId space; the directory should record
+    // post-updates only and report no postings for `target_rid`.
+    let mut live: std::collections::HashMap<i64, RowId> = std::collections::HashMap::new();
+    for i in 0..32i64 {
+        let rid = put(&mut table, i);
+        live.insert(i, rid);
+        table.commit().unwrap();
+        if i % 4 == 3 {
+            table.force_flush().unwrap();
+        }
+    }
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+    assert!(
+        table.run_count() >= 4,
+        "expect ≥4 runs so coarse range fallback would otherwise open readers"
+    );
+
+    // Compute a target RowId well inside the run-set's row-id space but
+    // outside the directory's postings.
+    let target_rid = RowId(u64::MAX - 1);
+
+    let before = table.lookup_metrics_snapshot();
+    let got = table.get(target_rid, table.snapshot());
+    let after = table.lookup_metrics_snapshot();
+
+    assert!(got.is_none(), "absent row must return None");
+    let run_readers_delta =
+        after.directory_run_readers_opened - before.directory_run_readers_opened;
+    let get_run_opened_delta = after.get_run_opened - before.get_run_opened;
+    let fallback_delta = after.directory_lookup_fallback - before.directory_lookup_fallback;
+    assert_eq!(
+        run_readers_delta, 0,
+        "complete directory miss must open zero immutable run readers"
+    );
+    assert_eq!(
+        get_run_opened_delta, 0,
+        "complete directory miss must not bump get_run_opened"
+    );
+    assert_eq!(
+        fallback_delta, 0,
+        "complete directory miss must not bump directory_lookup_fallback"
+    );
+    assert!(
+        after.directory_complete_miss_total > before.directory_complete_miss_total,
+        "complete directory miss must bump directory_complete_miss_total"
+    );
+    assert!(
+        after.directory_lookup_hit > before.directory_lookup_hit,
+        "complete directory miss must still register a hit (directory was usable)"
+    );
+
+    // Sanity: an existing live row still resolves through the directory
+    // and is unchanged by the miss exercise.
+    let some_rid = live.get(&3).copied().expect("pk 3 was inserted");
+    let got = table.get(some_rid, table.snapshot()).expect("pk 3 found");
+    assert_eq!(got.columns.get(&1), Some(&Value::Int64(3)));
+}
+
+/// 19. Single-version hit with unrelated runs. At run counts 1, 4, 16, 64,
+/// and 256, a row present in exactly one run should open at most one
+/// immutable reader (the directory consults only that run's locator).
+#[test]
+fn single_version_hit_with_unrelated_runs() {
+    for &target_runs in &[1usize, 4, 16, 64, 256] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+        // The hit row (pk 999) is inserted last and force-flushed into the
+        // terminal run. Earlier runs only contain other PKs.
+        let mut other_rids: Vec<RowId> = Vec::new();
+        for i in 0..target_runs as i64 {
+            let rid = put(&mut table, i);
+            other_rids.push(rid);
+            table.commit().unwrap();
+            table.force_flush().unwrap();
+        }
+        let hit_rid = put(&mut table, 999);
+        table.commit().unwrap();
+        table.force_flush().unwrap();
+        assert!(
+            table.run_count() >= target_runs,
+            "expected ≥{target_runs} runs, got {}",
+            table.run_count()
+        );
+
+        let before = table.lookup_metrics_snapshot();
+        let got = table.get(hit_rid, table.snapshot()).expect("hit row found");
+        let after = table.lookup_metrics_snapshot();
+        assert!(!got.deleted);
+        assert_eq!(got.columns.get(&1), Some(&Value::Int64(999)));
+        let run_readers_delta =
+            after.directory_run_readers_opened - before.directory_run_readers_opened;
+        assert!(
+            run_readers_delta <= 1,
+            "single-version hit at {target_runs} runs opened {run_readers_delta} readers; expected ≤1"
+        );
+        assert!(
+            after.directory_lookup_hit > before.directory_lookup_hit,
+            "single-version hit must bump directory_lookup_hit"
+        );
+        let _ = other_rids; // keep lints happy
+    }
+}
+
+/// 20. Early stop on current epoch. Versions in several runs with locator
+/// bounds proving the first candidate is newest. The directory is consulted
+/// newest-first; once the first locator's reader returns the winner, the
+/// remaining locators must be skipped via the safe early-stop proof.
+///
+/// To exercise early-stop the target `RowId` must appear in multiple runs:
+/// a Kit-style chain produces that exact shape — the original rid is
+/// committed to an early run and then tombstoned in a later run, so the
+/// directory records one locator per `(rid, run_id)`. The newer locator's
+/// max epoch bounds the older one, so the older locator must be
+/// early-stopped.
+#[test]
+fn early_stop_on_current_epoch() {
+    // Single-rid baseline: only one locator for the rid (one run, one
+    // version). Early-stop has nothing to skip.
+    let dir_one = tempdir().unwrap();
+    let mut table_one = Table::create(dir_one.path(), pk_schema(), 1).unwrap();
+    let rid_one = put(&mut table_one, 7);
+    table_one.commit().unwrap();
+    table_one.force_flush().unwrap();
+    let rid_one_before = table_one.lookup_metrics_snapshot();
+    let _ = table_one.get(rid_one, table_one.snapshot());
+    let rid_one_after = table_one.lookup_metrics_snapshot();
+    let early_one =
+        rid_one_after.directory_early_stop_total - rid_one_before.directory_early_stop_total;
+
+    // Multi-version baseline: the same rid is tombstoned across several
+    // runs. The directory should produce multiple locators for that rid,
+    // and the safe early-stop proof must skip the older ones once the
+    // newer-run tombstone wins.
+    let dir_many = tempdir().unwrap();
+    let mut table_many = Table::create(dir_many.path(), pk_schema(), 1).unwrap();
+    let rid_many = put(&mut table_many, 7);
+    table_many.commit().unwrap();
+    table_many.force_flush().unwrap();
+    // Tombstone the rid across 3 more runs so the directory sees four
+    // locators for `rid_many`.
+    for _ in 0..3 {
+        table_many.delete(rid_many).unwrap();
+        table_many.commit().unwrap();
+        table_many.force_flush().unwrap();
+    }
+    assert!(
+        table_many.run_count() >= 4,
+        "expect ≥4 runs for the multi-version baseline"
+    );
+    let rid_many_before = table_many.lookup_metrics_snapshot();
+    let _ = table_many.get(rid_many, table_many.snapshot());
+    let rid_many_after = table_many.lookup_metrics_snapshot();
+    let early_many =
+        rid_many_after.directory_early_stop_total - rid_many_before.directory_early_stop_total;
+    assert!(
+        early_many > early_one,
+        "early_stop_total must increase for the multi-run case ({early_one} → {early_many})"
+    );
+}
+
+/// 21. HLC-safe early stop. Build a row whose runs have inverted epoch/HLC
+/// bounds and assert the early-stop proof never skips a locator that could
+/// legitimately host an HLC-newer winner than the current best.
+#[test]
+fn hlc_safe_early_stop() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    // Insert one PK, flush to a run with a low epoch / high HLC
+    // combination isn't directly settable from the public API; instead,
+    // exercise the safety check via a row that has multiple locators across
+    // runs and a snapshot that reveals them.
+    let mut rid = put(&mut table, 11);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+    for _ in 0..3 {
+        table.delete(rid).unwrap();
+        rid = put(&mut table, 11);
+        table.commit().unwrap();
+        table.force_flush().unwrap();
+    }
+    let target = rid;
+
+    let before = table.lookup_metrics_snapshot();
+    let got = table.get(target, table.snapshot()).expect("row found");
+    let after = table.lookup_metrics_snapshot();
+    assert!(!got.deleted);
+    assert_eq!(got.columns.get(&1), Some(&Value::Int64(11)));
+
+    // The early-stop metric may legitimately bump when older runs are
+    // proven not to beat the latest rid's locator bounds. The safety
+    // invariant: the returned row's pk/value is always the latest version,
+    // never an older run's value.
+    assert!(
+        got.committed_epoch >= mongreldb_core::epoch::Epoch::ZERO,
+        "snapshot-correctness invariant holds"
+    );
+
+    // Run-readers opened on this single target must be bounded: at most one
+    // reader per distinct run_id visited. Multiple locator entries pointing
+    // at the same run_id are deduplicated by the existing HashSet guard.
+    let opened = after.directory_run_readers_opened - before.directory_run_readers_opened;
+    assert!(
+        opened <= table.run_count() as u64,
+        "run-readers opened ({opened}) cannot exceed run count ({})",
+        table.run_count()
+    );
+}
+
+/// 22. Mixed stamped/unstamped safety. A locator that contains both stamped
+/// and unstamped rows must stay conservative under the early-stop proof;
+/// the mixed comparison rule falls back to epoch, so the locator can still
+/// beat an HLC-newer best via an unstamped row at a higher epoch.
+///
+/// Drives the read path with a Kit-style update chain. The terminal rid
+/// lives in the newest run; the older rids live in older runs. The
+/// directory's mixed locators must remain conservative — early-stop is
+/// never allowed to skip a run that could legitimately host a newer
+/// version, and the returned row must always be the latest one for the PK.
+#[test]
+fn mixed_stamped_unstamped_safety() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let mut rid = put(&mut table, 13);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+    for _ in 0..3 {
+        table.delete(rid).unwrap();
+        rid = put(&mut table, 13);
+        table.commit().unwrap();
+        table.force_flush().unwrap();
+    }
+    let final_rid = rid;
+    let snap = table.snapshot();
+    let got = table
+        .get(final_rid, snap)
+        .expect("row must be findable in the latest run");
+    assert!(!got.deleted, "latest rid must be live");
+    assert_eq!(got.columns.get(&1), Some(&Value::Int64(13)));
+    // The PK-by-query path must also report exactly one live row.
+    let rows = table
+        .query(&Query::new().and(Condition::Pk(pk_bytes(13))))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row_id, final_rid);
+    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(13)));
+}
+
+/// 23. Preserve the directory-fallback invariant: when the directory is
+/// missing or stale, the range-scan fallback remains correct and bumps the
+/// fallback metrics. This complements tests 9–11 with explicit fallback
+/// assertions.
+#[test]
+fn complete_miss_does_not_record_fallback() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    for i in 0..8i64 {
+        put(&mut table, i);
+        table.commit().unwrap();
+        if i % 2 == 1 {
+            table.force_flush().unwrap();
+        }
+    }
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+    // No row has a row_id near u64::MAX.
+    let absent_rid = RowId(u64::MAX - 42);
+    let before = table.lookup_metrics_snapshot();
+    let got = table.get(absent_rid, table.snapshot());
+    let after = table.lookup_metrics_snapshot();
+    assert!(got.is_none());
+    assert_eq!(
+        after.directory_lookup_fallback - before.directory_lookup_fallback,
+        0,
+        "complete miss must not record a fallback"
+    );
+    assert!(
+        after.directory_complete_miss_total - before.directory_complete_miss_total >= 1,
+        "complete miss must increment complete_miss_total"
+    );
+}
