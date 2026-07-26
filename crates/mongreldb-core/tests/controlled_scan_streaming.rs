@@ -9,6 +9,22 @@ use mongreldb_core::{
 use mongreldb_types::hlc::HlcTimestamp;
 use tempfile::tempdir;
 
+/// Emit a structured one-line JSON record for `scripts/run-residual-closure.sh`
+/// to harvest. The script greps for lines starting with `{"test":` and writes
+/// them to the corresponding `<topic>-results.jsonl` artifact.
+macro_rules! emit_scan_metric {
+    ($name:literal, $metric:expr, $unit:literal) => {
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": $name,
+                "metric": $metric,
+                "unit": $unit,
+            })
+        )
+    };
+}
+
 fn schema() -> Schema {
     Schema {
         schema_id: 1,
@@ -69,6 +85,11 @@ fn million_row_controlled_scan_keeps_source_buffers_bounded() {
     result.unwrap();
     assert_eq!(trace.controlled_scan_rows_emitted, 1_000_000);
     assert!(trace.controlled_scan_peak_source_buffer_rows <= 256);
+    emit_scan_metric!(
+        "controlled_scan::million_row_controlled_scan_keeps_source_buffers_bounded",
+        trace.controlled_scan_peak_source_buffer_rows,
+        "peak_source_buffer_rows"
+    );
 }
 
 #[test]
@@ -159,6 +180,11 @@ fn cancellation_is_observed_within_256_examined_versions() {
 
     assert!(matches!(result, Err(MongrelError::Cancelled)));
     assert!((100..=356).contains(&trace.controlled_scan_versions_examined));
+    emit_scan_metric!(
+        "controlled_scan::cancellation_is_observed_within_256_examined_versions",
+        trace.controlled_scan_versions_examined,
+        "versions_examined"
+    );
 }
 
 #[test]

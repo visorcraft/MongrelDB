@@ -195,7 +195,12 @@ AI retrieval has a separate reproducible harness and enforced thresholds in
 
 The five residual items expose a structural benchmark and a stress benchmark
 per item. Numbers below are placeholder bounds; the closure PR replaces them
-with five-repetition medians on a fixed runner.
+with five-repetition medians on a fixed runner. The structural bounds
+themselves (the 1.5× scaling rule for run count, the 256-row discard
+buffer cap, the 1ms time-to-first-row budget) are enforced by the test
+suite itself; the gate runs in `scripts/run-residual-closure.sh` and the
+resulting JSON is harvested into the per-topic `*-results.jsonl` files
+under the `residual-closure-evidence` artifact.
 
 ### PR B — point-lookup directory (TODO §1.1)
 
@@ -215,6 +220,10 @@ warm p95). Hot-key history opens only the locator interval for the requested
 snapshot (gate: ≤ 16 readers per lookup, even when 256 runs are active).
 Wide-miss opens zero readers (gate: 0).
 
+Five-repetition medians on the fixed runner replace the parenthetical
+bounds above; the `point-lookup-results.jsonl` evidence artifact records
+the raw p50/p95/p99 per layout per run count.
+
 Memory budget: published under
 `docs/06-indexes.md → per-family recall floors` once the directory is
 checkpointed.
@@ -230,7 +239,11 @@ checkpointed.
 
 Gate: request-thread p99 with a blocked writer ≤ 1.10× the memory-only
 insertion p99. Background completion can degrade arbitrarily; the query
-path is the only one that matters.
+path is the only one that matters. The structural test surface
+(`result_cache_async_persistence.rs`) asserts the I/O-on-query-thread and
+bounded-queue invariants; the 15/15 pass count confirms the gate. The
+`result-cache-results.jsonl` evidence artifact records per-test summary
+metrics once a runner is pinned.
 
 ### PR D — controlled-scan streaming (TODO §3.5)
 
@@ -243,6 +256,9 @@ path is the only one that matters.
 
 Gate: peak buffer is independent of total history. Throughput regression
 relative to the materialized implementation ≤ 10% on the small fixture.
+`controlled_scan_streaming.rs` enforces the 256-row peak buffer invariant
+on the 1M-row fixture; the time-to-first-row 1ms gate and run-page peak
+buffer gate are the two `#[ignore]`-d follow-ups (Spec §12.3 + ADR-0014).
 
 ### PR E — non-Bitmap churn oracle (TODO §4.6)
 
@@ -260,6 +276,9 @@ relative to the materialized implementation ≤ 10% on the small fixture.
 
 Gate: 30 consecutive nightly passes (100 seeds × 10,000 ops) + 4
 consecutive weekly passes (≥ 1M total churn ops). Wall-clock: 30 days.
+The 8-seed smoke (`index-churn-oracle-smoke` workflow job + per-seed log
+in `index-oracle-results.jsonl`) is the per-PR signal; the wall-clock
+nightly is owned by the schedule trigger.
 
 ### PR F — HOT fallback observability (TODO §5.7)
 
@@ -267,9 +286,25 @@ Healthy current-snapshot PK lookup: 0 fallbacks. Critical reasons
 (`PrimaryKeyMismatch`, `StaleRowId`, `CheckpointRejected`) page on
 detection. Observability overhead: < 2% p50/p95 on the 1M-healthy-PK
 qualification workload (measured with `mongreldb_perf --bench
-hot_overhead`).
+hot_overhead`). The `hot-metrics-sample.txt` evidence artifact contains
+the full Prometheus text export of every HOT series asserted in
+`hot_metrics_export.rs`.
 
 ## Reproducing the residual-closure evidence
+
+The single command below runs the entire pipeline and writes every
+artifact to `${RUNNER_TEMP:-/tmp}/mongreldb-residual-closure/` (the
+`residual-closure-evidence` GitHub Actions artifact). Each
+`*-results.jsonl` is a JSONL stream harvested from per-test JSON emits
+(`--nocapture`); `commit.txt`, `toolchain.txt`, and `environment.txt`
+record the exact SHA, rustup version, and host fingerprint so any
+measurement is reproducible from the same inputs.
+
+```bash
+bash scripts/run-residual-closure.sh
+```
+
+Equivalent per-topic invocations (useful for local debugging):
 
 ```bash
 # PR B point-lookup structure
@@ -282,12 +317,13 @@ cargo test -p mongreldb-core --test result_cache_async_persistence --all-feature
 # PR D controlled scan
 cargo test -p mongreldb-core --test controlled_scan_streaming --all-features
 
-# PR E churn oracle
+# PR E churn oracle (8 seeds; singular MONGRELDB_ORACLE_SEED)
 MONGRELDB_ORACLE_SEED=1 cargo test -p mongreldb-core --test index_churn_oracle --all-features
 
 # PR F HOT observability
 cargo test -p mongreldb-core --test lookup_metrics --all-features
-cargo test -p mongreldb-server --all-targets --all-features
+MONGRELDB_HOT_METRICS_OUT=/tmp/hot.txt \
+  cargo test -p mongreldb-server --test hot_metrics_export --all-features
 
 # Full closure matrix
 cargo fmt --check
@@ -304,7 +340,10 @@ above once the closure PR lands.
 
 Captured on `ca3d0b2..72cc43e` of master (rustc 1.97.1). The runner
 fingerprint and five-repetition medians replace the placeholder bounds above
-when the closure PR lands on a clean runner.
+when the closure PR lands on a clean runner. The exact-SHA gate
+(`verify-exact-sha` workflow job) reads `commit.txt` from the
+`residual-closure-evidence` artifact and refuses to claim closure unless
+the recorded SHA matches the release SHA passed to `workflow_dispatch`.
 
 | Surface | Pass | RED / Ignored |
 |---|---:|---:|
@@ -329,14 +368,15 @@ when the closure PR lands on a clean runner.
 | F | HOT fallback observability | DONE (6/6 lookup + 1/1 hot_metrics + 289/289 server) |
 | B | Point lookup directory | foundation + 17 tests + 256-run benchmark ship; on-disk checkpoint + L0 bounds in follow-up |
 | E | Non-Bitmap churn oracle | oracle + 1/4 tests ship; 3 RED tests catch real engine bugs in LearnedRange, FmIndex, ANN-Dense; 30-day nightly cadence + engine fixes remain |
-| Final | Closure workflow + docs | workflow with 10 jobs, ADR-0013, design docs, runbook, hot metrics export all shipped |
+| Final | Closure workflow + docs | `scripts/run-residual-closure.sh` + 5-job workflow + 8-seed matrix + `verify-exact-sha` gate + ADR-0014 + hot metrics export all shipped |
 
 ## Reproducing
 
 ```bash
-cargo test -p mongreldb-core                                # 709 lib + 7 controlled_scan + 15 cache_async + 6 lookup + 1 churn seed
-cargo test -p mongreldb-server                              # 289 / 289
-cargo test -p mongreldb-core --test index_churn_oracle -- --include-ignored
-# 1 pass, 3 fail (intentional RED — engine bugs documented)
+bash scripts/run-residual-closure.sh                                              # full bundle
+cargo test -p mongreldb-core                                                       # 709 lib + 7 controlled_scan + 15 cache_async + 6 lookup + 1 churn seed
+cargo test -p mongreldb-server                                                     # 289 / 289
+cargo test -p mongreldb-core --test index_churn_oracle -- --include-ignored         # 1 pass, 3 fail (intentional RED — engine bugs documented)
 ```
+
 

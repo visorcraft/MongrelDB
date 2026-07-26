@@ -113,6 +113,21 @@ async fn metrics_export_includes_hot_fallback_block() {
     );
     let body = text_body(response).await;
 
+    // Persist the wire-format Prometheus text so the residual-closure
+    // script can include it in the evidence artifact directory
+    // (`hot-metrics-sample.txt`). We only persist when the orchestrator
+    // script exports `MONGRELDB_HOT_METRICS_OUT`; otherwise the script
+    // harvests the body from the captured log instead.
+    if let Some(dir) = std::env::var_os("MONGRELDB_HOT_METRICS_OUT") {
+        let path = std::path::PathBuf::from(&dir);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let _ = std::fs::write(&path, body.as_bytes());
+    }
+
     // Every HELP/TYPE preamble required by the spec must be present.
     for preamble in [
         "# HELP hot_lookup_total ",

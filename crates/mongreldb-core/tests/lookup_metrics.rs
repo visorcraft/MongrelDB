@@ -9,6 +9,23 @@ use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
+/// Emit a structured one-line JSON record for the residual-closure script
+/// (`scripts/run-residual-closure.sh`) to harvest. The script greps for
+/// lines starting with `{"test":` and writes them to the corresponding
+/// `<topic>-results.jsonl` artifact.
+macro_rules! emit_metric {
+    ($name:literal, $metric:expr, $unit:literal) => {
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": $name,
+                "metric": $metric,
+                "unit": $unit,
+            })
+        )
+    };
+}
+
 fn schema() -> Schema {
     let column = |id: u16, name: &str, ty: TypeId, primary_key: bool| ColumnDef {
         id,
@@ -71,15 +88,22 @@ fn healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback() {
     }
 
     let after = table.lookup_metrics_snapshot();
+    let hit_delta = after.hot_lookup_hit - before.hot_lookup_hit;
+    let fallback_delta = after.hot_lookup_fallback - before.hot_lookup_fallback;
     assert_eq!(
-        after.hot_lookup_hit - before.hot_lookup_hit,
+        hit_delta,
         50,
         "expected 50 HOT hits from Pk lookups"
     );
     assert_eq!(
-        after.hot_lookup_fallback - before.hot_lookup_fallback,
+        fallback_delta,
         0,
         "healthy Pk lookups must not trigger fallback"
+    );
+    emit_metric!(
+        "lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback",
+        fallback_delta,
+        "fallback_count"
     );
 }
 
@@ -132,6 +156,11 @@ fn result_cache_counters_advance_on_repeat_query() {
     assert_eq!(
         write_delta, 0,
         "tiny one-row result must skip persistent tier (got write_us delta {write_delta})"
+    );
+    emit_metric!(
+        "lookup_metrics::result_cache_counters_advance_on_repeat_query",
+        mem_delta,
+        "memory_hit_count"
     );
 }
 
@@ -225,6 +254,11 @@ fn healthy_pk_lookup_records_zero_fallback() {
         after.hot_checkpoint_rejected_total - before.hot_checkpoint_rejected_total,
         0
     );
+    emit_metric!(
+        "lookup_metrics::healthy_pk_lookup_records_zero_fallback",
+        after.hot_lookup_hit - before.hot_lookup_hit,
+        "hot_hit_count"
+    );
 }
 
 #[test]
@@ -257,6 +291,12 @@ fn deleted_row_increments_tombstone_fallback_reason() {
         after.hot_fallback_runs_considered_total - before.hot_fallback_runs_considered_total >= 1,
         "deleted-row lookup must register at least one considered run"
     );
+    emit_metric!(
+        "lookup_metrics::deleted_row_increments_tombstone_fallback_reason",
+        after.hot_fallback_reasons[REASON_TOMBSTONE]
+            - before.hot_fallback_reasons[REASON_TOMBSTONE],
+        "tombstone_reason_count"
+    );
 }
 
 #[test]
@@ -288,6 +328,12 @@ fn historical_snapshot_records_historical_fallback_reason() {
             - before.hot_fallback_reasons[REASON_HISTORICAL_SNAPSHOT],
         1,
         "lookup under pre-delete snapshot must record HistoricalSnapshot reason"
+    );
+    emit_metric!(
+        "lookup_metrics::historical_snapshot_records_historical_fallback_reason",
+        after.hot_fallback_reasons[REASON_HISTORICAL_SNAPSHOT]
+            - before.hot_fallback_reasons[REASON_HISTORICAL_SNAPSHOT],
+        "historical_reason_count"
     );
 }
 
@@ -347,6 +393,11 @@ fn snapshot_to_metrics_is_consistent() {
         "sum of hot_fallback_reasons[0..9] (={reason_sum}) must equal \
          hot_lookup_fallback (={})",
         metrics.hot_lookup_fallback
+    );
+    emit_metric!(
+        "lookup_metrics::snapshot_to_metrics_is_consistent",
+        reason_sum,
+        "reason_sum_equals_fallback"
     );
 }
 
