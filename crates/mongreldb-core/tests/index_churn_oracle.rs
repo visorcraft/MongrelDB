@@ -22,7 +22,7 @@
 //! future work in the TODO list at the bottom of the file.
 
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest,
+    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
 };
 use mongreldb_core::schema::{
     AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind,
@@ -316,13 +316,7 @@ fn fm_oracle(model: &Model, snap: Snapshot, column_id: u16, pattern: &[u8]) -> H
 }
 
 /// Oracle for `IndexKind::LearnedRange` inclusive range scan on Int64.
-fn range_oracle(
-    model: &Model,
-    snap: Snapshot,
-    column_id: u16,
-    lo: i64,
-    hi: i64,
-) -> HashSet<u64> {
+fn range_oracle(model: &Model, snap: Snapshot, column_id: u16, lo: i64, hi: i64) -> HashSet<u64> {
     let mut hits = HashSet::new();
     for row in model.live_rows(snap) {
         if let Some(ValueRepr::Int(v)) = row.cols.get(&column_id) {
@@ -1522,3 +1516,238 @@ fn range_cols(pk: i64, score: i64) -> Vec<(u16, Value)> {
 // 4. Once the `Database::set_authorization_allowed_set` API lands, swap the
 //    current `query_at_with_allowed` drill for the shipped path.
 // ---------------------------------------------------------------------------
+
+// Additional index families use the same seeded churn shape as the canonical
+// FM/range/ANN oracles above.  The expected sets are independently computed
+// from the values inserted by this test (never from Table visibility APIs).
+fn churn_ann_matrix(algorithm: AnnAlgorithm, quantization: AnnQuantization, exact: bool) {
+    let dir = tempdir().unwrap();
+    let mut opts = AnnOptions {
+        algorithm,
+        quantization,
+        ..AnnOptions::default()
+    };
+    if algorithm == AnnAlgorithm::Ivf {
+        opts.ivf = Some(Default::default());
+    }
+    if algorithm == AnnAlgorithm::DiskAnn {
+        opts.diskann = Some(Default::default());
+    }
+    if matches!(quantization, AnnQuantization::Product { .. }) {
+        opts.product = Some(Default::default());
+    }
+    let schema = Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "v".into(),
+                ty: TypeId::Embedding { dim: 8 },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "ann_matrix".into(),
+            column_id: 2,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: IndexOptions {
+                ann: Some(opts),
+                ..Default::default()
+            },
+        }],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    };
+    let mut table = Table::create(dir.path(), schema, 1).unwrap();
+    let query: Vec<f32> = vec![1., -1., 1., -1., 1., -1., 1., -1.];
+    let mut rows: BTreeMap<i64, (RowId, Vec<f32>)> = BTreeMap::new();
+    for i in 0..64i64 {
+        let v = (0..8)
+            .map(|j| if (i + j as i64) % 2 == 0 { 1. } else { -1. })
+            .collect::<Vec<_>>();
+        let rid = table
+            .put(vec![(1, Value::Int64(i)), (2, Value::Embedding(v.clone()))])
+            .unwrap();
+        rows.insert(i, (rid, v));
+    }
+    table.commit().unwrap();
+    table.flush().unwrap();
+    let stale = rows.remove(&7).unwrap().0;
+    table.delete(stale).unwrap();
+    let replacement = vec![1.; 8];
+    let rid = table
+        .put(vec![
+            (1, Value::Int64(7)),
+            (2, Value::Embedding(replacement.clone())),
+        ])
+        .unwrap();
+    rows.insert(7, (rid, replacement));
+    table.commit().unwrap();
+    table.flush().unwrap();
+    table.compact().unwrap();
+    table.rebuild_indexes().unwrap();
+    table.close().unwrap();
+    drop(table);
+    let mut table = Table::open(dir.path()).unwrap();
+    let hits = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: query.clone(),
+            k: 8,
+        })
+        .unwrap();
+    let mut expected: Vec<(RowId, f32)> = rows
+        .values()
+        .map(|(r, v)| (*r, cosine_distance(&query, v)))
+        .collect();
+    expected.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(a.0.cmp(&b.0)));
+    expected.truncate(8);
+    let got: HashSet<RowId> = hits.iter().map(|h| h.row_id).collect();
+    let want: HashSet<RowId> = expected.iter().map(|x| x.0).collect();
+    let recall = got.intersection(&want).count() as f32 / want.len() as f32;
+    assert!(
+        recall >= if exact { 1.0 } else { 0.90 },
+        "recall={recall} got={got:?} want={want:?}"
+    );
+    assert!(!got.contains(&stale));
+}
+
+#[test]
+fn churn_oracle_ann_hnsw_binary_sign() {
+    churn_ann_matrix(AnnAlgorithm::Hnsw, AnnQuantization::BinarySign, true);
+}
+#[test]
+fn churn_oracle_ann_diskann_dense() {
+    churn_ann_matrix(AnnAlgorithm::DiskAnn, AnnQuantization::Dense, false);
+}
+#[test]
+fn churn_oracle_ann_ivf_dense() {
+    churn_ann_matrix(AnnAlgorithm::Ivf, AnnQuantization::Dense, false);
+}
+#[test]
+fn churn_oracle_ann_product_quantization() {
+    churn_ann_matrix(
+        AnnAlgorithm::Hnsw,
+        AnnQuantization::Product {
+            num_subvectors: 4,
+            bits: 8,
+        },
+        false,
+    );
+}
+
+fn simple_bytes_schema(kind: IndexKind) -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "payload".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "churn".into(),
+            column_id: 2,
+            kind,
+            predicate: None,
+            options: Default::default(),
+        }],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
+#[test]
+fn churn_oracle_sparse() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), simple_bytes_schema(IndexKind::Sparse), 1).unwrap();
+    let q = vec![(1, 1.0), (3, 2.0)];
+    let mut rows = Vec::new();
+    for i in 0..32i64 {
+        let v = vec![(1, i as f32), (2, 1.0), (3, (32 - i) as f32)];
+        let r = t
+            .put(vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(bincode::serialize(&v).unwrap())),
+            ])
+            .unwrap();
+        rows.push((r, v));
+    }
+    t.commit().unwrap();
+    t.flush().unwrap();
+    let h = t
+        .retrieve(&Retriever::Sparse {
+            column_id: 2,
+            query: q,
+            k: 8,
+        })
+        .unwrap();
+    let mut e = rows
+        .iter()
+        .map(|(r, v)| (*r, v[0].1 + 2. * v[2].1))
+        .collect::<Vec<_>>();
+    e.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+    e.truncate(8);
+    assert_eq!(
+        h.iter().map(|x| x.row_id).collect::<HashSet<_>>(),
+        e.iter().map(|x| x.0).collect()
+    );
+}
+
+#[test]
+fn churn_oracle_minhash() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), simple_bytes_schema(IndexKind::MinHash), 1).unwrap();
+    for i in 0..32i64 {
+        let s = if i % 3 == 0 {
+            vec!["a", "b", "c", "d"]
+        } else {
+            vec!["a", "x"]
+        };
+        t.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(serde_json::to_vec(&s).unwrap())),
+        ])
+        .unwrap();
+    }
+    t.commit().unwrap();
+    t.flush().unwrap();
+    let q = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|s| SetMember::String(s.into()))
+        .collect();
+    let h = t
+        .retrieve(&Retriever::MinHash {
+            column_id: 2,
+            members: q,
+            k: 8,
+        })
+        .unwrap();
+    assert_eq!(h.len(), 8);
+    assert!(h.windows(2).all(|w|matches!((w[0].score,w[1].score),(RetrieverScore::MinHashEstimatedJaccard(a),RetrieverScore::MinHashEstimatedJaccard(b)) if a>=b)));
+}
