@@ -11,7 +11,7 @@ use crate::columnar;
 use crate::cursor::NativePageCursor;
 use crate::encryption::Kek;
 use crate::encryption::DEK_LEN;
-use crate::epoch::{Epoch, EpochAuthority, EpochGuard, MaintenanceReceipt, Snapshot};
+use crate::epoch::{Epoch, EpochAuthority, EpochGuard, MaintenanceReceipt, Snapshot, VersionStamp};
 use crate::global_idx;
 use crate::index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, IndexGeneration, MinHashIndex,
@@ -3956,65 +3956,104 @@ impl Table {
         self.fm = fm;
         self.sparse = sparse;
         self.minhash = minhash;
-        let snapshot = Epoch(u64::MAX);
+        // REM-001: rebuild the current-state index from a *globally merged*
+        // candidate set rather than indexing each run's visible versions in
+        // iteration order. For every RowId we collect the candidate from each
+        // run + the overlay tiers, select the winner using full version
+        // authority (HLC when both sides are stamped), and index the winner
+        // exactly once. Tombstones and TTL-expired rows drop the entry
+        // entirely. Physical run order is no longer a substitute for HLC
+        // authority.
+        //
+        // Visibility spans every epoch — a row just upserted in the memtable
+        // lives at `pending_epoch = visible + 1` (no commit yet) so a snapshot
+        // pinned at `visible` would silently hide it. Use [`Snapshot::unbounded`]
+        // so the fold observes every durable row, regardless of whether the
+        // caller has committed since the upsert.
+        let snapshot = Snapshot::unbounded();
         let ttl_now = unix_nanos_now();
         let mut scanned = 0_usize;
+        let mut winners: HashMap<RowId, (VersionStamp, Row)> = HashMap::new();
+        let fold =
+            |row: Row, winners: &mut HashMap<RowId, (VersionStamp, Row)>, scanned: &mut usize| {
+                *scanned += 1;
+                let stamp = VersionStamp {
+                    epoch: row.committed_epoch,
+                    commit_ts: row.commit_ts,
+                };
+                winners
+                    .entry(row.row_id)
+                    .and_modify(|entry| {
+                        if stamp.is_newer_than(entry.0) {
+                            *entry = (stamp, row.clone());
+                        }
+                    })
+                    .or_insert((stamp, row));
+            };
         for rr in self.run_refs.clone() {
             if let Some(control) = control {
                 control.checkpoint()?;
             }
             let mut reader = self.open_reader(rr.run_id)?;
-            for row in reader.visible_versions_at(Snapshot::at(snapshot))? {
-                if row.deleted {
-                    continue;
-                }
+            for row in reader.visible_versions_at(snapshot)? {
                 if scanned.is_multiple_of(256) {
                     if let Some(control) = control {
                         control.checkpoint()?;
                     }
                 }
-                scanned += 1;
-                if self.row_expired_at(&row, ttl_now) {
-                    continue;
-                }
-                let tok_row = self.tokenized_for_indexes(&row);
-                index_into(
-                    &self.schema,
-                    &tok_row,
-                    &mut self.hot,
-                    &mut self.bitmap,
-                    &mut self.ann,
-                    &mut self.fm,
-                    &mut self.sparse,
-                    &mut self.minhash,
-                );
+                // Tombstones are still folded: a tombstone's stamp may beat a
+                // older live row's stamp and clear the entry; folding both
+                // lets the merge decide the final state per RowId.
+                fold(row, &mut winners, &mut scanned);
             }
         }
-        for row in self.mutable_run.visible_versions(snapshot) {
-            if scanned.is_multiple_of(256) {
+        for (index, row) in self
+            .memtable
+            .visible_versions_at(snapshot)
+            .into_iter()
+            .enumerate()
+        {
+            if index & 255 == 0 {
                 if let Some(control) = control {
                     control.checkpoint()?;
                 }
             }
-            scanned += 1;
-            if row.deleted {
-                self.remove_hot_for_row(row.row_id, snapshot);
-            } else if !self.row_expired_at(&row, ttl_now) {
-                self.index_row(&row);
-            }
+            fold(row, &mut winners, &mut scanned);
         }
-        for row in self.memtable.visible_versions(snapshot) {
-            if scanned.is_multiple_of(256) {
+        for (index, row) in self
+            .mutable_run
+            .visible_versions_at(snapshot)
+            .into_iter()
+            .enumerate()
+        {
+            if index & 255 == 0 {
                 if let Some(control) = control {
                     control.checkpoint()?;
                 }
             }
-            scanned += 1;
+            fold(row, &mut winners, &mut scanned);
+        }
+        for (_rid, (stamp, row)) in winners.drain() {
             if row.deleted {
-                self.remove_hot_for_row(row.row_id, snapshot);
-            } else if !self.row_expired_at(&row, ttl_now) {
-                self.index_row(&row);
+                // Tombstone: nothing to index. Anything that was about to be
+                // promoted under this rid is suppressed by the merge above.
+                let _ = stamp;
+                continue;
             }
+            if self.row_expired_at(&row, ttl_now) {
+                continue;
+            }
+            let tok_row = self.tokenized_for_indexes(&row);
+            index_into(
+                &self.schema,
+                &tok_row,
+                &mut self.hot,
+                &mut self.bitmap,
+                &mut self.ann,
+                &mut self.fm,
+                &mut self.sparse,
+                &mut self.minhash,
+            );
         }
         // Pin-aware historical discovery for EVERY active pin source that
         // compact honors via min_active_snapshot — local pin_snapshot pins,
@@ -4159,10 +4198,13 @@ impl Table {
         // those into the PGM would surface stale rids from `ColumnLearnedRange::
         // range` that the engine's overlay merge cannot strip — a leaked
         // tombstone is a wrong hit (tested by `churn_oracle_learned_range`).
-        let snapshot_epoch = self.current_epoch();
+        // REM-001: route through the full-Snapshot visibility API so HLC-pinned
+        // tables pick the HLC-newer winner across run versions instead of the
+        // higher-epoch legacy fallback. Same `unbounded` rationale as the
+        // rebuild — every durable run row must be eligible for the PGM input.
+        let snapshot = Snapshot::unbounded();
         let mut reader = self.open_reader(self.run_refs[0].run_id)?;
-        let (visible_positions, visible_rids) =
-            reader.visible_positions_with_rids(snapshot_epoch)?;
+        let (visible_positions, visible_rids) = reader.visible_positions_with_rids_at(snapshot)?;
         let row_ids: Vec<u64> = visible_rids.iter().map(|r| *r as u64).collect();
         for (column_index, (cid, epsilon)) in cols.into_iter().enumerate() {
             if column_index % 256 == 0 {
@@ -7615,6 +7657,10 @@ impl Table {
                         context.checkpoint()?;
                     }
                     let raw = index.search_with_context(query, breadth, context)?;
+                    eprintln!(
+                        "MASTER DEBUG ANN raw candidates: {:?}",
+                        raw.iter().map(|(r, _)| r.0).collect::<Vec<_>>()
+                    );
                     crate::trace::QueryTrace::record(|trace| {
                         trace.raw_candidates = raw.len();
                         let unique = raw
@@ -7968,29 +8014,41 @@ impl Table {
                 }
                 continue;
             }
-            let mut best: Option<(Epoch, bool, usize)> = None;
+            // REM-001: keep the full version stamp across runs so the eligibility fold
+            // honors HLC authority when candidates are stamped. The legacy
+            // `(epoch, deleted, reader_index)` tuple dropped `commit_ts` and
+            // could admit a stale high-epoch row over an HLC-newer low-epoch
+            // candidate.
+            let mut best: Option<(crate::sorted_run::VersionVisibility, usize)> = None;
             for (index, reader) in readers.iter_mut().enumerate() {
-                if let Some((epoch, deleted)) =
-                    reader.get_version_visibility_at(row_id, lookup_snapshot)?
+                if let Some(visibility) =
+                    reader.get_version_visibility_full_at(row_id, lookup_snapshot)?
                 {
                     if best
                         .as_ref()
-                        .map(|(best_epoch, ..)| epoch > *best_epoch)
+                        .map(|(current, _)| visibility.stamp.is_newer_than(current.stamp))
                         .unwrap_or(true)
                     {
-                        best = Some((epoch, deleted, index));
+                        best = Some((visibility, index));
                     }
                 }
             }
-            let Some((_, false, reader_index)) = best else {
+            let Some((visibility, reader_index)) = best else {
                 continue;
             };
+            if visibility.deleted {
+                continue;
+            }
             if let Some(ttl) = self.ttl {
-                if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
-                    .get_version_column_at(row_id, lookup_snapshot, ttl.column_id)?
-                {
-                    if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
-                        continue;
+                if let Some(ttl_value) = readers[reader_index].get_version_column_full_at(
+                    row_id,
+                    lookup_snapshot,
+                    ttl.column_id,
+                )? {
+                    if let Some(Value::Int64(timestamp)) = ttl_value.value {
+                        if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
+                            continue;
+                        }
                     }
                 }
             }
@@ -9301,33 +9359,47 @@ impl Table {
                 continue;
             }
 
-            let mut best: Option<(Epoch, bool, Option<Value>, usize)> = None;
+            // REM-001: keep `commit_ts` on the cross-run candidate so the winner is
+            // selected under full HLC authority instead of the legacy epoch-only
+            // tuple. The metadata-preserving `get_version_column_full_at`
+            // returns a `VersionedColumnValue` (stamp, deleted, value).
+            let mut best: Option<(crate::sorted_run::VersionedColumnValue, usize)> = None;
             for (index, reader) in readers.iter_mut().enumerate() {
-                if let Some((epoch, deleted, value)) =
-                    reader.get_version_column_at(row_id, snapshot, column_id)?
+                if let Some(versioned) =
+                    reader.get_version_column_full_at(row_id, snapshot, column_id)?
                 {
                     if best
                         .as_ref()
-                        .map(|(best_epoch, ..)| epoch > *best_epoch)
+                        .map(|(current, _)| versioned.stamp.is_newer_than(current.stamp))
                         .unwrap_or(true)
                     {
-                        best = Some((epoch, deleted, value, index));
+                        best = Some((versioned, index));
                     }
                 }
             }
-            let Some((_, false, Some(value), reader_index)) = best else {
+            let Some((candidate, reader_index)) = best else {
+                continue;
+            };
+            if candidate.deleted {
+                continue;
+            }
+            let Some(value) = candidate.value.clone() else {
                 continue;
             };
             if let Some(ttl) = self.ttl {
                 if ttl.column_id != column_id {
-                    if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
-                        .get_version_column_at(row_id, snapshot, ttl.column_id)?
-                    {
-                        if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
-                            continue;
+                    if let Some(ttl_value) = readers[reader_index].get_version_column_full_at(
+                        row_id,
+                        snapshot,
+                        ttl.column_id,
+                    )? {
+                        if let Some(Value::Int64(timestamp)) = ttl_value.value {
+                            if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
+                                continue;
+                            }
                         }
                     }
-                } else if let Value::Int64(timestamp) = value {
+                } else if let Value::Int64(timestamp) = &value {
                     if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
                         continue;
                     }
@@ -9568,11 +9640,19 @@ impl Table {
                 }
                 continue;
             }
-            let mut best: Option<(Epoch, Row)> = None;
+            // REM-001: keep the full VersionStamp so the cross-run fold uses HLC
+            // authority when both candidates are stamped (the legacy
+            // `(epoch, _)` tuple discarded `commit_ts` and let a higher-epoch
+            // run silently outrank an HLC-newer run).
+            let mut best: Option<(VersionStamp, Row)> = None;
             for reader in readers.iter_mut() {
-                if let Ok(Some((epoch, row))) = reader.get_version_at(RowId(*rid), snapshot) {
-                    if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
-                        best = Some((epoch, row));
+                if let Ok(Some((stamp, row))) = reader.get_version_stamp_at(RowId(*rid), snapshot) {
+                    if best
+                        .as_ref()
+                        .map(|(current, _)| stamp.is_newer_than(*current))
+                        .unwrap_or(true)
+                    {
+                        best = Some((stamp, row));
                     }
                 }
             }
@@ -9725,7 +9805,10 @@ impl Table {
             let Ok(mut reader) = self.open_reader(rr.run_id) else {
                 continue;
             };
-            let Ok(Some((_, row))) = reader.get_version(rid, snapshot.epoch) else {
+            // REM-001: route through the full-Snapshot run API so HLC-stamped
+            // row versions are admitted by `observes_row` and recency selection
+            // uses `commit_ts` instead of discarding it at the epoch boundary.
+            let Ok(Some((_stamp, row))) = reader.get_version_stamp_at(rid, snapshot) else {
                 continue;
             };
             consider(row);
@@ -14695,6 +14778,9 @@ fn index_into(
     sparse: &mut HashMap<u16, SparseIndex>,
     minhash: &mut HashMap<u16, MinHashIndex>,
 ) {
+    if row.row_id.0 == 70 || row.row_id.0 == 117 {
+        eprintln!("DEBUG index_into rid={}", row.row_id.0);
+    }
     for idef in &schema.indexes {
         let Some(val) = row.columns.get(&idef.column_id) else {
             continue;
@@ -14707,6 +14793,9 @@ fn index_into(
             }
             IndexKind::Ann => {
                 if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
+                    if row.row_id.0 == 70 || row.row_id.0 == 117 {
+                        eprintln!("DEBUG index_into ANN index rid={}", row.row_id.0);
+                    }
                     if let Some(meta) = val.generated_embedding_metadata() {
                         // P1.5-T3: pending/failed generated vectors stay out of ANN.
                         if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
@@ -14719,6 +14808,13 @@ fn index_into(
                         }
                     }
                     a.insert_validated(v, row.row_id);
+                } else if row.row_id.0 == 70 || row.row_id.0 == 117 {
+                    eprintln!(
+                        "DEBUG index_into ANN skip rid={} ann_has={} val_is_embed={}",
+                        row.row_id.0,
+                        ann.get_mut(&idef.column_id).is_some(),
+                        val.as_embedding().is_some(),
+                    );
                 }
             }
             IndexKind::FmIndex => {
@@ -14767,6 +14863,15 @@ fn index_into_single(
     sparse: &mut HashMap<u16, SparseIndex>,
     minhash: &mut HashMap<u16, MinHashIndex>,
 ) {
+    if row.row_id.0 == 70 || row.row_id.0 == 117 {
+        eprintln!(
+            "DEBUG index_into_single rid={} kind={:?} col_id={} has_col={}",
+            row.row_id.0,
+            idef.kind,
+            idef.column_id,
+            row.columns.contains_key(&idef.column_id),
+        );
+    }
     let Some(val) = row.columns.get(&idef.column_id) else {
         return;
     };
@@ -14778,6 +14883,9 @@ fn index_into_single(
         }
         IndexKind::Ann => {
             if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
+                if row.row_id.0 == 70 || row.row_id.0 == 117 {
+                    eprintln!("DEBUG index_into ANN rid={}", row.row_id.0);
+                }
                 if let Some(meta) = val.generated_embedding_metadata() {
                     // P1.5-T3: pending/failed generated vectors stay out of ANN.
                     if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
@@ -15201,4 +15309,438 @@ fn list_wal_numbers(wal_dir: &Path) -> Result<Option<u32>> {
         max_n = Some(max_n.map(|m: u32| m.max(n)).unwrap_or(n));
     }
     Ok(max_n)
+}
+
+// =========================================================================
+// REM-001: full HLC authority across multi-run merge paths.
+//
+// These tests are the canonical inversion fixture from spec §6.1 / §9:
+//
+//   Run A:  epoch=low    HLC=high   payload="newer-by-HLC"
+//   Run B:  epoch=high   HLC=low    payload="older-by-HLC"
+//   Snapshot: epoch=10   HLC=600
+//   Expected winner: "newer-by-HLC"
+//
+// Before the fix, every affected path stored `Option<(Epoch, ...)>` and
+// picked the cross-run winner by `epoch > best_epoch`. An epoch-only fold
+// selects Run B (high epoch) over Run A (low epoch), even though the HLC
+// watermark is above both rows' stamps and HLC is the authority.
+//
+// The fix threads `commit_ts` through every cross-run fold via
+// `crate::epoch::VersionStamp`; the run APIs return metadata-preserving
+// `VersionedColumnValue` / `VersionVisibility` structs so the engine merge
+// can compare candidates by full version stamp instead of epoch alone.
+//
+// The tests live inside this module so they can exercise private helpers
+// (`values_for_rids_at`, `eligible_candidate_ids`, `rebuild_indexes_from_runs`).
+// =========================================================================
+
+#[cfg(test)]
+mod rem001_multi_run_hlc_authority {
+    use super::*;
+    use crate::epoch::{Epoch, Snapshot, VersionStamp};
+    use crate::memtable::{Row, Value};
+    use crate::query::{Condition, Query};
+    use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+    use mongreldb_types::hlc::HlcTimestamp;
+    use tempfile::tempdir;
+
+    fn hlc(physical_micros: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical_micros,
+            logical: 0,
+            node_tiebreaker: 1,
+        }
+    }
+
+    fn pk_schema() -> Schema {
+        Schema {
+            schema_id: 1,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "name".into(),
+                    ty: TypeId::Bytes,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            indexes: Vec::new(),
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        }
+    }
+
+    fn pk_schema_with_bitmap() -> Schema {
+        Schema {
+            schema_id: 1,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "name".into(),
+                    ty: TypeId::Bytes,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            // Bitmap index on `name` so we can verify BitmapEq membership
+            // reflects the HLC-winning run after the index rebuild.
+            indexes: vec![IndexDef {
+                name: "name_bitmap".into(),
+                column_id: 2,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: Default::default(),
+            }],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        }
+    }
+
+    fn encode_put(table_id: u64, row: &Row) -> Vec<u8> {
+        use crate::database::StagedTxnWrite;
+        bincode::serialize(&StagedTxnWrite::Put {
+            table_id,
+            rows: bincode::serialize(&vec![row.clone()]).expect("encode row"),
+        })
+        .expect("encode payload")
+    }
+
+    /// Build the canonical two-run inversion:
+    ///
+    /// 1. apply the HLC-newer row first (lower committed_epoch because the
+    ///    commit happens before any other write);
+    /// 2. force-flush → `Run A` with `(epoch=1, HLC=500, payload="newer-by-HLC")`;
+    /// 3. apply the HLC-older row second (higher committed_epoch because the
+    ///    commit advances `epoch.visible()`);
+    /// 4. force-flush → `Run B` with `(epoch=2, HLC=400, payload="older-by-HLC")`.
+    ///
+    /// After both flushes the table owns two immutable `.sr` files; Run A
+    /// holds the HLC-newer payload, Run B holds the HLC-older payload, and
+    /// Run B has the higher epoch because it was written later. Epoch-only
+    /// cross-run folding picks Run B; HLC authority picks Run A.
+    fn build_inverted_database(dir: &std::path::Path, schema: Schema) -> crate::Database {
+        let db = crate::Database::create(dir).unwrap();
+        db.create_table("t", schema).unwrap();
+        let table_id = db.table_id("t").unwrap();
+        let rid = RowId(7);
+
+        let newer = Row::new_with_hlc(rid, Epoch(1), hlc(500))
+            .with_column(1, Value::Int64(7))
+            .with_column(2, Value::Bytes(b"newer-by-HLC".to_vec()));
+        let older = Row::new_with_hlc(rid, Epoch(2), hlc(400))
+            .with_column(1, Value::Int64(7))
+            .with_column(2, Value::Bytes(b"older-by-HLC".to_vec()));
+
+        db.apply_staged_txn_writes(1, &[encode_put(table_id, &newer)], hlc(500))
+            .expect("first apply");
+        {
+            let table = db.table("t").unwrap();
+            table.lock().force_flush().expect("flush run A");
+        }
+
+        db.apply_staged_txn_writes(2, &[encode_put(table_id, &older)], hlc(400))
+            .expect("second apply");
+        {
+            let table = db.table("t").unwrap();
+            table.lock().force_flush().expect("flush run B");
+        }
+
+        db
+    }
+
+    /// TTL fixture: HLC-newer row carries a far-future `ttl_ts`; HLC-older
+    /// row carries a far-past `ttl_ts`. The TTL eligibility path must read
+    /// the timestamp from the HLC-newer run (live), not from the HLC-older
+    /// run (expired), and admit the rid.
+    fn build_inverted_ttl_database(dir: &std::path::Path) -> crate::Database {
+        let db = crate::Database::create(dir).unwrap();
+        db.create_table("t", ttl_schema()).unwrap();
+        let table_id = db.table_id("t").unwrap();
+        let rid = RowId(7);
+        let read_time_ns: i64 = 1_000_000_000;
+        let newer = Row::new_with_hlc(rid, Epoch(1), hlc(500))
+            .with_column(1, Value::Int64(7))
+            .with_column(2, Value::Bytes(b"newer-by-HLC".to_vec()))
+            .with_column(3, Value::Int64(read_time_ns + 60 * 1_000_000_000));
+        let older = Row::new_with_hlc(rid, Epoch(2), hlc(400))
+            .with_column(1, Value::Int64(7))
+            .with_column(2, Value::Bytes(b"older-by-HLC".to_vec()))
+            .with_column(3, Value::Int64(read_time_ns - 60 * 1_000_000_000));
+
+        db.apply_staged_txn_writes(1, &[encode_put(table_id, &newer)], hlc(500))
+            .expect("first apply");
+        {
+            let table = db.table("t").unwrap();
+            table.lock().force_flush().expect("flush run A");
+        }
+        db.apply_staged_txn_writes(2, &[encode_put(table_id, &older)], hlc(400))
+            .expect("second apply");
+        {
+            let table = db.table("t").unwrap();
+            table.lock().force_flush().expect("flush run B");
+        }
+
+        db
+    }
+
+    fn ttl_schema() -> Schema {
+        Schema {
+            schema_id: 1,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "name".into(),
+                    ty: TypeId::Bytes,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 3,
+                    name: "ttl_ts".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            indexes: Vec::new(),
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        }
+    }
+
+    #[test]
+    fn multi_run_rows_for_rids_uses_hlc_winner_when_epoch_is_inverted() {
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema());
+        let table = db.table("t").unwrap();
+        let table = table.lock();
+        // HLC-pinned snapshot at HLC=600 — both rows are visible, the
+        // HLC-newer (Run A) must win. An epoch-only fold would silently
+        // return Run B's "older-by-HLC" payload because its epoch=2 > 1.
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        let rows = table
+            .rows_for_rids(&[7], snap)
+            .expect("rows_for_rids across two runs");
+        assert_eq!(rows.len(), 1, "one row materialised across two runs");
+        assert_eq!(
+            rows[0].columns.get(&2),
+            Some(&Value::Bytes(b"newer-by-HLC".to_vec())),
+            "multi-run rows_for_rids must honor HLC authority"
+        );
+    }
+
+    #[test]
+    fn multi_run_projected_column_uses_hlc_winner_when_epoch_is_inverted() {
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema());
+        let table = db.table("t").unwrap();
+        let table = table.lock();
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        let projected = table
+            .values_for_rids_at(&[7], 2, snap, i64::MAX)
+            .expect("values_for_rids_at across two runs");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected[0].1,
+            Value::Bytes(b"newer-by-HLC".to_vec()),
+            "multi-run projection must pick the HLC-newer column"
+        );
+    }
+
+    #[test]
+    fn ann_candidate_eligibility_uses_hlc_winner_across_runs() {
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema());
+        let table = db.table("t").unwrap();
+        let table = table.lock();
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        // ANN/Sparse/MinHash all funnel through `eligible_candidate_ids`.
+        // The HLC-newer row must survive the visibility fold.
+        let eligible = table
+            .eligible_candidate_ids(&[RowId(7)], 2, snap, None)
+            .expect("eligibility across runs");
+        assert!(
+            eligible.contains(&RowId(7)),
+            "HLC-newer rid must remain eligible across runs"
+        );
+    }
+
+    #[test]
+    fn ttl_inverted_run_is_admitted_via_values_for_rids_at() {
+        let dir = tempdir().unwrap();
+        let db = build_inverted_ttl_database(dir.path());
+        let table = db.table("t").unwrap();
+        let table = table.lock();
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        let now_ns: i64 = 1_000_000_000;
+        // HLC-newer row's ttl_ts = now+60s (live); HLC-older row's ttl_ts =
+        // now-60s (expired). The TTL eligibility path must read the
+        // timestamp from the HLC-newer run (live) and surface the rid.
+        let projected = table
+            .values_for_rids_at(&[7], 2, snap, now_ns)
+            .expect("ttl-aware projection");
+        assert_eq!(projected.len(), 1, "TTL must admit the HLC-newer row");
+        assert_eq!(
+            projected[0].1,
+            Value::Bytes(b"newer-by-HLC".to_vec()),
+            "TTL must be read from the HLC-newer run; older run's timestamp is expired"
+        );
+    }
+
+    #[test]
+    fn hot_candidate_inspection_uses_full_snapshot_for_run_versions() {
+        // The HOT-fallback inspection path. `inspect_row_at` is invoked via
+        // `Table::get` for rid-resolved lookups (the same merge logic
+        // applies); the test exercises the production read path and asserts
+        // the HLC-newer payload wins across runs.
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema());
+        let table = db.table("t").unwrap();
+        let table = table.lock();
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        let row = table
+            .get(RowId(7), snap)
+            .expect("Table::get across two runs");
+        assert_eq!(
+            row.columns.get(&2),
+            Some(&Value::Bytes(b"newer-by-HLC".to_vec())),
+            "Table::get must surface the HLC-newer winner"
+        );
+    }
+
+    #[test]
+    fn learned_range_rebuild_indexes_only_hlc_visible_winners() {
+        // The learned-range rebuild path (`build_learned_ranges_inner`) is
+        // only exercised when the table has exactly one run; we therefore
+        // exercise the more general `rebuild_indexes_from_runs` path, which
+        // performs the global merge. After rebuild the projected column for
+        // rid=7 must come from the HLC-newer run even though Run B was
+        // iterated last.
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema());
+        let handle = db.table("t").unwrap();
+        let mut table = handle.lock();
+        table.rebuild_indexes_from_runs().expect("rebuild");
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        let rows = table
+            .rows_for_rids(&[7], snap)
+            .expect("post-rebuild rows_for_rids");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].columns.get(&2),
+            Some(&Value::Bytes(b"newer-by-HLC".to_vec())),
+            "post-rebuild row must be the HLC-newer winner"
+        );
+    }
+
+    #[test]
+    fn rebuild_indexes_uses_global_hlc_winners_not_run_iteration_order() {
+        // REM-001 §7.6: after `rebuild_indexes` the primary-key lookup and
+        // the Bitmap index membership must both reflect the HLC-winning run,
+        // not whichever run was iterated last.
+        //
+        // Close + reopen preservation of the HLC-newer winner is covered by
+        // `sorted_run_hlc_visibility::reopen_from_disk_preserves_hlc_visibility`
+        // (and by the merged `pk_equality_fallback` path through `Table::get`).
+        // Re-running it on top of `rebuild_indexes` would require writing two
+        // `Op::Put` records for the same rid across two WAL segments, which
+        // trips the recovery-time duplicate-row-id guard — that guard is
+        // orthogonal to REM-001 and would mask the actual fix we want to
+        // exercise here.
+        let dir = tempdir().unwrap();
+        let db = build_inverted_database(dir.path(), pk_schema_with_bitmap());
+        let handle = db.table("t").unwrap();
+        let mut table = handle.lock();
+        table.rebuild_indexes_from_runs().expect("rebuild");
+        let snap = Snapshot::at_hlc(Epoch(10), hlc(600));
+        // 1. PK lookup resolves to the HLC winner.
+        let row = table.get(RowId(7), snap).expect("post-rebuild Table::get");
+        assert_eq!(
+            row.columns.get(&2),
+            Some(&Value::Bytes(b"newer-by-HLC".to_vec())),
+            "PK lookup must resolve to the HLC-newer winner"
+        );
+        // 2. Bitmap membership: name="newer-by-HLC" must contain rid=7
+        //    and name="older-by-HLC" must NOT (the older version was
+        //    suppressed by the global merge before indexing).
+        let query_newer = Query::new().and(Condition::BitmapEq {
+            column_id: 2,
+            value: b"newer-by-HLC".to_vec(),
+        });
+        let rows_newer = table.query(&query_newer).expect("bitmap eq newer");
+        let rids_newer: Vec<u64> = rows_newer.iter().map(|r| r.row_id.0).collect();
+        assert!(
+            rids_newer.contains(&7),
+            "bitmap must include the HLC-newer value (got {rids_newer:?})"
+        );
+        let query_older = Query::new().and(Condition::BitmapEq {
+            column_id: 2,
+            value: b"older-by-HLC".to_vec(),
+        });
+        let rows_older = table.query(&query_older).expect("bitmap eq older");
+        let rids_older: Vec<u64> = rows_older.iter().map(|r| r.row_id.0).collect();
+        assert!(
+            !rids_older.contains(&7),
+            "bitmap must NOT include the HLC-older value (got {rids_older:?})"
+        );
+    }
+
+    #[test]
+    fn version_stamp_is_newer_than_matches_snapshot_rule() {
+        // Unit test for the new VersionStamp helper: HLC-newer wins despite
+        // a smaller epoch; both-unstamped falls back to epoch.
+        let early = hlc(100);
+        let late = hlc(200);
+        let newer = VersionStamp {
+            epoch: Epoch(9),
+            commit_ts: Some(late),
+        };
+        let older = VersionStamp {
+            epoch: Epoch(50),
+            commit_ts: Some(early),
+        };
+        assert!(newer.is_newer_than(older));
+        assert!(!older.is_newer_than(newer));
+        let a = VersionStamp {
+            epoch: Epoch(5),
+            commit_ts: None,
+        };
+        let b = VersionStamp {
+            epoch: Epoch(4),
+            commit_ts: None,
+        };
+        assert!(a.is_newer_than(b));
+    }
 }

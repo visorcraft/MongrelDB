@@ -17,7 +17,7 @@
 
 use crate::columnar;
 use crate::encryption::{setup_run_encryption, Cipher, Kek, RunEncryption};
-use crate::epoch::{Epoch, Snapshot};
+use crate::epoch::{Epoch, Snapshot, VersionStamp};
 use crate::error::{MongrelError, Result};
 use crate::index::pgm::PgmIndex;
 use crate::memtable::{Row, Value};
@@ -144,6 +144,33 @@ pub(crate) fn decode_commit_ts_value(value: Option<&Value>) -> Option<HlcTimesta
         _ => None,
     }
 }
+
+/// Metadata-preserving column projection returned by
+/// [`RunReader::get_version_column_full_at`]. Keeps `commit_ts` so the engine
+/// can compare candidates across runs under HLC authority (REM-001).
+#[derive(Debug, Clone)]
+pub(crate) struct VersionedColumnValue {
+    pub stamp: VersionStamp,
+    pub deleted: bool,
+    pub value: Option<Value>,
+}
+
+/// Metadata-preserving visibility record returned by
+/// [`RunReader::get_version_visibility_full_at`]. Same rationale as
+/// [`VersionedColumnValue`]: survives the run boundary without losing
+/// `commit_ts`, so cross-run folds can apply
+/// [`VersionStamp::is_newer_than`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VersionVisibility {
+    pub stamp: VersionStamp,
+    pub deleted: bool,
+}
+
+/// Internal page-pruned probe result: `(epoch, commit_ts, page_seq,
+/// local_index)`. `commit_ts` is preserved through REM-001 so metadata-
+/// preserving callers can compare candidates by full version stamp without
+/// re-decoding SYS_COMMIT_TS.
+type FoundVersionPage = (u64, Option<HlcTimestamp>, usize, usize);
 
 /// True when `column_id` is a reserved system column (including optional HLC).
 fn is_system_column_id(column_id: u16) -> bool {
@@ -2869,8 +2896,30 @@ impl RunReader {
     ) -> Result<Option<(Epoch, Row)>> {
         match self.find_version_page_at(row_id, snapshot)? {
             None => Ok(None),
-            Some((epoch, seq, local_index)) => Ok(Some((
+            Some((epoch, _commit_ts, seq, local_index)) => Ok(Some((
                 Epoch(epoch),
+                self.materialize_in_page(seq, local_index)?,
+            ))),
+        }
+    }
+
+    /// Full-Snapshot variant of [`Self::get_version_at`] that preserves
+    /// `commit_ts` in the return so cross-run folds can compare candidates
+    /// under HLC authority (REM-001). Visibility has already been applied by
+    /// [`Snapshot::observes_row`] during the page-pruned search; the returned
+    /// `stamp` is only meant for recency selection.
+    pub(crate) fn get_version_stamp_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+    ) -> Result<Option<(VersionStamp, Row)>> {
+        match self.find_version_page_at(row_id, snapshot)? {
+            None => Ok(None),
+            Some((epoch, commit_ts, seq, local_index)) => Ok(Some((
+                VersionStamp {
+                    epoch: Epoch(epoch),
+                    commit_ts,
+                },
                 self.materialize_in_page(seq, local_index)?,
             ))),
         }
@@ -2886,7 +2935,7 @@ impl RunReader {
         &mut self,
         row_id: RowId,
         snapshot: Epoch,
-    ) -> Result<Option<(u64, usize, usize)>> {
+    ) -> Result<Option<FoundVersionPage>> {
         self.find_version_page_at(row_id, Snapshot::at(snapshot))
     }
 
@@ -2895,11 +2944,16 @@ impl RunReader {
     /// [`Snapshot::observes_row`] and [`Snapshot::version_is_newer`]. HLC
     /// authority is only consulted when the snapshot has a non-ZERO
     /// `commit_ts`; otherwise the legacy epoch rule applies.
+    ///
+    /// Returns `(epoch, commit_ts, page_seq, local_index)` — REM-001 keeps the
+    /// `commit_ts` in the return so metadata-preserving callers (e.g. the
+    /// columnar visibility gather) can compare candidates by full version
+    /// stamp without re-decoding SYS_COMMIT_TS.
     fn find_version_page_at(
         &mut self,
         row_id: RowId,
         snapshot: Snapshot,
-    ) -> Result<Option<(u64, usize, usize)>> {
+    ) -> Result<Option<FoundVersionPage>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(None);
@@ -2986,7 +3040,7 @@ impl RunReader {
                 }
             }
         }
-        Ok(best.map(|(epoch, _, seq, local)| (epoch, seq, local)))
+        Ok(best)
     }
 
     /// Like [`Self::get_version`], but decodes only `column_id` (plus the
@@ -3012,7 +3066,9 @@ impl RunReader {
         snapshot: Snapshot,
         column_id: u16,
     ) -> Result<Option<(Epoch, bool, Option<Value>)>> {
-        let Some((epoch, seq, local_index)) = self.find_version_page_at(row_id, snapshot)? else {
+        let Some((epoch, _commit_ts, seq, local_index)) =
+            self.find_version_page_at(row_id, snapshot)?
+        else {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
@@ -3054,6 +3110,67 @@ impl RunReader {
         Ok(Some((Epoch(epoch), deleted, value)))
     }
 
+    /// Metadata-preserving counterpart of [`Self::get_version_column_at`]
+    /// (REM-001). Returns `commit_ts` so the caller can compare candidates
+    /// across runs with [`VersionStamp::is_newer_than`] instead of falling
+    /// back to epoch-only ordering.
+    pub(crate) fn get_version_column_full_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+        column_id: u16,
+    ) -> Result<Option<VersionedColumnValue>> {
+        let Some((epoch, commit_ts, seq, local_index)) =
+            self.find_version_page_at(row_id, snapshot)?
+        else {
+            return Ok(None);
+        };
+        let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+        let page_start: usize = self.find_header(SYS_ROW_ID)?.page_stats[..seq]
+            .iter()
+            .map(|s| s.row_count as usize)
+            .sum();
+        let global_index = page_start + local_index;
+        let native_at = |slf: &mut Self, cid: u16| -> Result<Option<Value>> {
+            if !slf.dir.iter().any(|h| h.column_id == cid) {
+                return Ok(None);
+            }
+            let ty = slf.resolve_type(cid);
+            if !matches!(
+                ty,
+                TypeId::Bool
+                    | TypeId::Int8
+                    | TypeId::Int16
+                    | TypeId::Int32
+                    | TypeId::Int64
+                    | TypeId::UInt8
+                    | TypeId::UInt16
+                    | TypeId::UInt32
+                    | TypeId::UInt64
+                    | TypeId::Float32
+                    | TypeId::Float64
+                    | TypeId::TimestampNanos
+                    | TypeId::Date32
+                    | TypeId::Bytes
+            ) {
+                return Ok(slf.column(cid)?.get(global_index).cloned());
+            }
+            Ok(slf
+                .decode_page_native_cached(ty, cid, seq, page_rows)?
+                .value_at(local_index))
+        };
+        let deleted = matches!(native_at(self, SYS_DELETED)?, Some(Value::Bool(true)));
+        let value = native_at(self, column_id)?;
+        Ok(Some(VersionedColumnValue {
+            stamp: VersionStamp {
+                epoch: Epoch(epoch),
+                commit_ts,
+            },
+            deleted,
+            value,
+        }))
+    }
+
     /// Newest version epoch and tombstone flag without decoding a user column.
     pub fn get_version_visibility(
         &mut self,
@@ -3069,7 +3186,9 @@ impl RunReader {
         row_id: RowId,
         snapshot: Snapshot,
     ) -> Result<Option<(Epoch, bool)>> {
-        let Some((epoch, seq, local_index)) = self.find_version_page_at(row_id, snapshot)? else {
+        let Some((epoch, _commit_ts, seq, local_index)) =
+            self.find_version_page_at(row_id, snapshot)?
+        else {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
@@ -3083,6 +3202,38 @@ impl RunReader {
             _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
         };
         Ok(Some((Epoch(epoch), deleted)))
+    }
+
+    /// Metadata-preserving counterpart of [`Self::get_version_visibility_at`]
+    /// (REM-001). Returns `commit_ts` so cross-run folds can compare
+    /// candidates by full version stamp rather than epoch alone.
+    pub(crate) fn get_version_visibility_full_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+    ) -> Result<Option<VersionVisibility>> {
+        let Some((epoch, commit_ts, seq, local_index)) =
+            self.find_version_page_at(row_id, snapshot)?
+        else {
+            return Ok(None);
+        };
+        let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+        let deleted = match self.decode_page_native_cached(
+            self.resolve_type(SYS_DELETED),
+            SYS_DELETED,
+            seq,
+            page_rows,
+        )? {
+            columnar::NativeColumn::Bool { data, .. } => data[local_index] != 0,
+            _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
+        };
+        Ok(Some(VersionVisibility {
+            stamp: VersionStamp {
+                epoch: Epoch(epoch),
+                commit_ts,
+            },
+            deleted,
+        }))
     }
 
     /// Build a `Row` from page `seq`'s data at `local_index`, decoding only
