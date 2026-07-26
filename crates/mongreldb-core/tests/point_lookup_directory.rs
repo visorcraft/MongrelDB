@@ -126,32 +126,33 @@ fn historical_snapshot_selecting_older_run() {
 fn multiple_versions_of_one_row_inside_one_run() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
-    let rid = put(&mut table, 1);
+    let mut rid = put(&mut table, 1);
     table.commit().unwrap();
 
-    // 9 Kit-style updates to the same PK.
-    for v in 2..=10 {
+    // 9 Kit-style updates to the same PK: delete the previous rid, put a new
+    // rid with the same PK. The engine tombstones the previous rid (HOT
+    // already maps the PK to it) and produces a fresh rid.
+    for _ in 2..=10 {
         table.delete(rid).unwrap();
-        let new_rid = put(&mut table, v);
+        let new_rid = put(&mut table, 1);
         assert_ne!(new_rid, rid, "Kit-style update must assign fresh rid");
+        rid = new_rid;
         table.commit().unwrap();
     }
     table.force_flush().unwrap();
 
-    // At current snapshot, exactly one live row matches PK=10.
+    // At current snapshot, exactly one live row matches the PK.
     let rows = table
-        .query(&Query::new().and(Condition::Pk(pk_bytes(10))))
+        .query(&Query::new().and(Condition::Pk(pk_bytes(1))))
         .unwrap();
-    assert_eq!(rows.len(), 1, "exactly one live row for the latest PK");
-    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(10)));
+    assert_eq!(rows.len(), 1, "exactly one live row for the PK");
+    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(1)));
 
-    // Earlier PKs must have zero live rows at the current snapshot.
-    for v in 1..=9 {
-        let rows = table
-            .query(&Query::new().and(Condition::Pk(pk_bytes(v))))
-            .unwrap();
-        assert_eq!(rows.len(), 0, "earlier PK {} must be tombstoned", v);
-    }
+    // The current live rid is the one produced by the last Kit-style update.
+    assert_eq!(
+        rows[0].row_id, rid,
+        "the live row must be the latest fresh rid"
+    );
 }
 
 /// 5. Mixed stamped and unstamped versions. Writes two run files: the first
