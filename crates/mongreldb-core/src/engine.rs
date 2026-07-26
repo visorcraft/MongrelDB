@@ -28,6 +28,7 @@ use crate::txn::{GroupCommit, OwnedRow};
 use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
 use arc_swap::ArcSwap;
+use mongreldb_types::hlc::HlcTimestamp;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -3457,7 +3458,7 @@ impl Table {
                 .hot_lookup_fallback_runs
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut reader = self.open_reader(rr.run_id)?;
-            for row in reader.visible_rows(snapshot.epoch)? {
+            for row in reader.visible_versions_at(snapshot)? {
                 if overlay.contains(&row.row_id.0) || row.deleted {
                     if row.deleted {
                         tombstone_hit = true;
@@ -3530,7 +3531,10 @@ impl Table {
                 control.checkpoint()?;
             }
             let mut reader = self.open_reader(rr.run_id)?;
-            for row in reader.visible_rows(snapshot)? {
+            for row in reader.visible_versions_at(Snapshot::at(snapshot))? {
+                if row.deleted {
+                    continue;
+                }
                 if scanned.is_multiple_of(256) {
                     if let Some(control) = control {
                         control.checkpoint()?;
@@ -6192,7 +6196,7 @@ impl Table {
             };
             // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
             // legacy runs without the column fall back to epoch visibility.
-            let Ok(Some((_, row))) = reader.get_version(row_id, snapshot.epoch) else {
+            let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
                 continue;
             };
             consider(row);
@@ -6275,7 +6279,7 @@ impl Table {
             checkpoints += 1;
             let reader = self.open_reader(run.run_id)?;
             sources.push(ControlledVisibleSource::run(
-                reader.into_visible_version_cursor(snapshot.epoch)?,
+                reader.into_visible_version_cursor_at(snapshot)?,
             ));
         }
         // `start` is captured AFTER the source materialisation, so the
@@ -6350,7 +6354,7 @@ impl Table {
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
             // P0.5-T3: optional SYS_COMMIT_TS restored when present on the run.
-            for row in reader.visible_versions(snapshot.epoch)? {
+            for row in reader.visible_versions_at(snapshot)? {
                 fold(row);
             }
         }
@@ -6382,7 +6386,7 @@ impl Table {
         {
             let rr = self.run_refs[0].clone();
             let mut reader = self.open_reader(rr.run_id)?;
-            let idxs = reader.visible_indices(snapshot.epoch)?;
+            let idxs = reader.visible_indices_at(snapshot)?;
             let mut cols = Vec::with_capacity(self.schema.columns.len());
             for cdef in &self.schema.columns {
                 cols.push((cdef.id, reader.gather_column(cdef.id, &idxs)?));
@@ -7223,7 +7227,7 @@ impl Table {
             let mut best: Option<(Epoch, bool, usize)> = None;
             for (index, reader) in readers.iter_mut().enumerate() {
                 if let Some((epoch, deleted)) =
-                    reader.get_version_visibility(row_id, snapshot.epoch)?
+                    reader.get_version_visibility_at(row_id, lookup_snapshot)?
                 {
                     if best
                         .as_ref()
@@ -7239,7 +7243,7 @@ impl Table {
             };
             if let Some(ttl) = self.ttl {
                 if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
-                    .get_version_column(row_id, snapshot.epoch, ttl.column_id)?
+                    .get_version_column_at(row_id, lookup_snapshot, ttl.column_id)?
                 {
                     if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
                         continue;
@@ -8458,15 +8462,14 @@ impl Table {
                 for &raw_row_id in row_ids {
                     let row_id = RowId(raw_row_id);
                     if let Some((_, false, Some(value))) =
-                        reader.get_version_column(row_id, snapshot.epoch, column_id)?
+                        reader.get_version_column_at(row_id, snapshot, column_id)?
                     {
                         values.push((row_id, value));
                     }
                 }
                 return Ok(values);
             }
-            let (positions, visible_row_ids) =
-                reader.visible_positions_with_rids(snapshot.epoch)?;
+            let (positions, visible_row_ids) = reader.visible_positions_with_rids_at(snapshot)?;
             let requested: Vec<(RowId, usize)> = row_ids
                 .iter()
                 .filter_map(|raw| {
@@ -8557,7 +8560,7 @@ impl Table {
             let mut best: Option<(Epoch, bool, Option<Value>, usize)> = None;
             for (index, reader) in readers.iter_mut().enumerate() {
                 if let Some((epoch, deleted, value)) =
-                    reader.get_version_column(row_id, snapshot.epoch, column_id)?
+                    reader.get_version_column_at(row_id, snapshot, column_id)?
                 {
                     if best
                         .as_ref()
@@ -8574,7 +8577,7 @@ impl Table {
             if let Some(ttl) = self.ttl {
                 if ttl.column_id != column_id {
                     if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
-                        .get_version_column(row_id, snapshot.epoch, ttl.column_id)?
+                        .get_version_column_at(row_id, snapshot, ttl.column_id)?
                     {
                         if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
                             continue;
@@ -8729,7 +8732,7 @@ impl Table {
                         }
                         continue;
                     }
-                    if let Some((_, row)) = reader.get_version(RowId(rid), snapshot.epoch)? {
+                    if let Some((_, row)) = reader.get_version_at(RowId(rid), snapshot)? {
                         if !row.deleted {
                             rows.push(row);
                         }
@@ -8746,7 +8749,7 @@ impl Table {
             // `materialize_batch` call so user columns are decoded once each via
             // the typed, page-cached path (not a per-rid `Vec<Value>` decode +
             // `.cloned()`).
-            let (positions, vis_rids) = reader.visible_positions_with_rids(snapshot.epoch)?;
+            let (positions, vis_rids) = reader.visible_positions_with_rids_at(snapshot)?;
             // First pass: classify each input rid (overlay / run position /
             // not-found), recording the run positions to fetch in input order.
             enum Src {
@@ -8823,7 +8826,7 @@ impl Table {
             }
             let mut best: Option<(Epoch, Row)> = None;
             for reader in readers.iter_mut() {
-                if let Ok(Some((epoch, row))) = reader.get_version(RowId(*rid), snapshot.epoch) {
+                if let Ok(Some((epoch, row))) = reader.get_version_at(RowId(*rid), snapshot) {
                     if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
                         best = Some((epoch, row));
                     }
@@ -9200,9 +9203,7 @@ impl Table {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
-                        RowIdSet::from_unsorted(
-                            li.range(*lo, *hi).into_iter().collect(),
-                        )
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
                         // Multi-run: learned_range only covers run_refs[0]; a
                         // tombstone in a later run wouldn't strip its alive
@@ -9211,15 +9212,9 @@ impl Table {
                         // leaked rid would surface as a wrong hit. Fall through
                         // to the MVCC-aware multi-run path so deletes land in
                         // any run are honored.
-                        let mut multi =
-                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
                         if lo == hi {
-                            self.union_bitmap_point_i64(
-                                &mut multi,
-                                *column_id,
-                                *lo,
-                                snapshot,
-                            );
+                            self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
                         }
                         return Ok(multi);
                     }
@@ -9332,13 +9327,13 @@ impl Table {
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
-            let matched = reader.range_row_ids_visible_i64(column_id, lo, hi, snapshot.epoch)?;
+            let matched = reader.range_row_ids_visible_i64_at(column_id, lo, hi, snapshot)?;
             for rid in matched {
                 if !overlay_rids.contains(&rid) {
                     row_ids.push(rid);
                 }
             }
-            for rid in reader.tombstoned_row_ids(snapshot.epoch)? {
+            for rid in reader.tombstoned_row_ids_at(snapshot)? {
                 tomb_rids.insert(rid);
             }
         }
@@ -9363,13 +9358,13 @@ impl Table {
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
-            let matched = reader.range_row_ids_visible_f64(
+            let matched = reader.range_row_ids_visible_f64_at(
                 column_id,
                 lo,
                 lo_inclusive,
                 hi,
                 hi_inclusive,
-                snapshot.epoch,
+                snapshot,
             )?;
             for rid in matched {
                 if !overlay_rids.contains(&rid) {
@@ -9498,7 +9493,7 @@ impl Table {
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
-            let matched = reader.null_row_ids_visible(column_id, want_nulls, snapshot.epoch)?;
+            let matched = reader.null_row_ids_visible_at(column_id, want_nulls, snapshot)?;
             for rid in matched {
                 if !overlay_rids.contains(&rid) {
                     row_ids.push(rid);
@@ -10062,12 +10057,12 @@ impl Table {
     /// materialize (`rows_for_rids`) instead of this overlay-only set. (§5.1)
     fn overlay_tombstoned_rids(&self, snapshot: Snapshot) -> Vec<u64> {
         let mut out = Vec::new();
-        for row in self.memtable.visible_versions(snapshot.epoch) {
+        for row in self.memtable.visible_versions_at(snapshot) {
             if row.deleted {
                 out.push(row.row_id.0);
             }
         }
-        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+        for row in self.mutable_run.visible_versions_at(snapshot) {
             if row.deleted {
                 out.push(row.row_id.0);
             }
@@ -10323,7 +10318,7 @@ impl Table {
         {
             let rr = self.run_refs[0].clone();
             let mut reader = self.open_reader(rr.run_id)?;
-            let idxs = reader.visible_indices_native(snapshot.epoch)?;
+            let idxs = reader.visible_indices_native_at(snapshot)?;
             execution_checkpoint(control, 0)?;
             let all_visible = idxs.len() == reader.row_count();
             // Phase 15.1: decode every requested column in parallel when the
@@ -10986,16 +10981,16 @@ impl Table {
             return Ok(None);
         }
         let mut reader = self.open_reader(self.run_refs[0].run_id)?;
-        let (positions, rids) = reader.visible_positions_with_rids(snapshot.epoch)?;
+        let (positions, rids) = reader.visible_positions_with_rids_at(snapshot)?;
 
         // Collect overlay rows from memtable + mutable_run (visible, newest
         // version per row). These shadow any stale version in the run.
         let overlay_rids: HashSet<u64> = {
             let mut s = HashSet::new();
-            for row in self.memtable.visible_versions(snapshot.epoch) {
+            for row in self.memtable.visible_versions_at(snapshot) {
                 s.insert(row.row_id.0);
             }
-            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            for row in self.mutable_run.visible_versions_at(snapshot) {
                 s.insert(row.row_id.0);
             }
             s
@@ -11113,44 +11108,67 @@ impl Table {
         }
 
         // Open each run once; read its system columns + page layout.
-        let mut run_meta: Vec<(RunReader, Vec<i64>, Vec<i64>, Vec<u8>, Vec<usize>)> =
-            Vec::with_capacity(self.run_refs.len());
+        let mut run_meta: Vec<(
+            RunReader,
+            Vec<i64>,
+            Vec<i64>,
+            Vec<u8>,
+            Option<Vec<Option<HlcTimestamp>>>,
+            Vec<usize>,
+        )> = Vec::with_capacity(self.run_refs.len());
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
             let (rids, eps, del) = reader.system_columns_native()?;
             let page_rows = reader.page_row_counts(SYS_ROW_ID)?;
-            run_meta.push((reader, rids, eps, del, page_rows));
+            let commit_ts: Option<Vec<Option<HlcTimestamp>>> =
+                if reader.has_column(crate::sorted_run::SYS_COMMIT_TS) {
+                    let col = reader.column_native(crate::sorted_run::SYS_COMMIT_TS)?;
+                    Some(
+                        (0..rids.len())
+                            .map(|i| {
+                                crate::sorted_run::decode_commit_ts_value(col.value_at(i).as_ref())
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+            run_meta.push((reader, rids, eps, del, commit_ts, page_rows));
         }
 
         // Global cross-run newest-version resolution: rid -> (epoch, run_idx,
         // position, deleted). Mirrors `visible_rows`, tracking which run owns
-        // the newest MVCC-visible version.
-        let mut best: HashMap<u64, (u64, usize, usize, bool)> = HashMap::new();
-        for (run_idx, (_, rids, eps, del, _)) in run_meta.iter().enumerate() {
+        // the newest MVCC-visible version. HLC stamps participate via
+        // `Snapshot::observes_row` and `version_is_newer` so an HLC-pinned
+        // snapshot surfaces the HLC-newer winner regardless of local epoch.
+        let mut best: HashMap<u64, (Epoch, Option<HlcTimestamp>, usize, usize, bool)> =
+            HashMap::new();
+        for (run_idx, (_, rids, eps, del, commit_ts, _)) in run_meta.iter().enumerate() {
             for i in 0..rids.len() {
                 let rid = rids[i] as u64;
-                let e = eps[i] as u64;
-                if e > snapshot.epoch.0 {
+                let e = Epoch(eps[i] as u64);
+                let ts = commit_ts.as_ref().and_then(|v| v.get(i).copied().flatten());
+                if !snapshot.observes_row(e, ts) {
                     continue;
                 }
                 let is_del = del[i] != 0;
                 best.entry(rid)
                     .and_modify(|cur| {
-                        if e > cur.0 {
-                            *cur = (e, run_idx, i, is_del);
+                        if Snapshot::version_is_newer(e, ts, cur.0, cur.1) {
+                            *cur = (e, ts, run_idx, i, is_del);
                         }
                     })
-                    .or_insert((e, run_idx, i, is_del));
+                    .or_insert((e, ts, run_idx, i, is_del));
             }
         }
 
         // Overlay rids (memtable + mutable-run) shadow every run version.
         let overlay_rids: HashSet<u64> = {
             let mut s = HashSet::new();
-            for row in self.memtable.visible_versions(snapshot.epoch) {
+            for row in self.memtable.visible_versions_at(snapshot) {
                 s.insert(row.row_id.0);
             }
-            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            for row in self.mutable_run.visible_versions_at(snapshot) {
                 s.insert(row.row_id.0);
             }
             s
@@ -11171,7 +11189,7 @@ impl Table {
         // owned by the run holding its newest visible version, is not deleted,
         // is not shadowed by the overlay, and satisfies the predicate.
         let mut per_run: Vec<Vec<(u64, usize)>> = vec![Vec::new(); run_meta.len()];
-        for (rid, (_, run_idx, pos, deleted)) in &best {
+        for (rid, (_, _, run_idx, pos, deleted)) in &best {
             if *deleted {
                 continue;
             }
@@ -11193,7 +11211,7 @@ impl Table {
         let mut streams = Vec::with_capacity(run_meta.len());
         let mut heap: BinaryHeap<std::cmp::Reverse<(u64, usize)>> = BinaryHeap::new();
         let mut total = 0usize;
-        for (run_idx, (reader, _, _, _, page_rows)) in run_meta.into_iter().enumerate() {
+        for (run_idx, (reader, _, _, _, _, page_rows)) in run_meta.into_iter().enumerate() {
             let mut starts = Vec::with_capacity(page_rows.len());
             let mut acc = 0usize;
             for &r in &page_rows {
@@ -11309,10 +11327,10 @@ impl Table {
                 })
                 .or_insert_with(|| (row.committed_epoch, row));
         };
-        for row in self.memtable.visible_versions(snapshot.epoch) {
+        for row in self.memtable.visible_versions_at(snapshot) {
             fold(row);
         }
-        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+        for row in self.mutable_run.visible_versions_at(snapshot) {
             fold(row);
         }
         let mut out: Vec<Row> = best
