@@ -28,8 +28,9 @@ on:
       - "docs/architecture/adr/0013-persistent-result-cache-publication.md"
       - "docs/operations/hot-fallback.md"
   schedule:
-    # nightly at 04:00 UTC; staggered to avoid the qualification window.
+    # nightly at 04:00 UTC; Sunday also runs the weekly soak.
     - cron: "0 4 * * *"
+    - cron: "0 4 * * 0"
 
 permissions:
   contents: read
@@ -109,12 +110,62 @@ jobs:
   # ---- TODO §4 ---------------------------------------------------------
   index-churn-oracle-smoke:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
-      MONGRELDB_ORACLE_SEEDS: "1,2,3,4,5,6,7,8"
+      MONGRELDB_ORACLE_SEED: ${{ matrix.seed }}
+      MONGRELDB_ORACLE_OPERATIONS: "500"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
-      - run: cargo test -p mongreldb-core --test index_churn_oracle --all-features
+      - run: cargo test -p mongreldb-core --test index_churn_oracle --all-features -- --nocapture
+
+  nightly-churn-oracle:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 4 * * *'
+    runs-on: ubuntu-latest
+    env:
+      MONGRELDB_ORACLE_OPERATIONS: "10000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Run 100 replayable seeds
+        run: |
+          mkdir -p churn-artifacts
+          git rev-parse HEAD > churn-artifacts/commit.txt
+          rustc --version --verbose > churn-artifacts/toolchain.txt
+          for seed in $(seq 1 100); do
+            printf '%s\n' "$seed" > churn-artifacts/seed.txt
+            MONGRELDB_ORACLE_SEED="$seed" cargo test -p mongreldb-core --test index_churn_oracle --all-features -- --nocapture 2>&1 | tee churn-artifacts/query-trace.log
+          done
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-churn-oracle-failure
+          path: churn-artifacts/
+
+  weekly-churn-oracle:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 4 * * 0'
+    runs-on: ubuntu-latest
+    env:
+      MONGRELDB_ORACLE_OPERATIONS: "1000000"
+      MONGRELDB_ORACLE_STALE_LIVE_RATIO: "100"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Run weekly stale-candidate soak
+        run: |
+          mkdir -p churn-artifacts
+          git rev-parse HEAD > churn-artifacts/commit.txt
+          rustc --version --verbose > churn-artifacts/toolchain.txt
+          printf '%s\n' "1" > churn-artifacts/seed.txt
+          MONGRELDB_ORACLE_SEED=1 cargo test -p mongreldb-core --test index_churn_oracle --all-features -- --nocapture 2>&1 | tee churn-artifacts/query-trace.log
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-churn-oracle-failure
+          path: churn-artifacts/
 
   # ---- TODO §5 ---------------------------------------------------------
   hot-observability-core:
