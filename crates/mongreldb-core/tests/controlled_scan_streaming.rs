@@ -300,7 +300,6 @@ fn hundred_thousand_rows_with_ten_versions_each_match_oracle() {
 }
 
 #[test]
-#[ignore = "pre-existing BeTree buffer-not-iterated gap on the memtable path: the streaming memtable cursor misses rows that are still in the Bε-tree root buffer. Tracked separately; the spec acceptance (memory bound + 256-version cancellation) is already covered by the bulk_load-backed 1M-row tests above."]
 fn dense_hot_key_versions_streams() {
     let directory = tempdir().unwrap();
     let mut table = Table::create(directory.path(), schema(), 1).unwrap();
@@ -511,3 +510,4 @@ fn dml_count_update_delete_regression_fixture_still_passes() {
         .unwrap();
     assert_eq!(count, oracle);
 }
+

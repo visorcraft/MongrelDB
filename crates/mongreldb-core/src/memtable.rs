@@ -14,6 +14,7 @@ use crate::be_tree::{BeTree, LeafVersions};
 use crate::epoch::{Epoch, Snapshot};
 use crate::rowid::RowId;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -188,12 +189,12 @@ pub struct MemtableVisibleVersionCursor<'a> {
     leaf_index: usize,
     snapshot: Snapshot,
     current_row_id: Option<RowId>,
-    best: Option<&'a Row>,
+    best: Option<Cow<'a, Row>>,
     finished: bool,
 }
 
 impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
-    type Item = (RowId, Epoch, &'a Row);
+    type Item = (RowId, Epoch, Cow<'a, Row>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
@@ -212,41 +213,48 @@ impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
                 self.finished = true;
                 return self.take_best();
             };
-            let row = match version {
-                std::borrow::Cow::Borrowed(row) => row,
-                std::borrow::Cow::Owned(_) => continue,
-            };
-            if !self
-                .snapshot
-                .observes_version(row.committed_epoch, row.commit_ts)
-            {
+            // Skip versions outside the snapshot's visibility window.
+            let (epoch, commit_ts, row_id) = cow_parts(&version);
+            if !self.snapshot.observes_version(epoch, commit_ts) {
                 continue;
             }
-            if self.current_row_id != Some(row.row_id) {
+            if self.current_row_id != Some(row_id) {
                 let result = self.take_best();
-                self.current_row_id = Some(row.row_id);
-                self.best = Some(row);
+                self.current_row_id = Some(row_id);
+                self.best = Some(version);
                 if result.is_some() {
                     return result;
                 }
-            } else if self.best.is_none_or(|best| {
-                Snapshot::version_is_newer(
-                    row.committed_epoch,
-                    row.commit_ts,
-                    best.committed_epoch,
-                    best.commit_ts,
-                )
+            } else if self.best.as_ref().is_none_or(|best| {
+                let (best_epoch, best_ts, _best_id) = cow_parts(best);
+                Snapshot::version_is_newer(epoch, commit_ts, best_epoch, best_ts)
             }) {
-                self.best = Some(row);
+                self.best = Some(version);
             }
         }
     }
 }
 
+#[allow(clippy::ptr_arg)] // `Cow<'_, Row>::Deref` doesn't auto-coerce, so keep the type explicit here
+fn cow_parts(cow: &Cow<'_, Row>) -> (Epoch, Option<mongreldb_types::hlc::HlcTimestamp>, RowId) {
+    match cow {
+        Cow::Borrowed(r) => (r.committed_epoch, r.commit_ts, r.row_id),
+        Cow::Owned(r) => (r.committed_epoch, r.commit_ts, r.row_id),
+    }
+}
+
 impl<'a> MemtableVisibleVersionCursor<'a> {
-    fn take_best(&mut self) -> Option<(RowId, Epoch, &'a Row)> {
-        let row = self.best.take()?;
-        Some((row.row_id, row.committed_epoch, row))
+    fn take_best(&mut self) -> Option<(RowId, Epoch, Cow<'a, Row>)> {
+        let best = self.best.take()?;
+        let epoch = match &best {
+            Cow::Borrowed(r) => r.committed_epoch,
+            Cow::Owned(r) => r.committed_epoch,
+        };
+        let row_id = match &best {
+            Cow::Borrowed(r) => r.row_id,
+            Cow::Owned(r) => r.row_id,
+        };
+        Some((row_id, epoch, best))
     }
 }
 
@@ -826,5 +834,121 @@ mod tests {
             .map(|(rid, epoch, row)| (rid.0, epoch.0, row.deleted))
             .collect();
         assert_eq!(got_early, vec![(1, 1, false)]);
+    }
+
+    /// Regression for the BeTree root-buffer-not-iterated bug (iss10).
+    ///
+    /// Before the fix, [`crate::be_tree::LeafVersions`] walked only the
+    /// consolidated leaves of the Bε-tree — silently skipping messages that
+    /// were still sitting in an internal-node buffer pending flush. A scan
+    /// over a live memtable that has triggered at least one split therefore
+    /// returned a subset of the inserted rows (typically the leaf-resident
+    /// ones, missing every row still buffered at the root).
+    ///
+    /// This test inserts 1,000 rows without flushing. The first
+    /// `LEAF_CAP = 32` rows go directly into a leaf; subsequent splits and
+    /// buffer flushes leave a meaningful fraction of the rows sitting in
+    /// internal-node buffers. The streaming cursor must yield all 1,000
+    /// distinct `(RowId, Epoch)` pairs.
+    #[test]
+    fn newest_visible_iter_includes_root_buffer_rows() {
+        const N: u64 = 1_000;
+        let mut m = Memtable::new();
+        // Each row gets a fresh RowId and its own (epoch-bumped) version; the
+        // memtable has no flush path in this scope so the rows have to be
+        // reachable via the active BeTree.
+        for i in 0..N {
+            let mut r = Row::new(RowId(i), Epoch(i + 1));
+            r.columns.insert(1, Value::Int64(i as i64 * 10));
+            m.upsert(r);
+        }
+        assert_eq!(m.len(), N as usize);
+
+        // Snapshot high enough that every version is visible.
+        let snap = Snapshot::at(Epoch(N + 10));
+        let got: Vec<(u64, u64, i64)> = m
+            .newest_visible_iter(&snap)
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, int_of_value(&row)))
+            .collect();
+
+        // Count: every distinct RowId must be visible exactly once.
+        assert_eq!(
+            got.len(),
+            N as usize,
+            "buffered rows must be visible to a streaming scan (got {})",
+            got.len()
+        );
+        let mut seen_row_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (rid, _epoch, _v) in &got {
+            assert!(
+                seen_row_ids.insert(*rid),
+                "duplicate RowId {rid} in streaming scan output"
+            );
+        }
+        // Set equality: every input RowId was emitted, no extras.
+        let expected_ids: std::collections::HashSet<u64> = (0..N).collect();
+        let got_ids: std::collections::HashSet<u64> = got.iter().map(|(rid, _, _)| *rid).collect();
+        assert_eq!(got_ids, expected_ids, "must yield every input RowId");
+
+        // Spot-check: epoch and column bytes for a buffered row (high RowId
+        // is almost certainly still buffered, not yet flushed to a leaf).
+        let (_, epoch_raw, v) = got
+            .iter()
+            .find(|(rid, _, _)| *rid == N - 1)
+            .copied()
+            .expect("highest RowId present");
+        assert_eq!(epoch_raw, N);
+        assert_eq!(v, (N as i64 - 1) * 10);
+    }
+
+    /// Same shape as `newest_visible_iter_includes_root_buffer_rows`, but
+    /// drives the cursor against one row with many versions — exercising the
+    /// case where the same `RowId` coexists in both a leaf and the root
+    /// buffer (dedup picks the newest visible, which must come from the
+    /// buffer when the buffered version is the latest).
+    #[test]
+    fn newest_visible_iter_buffered_versions_dedup_against_leaf_resident() {
+        // Seed the leaf via a few inserts.
+        let mut m = Memtable::new();
+        for i in 0..16u64 {
+            let mut r = Row::new(RowId(7), Epoch(i + 1));
+            r.columns.insert(1, Value::Int64(i as i64));
+            m.upsert(r);
+        }
+        // Then drive the tree through several splits by inserting many more
+        // rows so the buffered message for the same RowId has to coexist with
+        // the leaf-resident version (different epochs for the same RowId in
+        // two locations).
+        for i in 0u64..4_000 {
+            let mut r = Row::new(RowId(1000 + i), Epoch(i + 100));
+            r.columns.insert(1, Value::Int64(i as i64));
+            m.upsert(r);
+        }
+        // One more version of row 7, distinctly newer than the leaf-resident
+        // ones — guaranteed to land in some internal-node buffer.
+        let mut latest_seven = Row::new(RowId(7), Epoch(20_000));
+        latest_seven.columns.insert(1, Value::Int64(999));
+        m.upsert(latest_seven);
+
+        let snap = Snapshot::at(Epoch(20_001));
+        let seven = m
+            .newest_visible_iter(&snap)
+            .find(|(rid, _epoch, _row)| *rid == RowId(7))
+            .expect("row 7 visible");
+        assert_eq!(seven.1, Epoch(20_000), "buffered newest wins");
+        // The full cursor must yield every distinct RowId (latest version):
+        // 4,000 background rows + 1 distinct version of row 7.
+        let total: u64 = m
+            .newest_visible_iter(&snap)
+            .map(|(rid, _epoch, _row)| rid.0)
+            .fold(0u64, |acc, _| acc + 1);
+        assert_eq!(total, 4_001, "buffer + leaf coverage");
+    }
+
+    fn int_of_value(row: &Row) -> i64 {
+        match row.columns.get(&1) {
+            Some(Value::Int64(x)) => *x,
+            other => panic!("expected Int64 column, got {other:?}"),
+        }
     }
 }
