@@ -285,12 +285,34 @@ impl<'a> ControlledVisibleSource<'a> {
                     }
                 }
             }
-            ControlledVisibleCursor::Memtable(iter) => iter
-                .next()
-                .map(|(rid, epoch, row)| ControlledVisibleCandidate::Memtable(rid, epoch, row)),
-            ControlledVisibleCursor::MutableRun(iter) => iter
-                .next()
-                .map(|(rid, epoch, row)| ControlledVisibleCandidate::MutableRun(rid, epoch, row)),
+            ControlledVisibleCursor::Memtable(iter) => {
+                let prev_peak = iter.peak_examined;
+                let next = iter
+                    .next()
+                    .map(|(rid, epoch, row)| ControlledVisibleCandidate::Memtable(rid, epoch, row));
+                if let Some(peak) = iter.peak_examined.checked_sub(prev_peak) {
+                    crate::trace::QueryTrace::record(|t| {
+                        t.controlled_scan_peak_same_row_versions = t
+                            .controlled_scan_peak_same_row_versions
+                            .saturating_add(peak);
+                    });
+                }
+                next
+            }
+            ControlledVisibleCursor::MutableRun(iter) => {
+                let prev_peak = iter.peak_examined;
+                let next = iter.next().map(|(rid, epoch, row)| {
+                    ControlledVisibleCandidate::MutableRun(rid, epoch, row)
+                });
+                if let Some(peak) = iter.peak_examined.checked_sub(prev_peak) {
+                    crate::trace::QueryTrace::record(|t| {
+                        t.controlled_scan_peak_same_row_versions = t
+                            .controlled_scan_peak_same_row_versions
+                            .saturating_add(peak);
+                    });
+                }
+                next
+            }
             ControlledVisibleCursor::Run(cursor) => cursor
                 .next_visible_version(control)?
                 .map(ControlledVisibleCandidate::Run),
@@ -370,6 +392,9 @@ fn merge_controlled_visible_sources<'a>(
         }
     }
     let mut merged = 0_usize;
+    let mut peak_buffer_rows: usize = heap.len();
+    let mut peak_same_row_versions: usize = 0;
+    let mut cancel_started: Option<std::time::Instant> = None;
     while let Some(Reverse((row_id, source_index))) = heap.pop() {
         if merged.is_multiple_of(256) {
             control.checkpoint()?;
@@ -380,6 +405,7 @@ fn merge_controlled_visible_sources<'a>(
         if let Some(next) = &sources[source_index].current {
             heap.push(Reverse((next.row_id(), source_index)));
         }
+        let mut same_row_versions: usize = 1;
         while heap
             .peek()
             .is_some_and(|Reverse((candidate, _))| *candidate == row_id)
@@ -389,6 +415,7 @@ fn merge_controlled_visible_sources<'a>(
                 break;
             };
             let candidate = sources[source_index].pop(control)?;
+            same_row_versions += 1;
             // HLC-authoritative: when both candidates carry HLC, the higher
             // HLC wins regardless of local epoch. Falls back to epoch when
             // either side lacks HLC (legacy / sorted-run path).
@@ -405,6 +432,8 @@ fn merge_controlled_visible_sources<'a>(
                 heap.push(Reverse((next.row_id(), source_index)));
             }
         }
+        peak_same_row_versions = peak_same_row_versions.max(same_row_versions);
+        peak_buffer_rows = peak_buffer_rows.max(heap.len());
         if best.deleted() {
             continue;
         }
@@ -412,8 +441,21 @@ fn merge_controlled_visible_sources<'a>(
         if !expired(&row) {
             visit(row)?;
         }
+        if cancel_started.is_none() && control.is_cancelled() {
+            cancel_started = Some(std::time::Instant::now());
+        }
     }
-    control.checkpoint()
+    crate::trace::QueryTrace::record(|t| {
+        t.controlled_scan_source_refills = t.controlled_scan_source_refills.saturating_add(0); // source refills are counted by each cursor's own advance()
+        t.controlled_scan_peak_source_buffer_rows = t
+            .controlled_scan_peak_source_buffer_rows
+            .saturating_add(peak_buffer_rows);
+        t.controlled_scan_peak_same_row_versions = t
+            .controlled_scan_peak_same_row_versions
+            .saturating_add(peak_same_row_versions);
+    });
+    control.checkpoint()?;
+    Ok(())
 }
 
 #[cfg(test)]
