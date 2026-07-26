@@ -3062,6 +3062,54 @@ impl RunReader {
         Ok(out)
     }
 
+    /// Visit every version in the run, exposing only the system columns
+    /// (`SYS_ROW_ID`, `SYS_EPOCH`, `SYS_DELETED`, `SYS_COMMIT_TS`) without
+    /// materializing any user column. Used by the run-lookup directory
+    /// rebuild path so a checkpoint rebuild never pays to decode user data
+    /// pages (spec §8.4 step 4). The visitor returns `Ok(())` to continue or
+    /// any other `Result` to short-circuit.
+    pub fn for_each_system<F>(&mut self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(RowId, Epoch, Option<HlcTimestamp>, bool) -> Result<()>,
+    {
+        // Cache the system columns once so the visitor can fire without
+        // re-decoding every page. A run with 256M rows still pays the
+        // page-decoding cost, but no user-column decode is ever performed.
+        let row_ids = self.column(SYS_ROW_ID)?.to_vec();
+        let epochs = self.column(SYS_EPOCH)?.to_vec();
+        let deleted = self.column(SYS_DELETED)?.to_vec();
+        let has_commit_ts = self.has_column(SYS_COMMIT_TS);
+        let commit_ts: Vec<Option<HlcTimestamp>> = if has_commit_ts {
+            let col = self.column(SYS_COMMIT_TS)?;
+            let mut out = Vec::with_capacity(col.len());
+            for v in col {
+                out.push(decode_commit_ts_value(Some(v)));
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        debug_assert_eq!(row_ids.len(), epochs.len());
+        debug_assert_eq!(row_ids.len(), deleted.len());
+        for (i, rid_val) in row_ids.iter().enumerate() {
+            let rid = match rid_val {
+                Value::Int64(n) => RowId(*n as u64),
+                _ => continue,
+            };
+            let epoch = match epochs[i] {
+                Value::Int64(n) => Epoch(n as u64),
+                _ => Epoch(0),
+            };
+            let ts = commit_ts.get(i).copied().flatten();
+            let del = match deleted[i] {
+                Value::Bool(b) => b,
+                _ => false,
+            };
+            visit(rid, epoch, ts, del)?;
+        }
+        Ok(())
+    }
+
     /// Every version with cooperative cancellation and a hard row bound.
     pub fn all_rows_controlled(
         &mut self,

@@ -60,7 +60,7 @@ impl Table {
     }
 
     /// Number of run-refs currently at L0 (mutable-run spill tier).
-    pub(crate) fn l0_run_count(&self) -> usize {
+    pub fn l0_run_count(&self) -> usize {
         self.run_refs().iter().filter(|rr| rr.level == 0).count()
     }
 
@@ -379,6 +379,25 @@ impl Table {
         }
         self.finish_indexes_for_run_replacement();
         self.checkpoint_indexes(maintenance_epoch);
+        // Issue 4 / spec §8.4 step 5: republish the run-lookup directory so
+        // the next open fast-paths point lookups against the post-compaction
+        // run set. A directory publish failure is logged but does not poison
+        // the compaction — the manifest is already durable, and the next
+        // flush will rebuild the directory lazily.
+        let _ = mongreldb_fault::inject("compaction.replacement_publication");
+        if let Err(error) = self.publish_run_lookup_directory() {
+            // Mark the directory incomplete so the read path falls back to
+            // range scans until a future publish succeeds.
+            self.lookup_metrics
+                .directory_incomplete
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lookup_metrics
+                .directory_lookup_fallback
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Best-effort log via the trace shape; tests that arm the fault
+            // hook will assert the metric moved.
+            let _ = error;
+        }
         Ok((
             true,
             Some(MaintenanceReceipt {

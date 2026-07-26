@@ -316,13 +316,7 @@ fn fm_oracle(model: &Model, snap: Snapshot, column_id: u16, pattern: &[u8]) -> H
 }
 
 /// Oracle for `IndexKind::LearnedRange` inclusive range scan on Int64.
-fn range_oracle(
-    model: &Model,
-    snap: Snapshot,
-    column_id: u16,
-    lo: i64,
-    hi: i64,
-) -> HashSet<u64> {
+fn range_oracle(model: &Model, snap: Snapshot, column_id: u16, lo: i64, hi: i64) -> HashSet<u64> {
     let mut hits = HashSet::new();
     for row in model.live_rows(snap) {
         if let Some(ValueRepr::Int(v)) = row.cols.get(&column_id) {
