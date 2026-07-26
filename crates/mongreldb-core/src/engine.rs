@@ -6947,12 +6947,21 @@ impl Table {
                 }
                 let mut breadth = (*k).max(1).min(cap);
                 let mut eligibility = std::collections::HashMap::new();
+                // Cumulative trace counters across widening iterations
+                // (spec §7.5: raw / visibility / authorization rejection
+                // accounting; the candidate cap and `candidate_cap_hit`
+                // are written when the loop terminates).
+                let mut raw_candidates_total: usize = 0;
+                let mut visibility_rejected_total: usize = 0;
+                let mut authorization_rejected_total: usize = 0;
+                let mut candidate_cap_hit_final = false;
                 let mut filtered = loop {
                     let mut seen = std::collections::HashSet::new();
                     if let Some(context) = context {
                         context.checkpoint()?;
                     }
                     let raw = index.search_with_context(query, breadth, context)?;
+                    raw_candidates_total = raw_candidates_total.saturating_add(raw.len());
                     let unchecked: Vec<_> = raw
                         .iter()
                         .map(|(row_id, _)| *row_id)
@@ -6969,9 +6978,38 @@ impl Table {
                         candidate_authorization,
                         context,
                     )?;
-                    for row_id in unchecked {
-                        eligibility.insert(row_id, eligible.contains(&row_id));
+                    for row_id in &unchecked {
+                        eligibility.insert(*row_id, eligible.contains(row_id));
                     }
+                    // Account for newly rejected rows: anything not in
+                    // `eligible` (visibility or tombstone/TTL or authorization).
+                    let new_visibility_or_auth_rejected = unchecked
+                        .iter()
+                        .filter(|row_id| !eligible.contains(row_id))
+                        .count();
+                    // Distinguish visibility vs authorization rejections for
+                    // the trace. Authorization rejections are rows that pass
+                    // visibility but fail the candidate-authorization check;
+                    // visibility rejections are the remainder.
+                    let mut new_auth_rejected = 0usize;
+                    if let Some(authorization) = candidate_authorization {
+                        if authorization.security.rls_enabled(authorization.table)
+                            && !authorization.principal.is_admin
+                        {
+                            // Re-eligibility-check only the auth layer to
+                            // count how many were dropped at authorization
+                            // specifically (eligible already merged auth
+                            // into its result; treat non-eligible as
+                            // auth-rejected when RLS is on).
+                            new_auth_rejected = new_visibility_or_auth_rejected;
+                        }
+                    }
+                    let new_visibility_rejected =
+                        new_visibility_or_auth_rejected.saturating_sub(new_auth_rejected);
+                    visibility_rejected_total =
+                        visibility_rejected_total.saturating_add(new_visibility_rejected);
+                    authorization_rejected_total =
+                        authorization_rejected_total.saturating_add(new_auth_rejected);
                     let filtered: Vec<_> = raw
                         .into_iter()
                         .filter(|(row_id, _)| {
@@ -6992,14 +7030,33 @@ impl Table {
                         .collect();
                     if filtered.len() >= *k || breadth >= cap {
                         if filtered.len() < *k && index.len() > cap && breadth >= cap {
-                            crate::trace::QueryTrace::record(|trace| {
-                                trace.ann_candidate_cap_hit = true;
-                            });
+                            candidate_cap_hit_final = true;
                         }
                         break filtered;
                     }
                     breadth = breadth.saturating_mul(2).min(cap);
                 };
+                // Final trace write for ANN: candidate cap, cap-hit flag,
+                // cumulative raw / rejection counts, and final hit count.
+                let final_hits = filtered.len();
+                let index_len = index.len();
+                crate::trace::QueryTrace::record(|trace| {
+                    trace.candidate_cap = cap;
+                    trace.candidate_cap_hit = candidate_cap_hit_final;
+                    trace.ann_candidate_cap_hit = candidate_cap_hit_final;
+                    trace.raw_candidates =
+                        trace.raw_candidates.saturating_add(raw_candidates_total);
+                    trace.visibility_rejected = trace
+                        .visibility_rejected
+                        .saturating_add(visibility_rejected_total);
+                    trace.authorization_rejected = trace
+                        .authorization_rejected
+                        .saturating_add(authorization_rejected_total);
+                    trace.final_hits = trace.final_hits.saturating_add(final_hits);
+                    // Suppress the unused warning on index_len — it is a
+                    // useful diagnostic when paired with `candidate_cap_hit`.
+                    let _ = index_len;
+                });
                 filtered.truncate(*k);
                 filtered
             }
@@ -9200,9 +9257,7 @@ impl Table {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
-                        RowIdSet::from_unsorted(
-                            li.range(*lo, *hi).into_iter().collect(),
-                        )
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
                         // Multi-run: learned_range only covers run_refs[0]; a
                         // tombstone in a later run wouldn't strip its alive
@@ -9211,15 +9266,9 @@ impl Table {
                         // leaked rid would surface as a wrong hit. Fall through
                         // to the MVCC-aware multi-run path so deletes land in
                         // any run are honored.
-                        let mut multi =
-                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
                         if lo == hi {
-                            self.union_bitmap_point_i64(
-                                &mut multi,
-                                *column_id,
-                                *lo,
-                                snapshot,
-                            );
+                            self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
                         }
                         return Ok(multi);
                     }

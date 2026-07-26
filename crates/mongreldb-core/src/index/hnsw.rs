@@ -129,6 +129,13 @@ impl Hnsw {
             chosen.sort_by_key(|(d, _)| *d);
             chosen.truncate(m_layer);
             let neighbors: Vec<usize> = chosen.iter().map(|(_, n)| *n).collect();
+            // Bridge owner = closest selected neighbor. If no old neighbor
+            // keeps the new node after independent degree-bound pruning, the
+            // bridge owner is forced to retain it (degree bound preserved by
+            // replacing the farthest retained edge if needed). This keeps
+            // every newly inserted node reachable from the entry point on
+            // every layer, including the mandatory layer-0 search graph.
+            let bridge = neighbors.first().copied();
             self.graph[node][lc as usize] = neighbors.clone();
             for &n in &neighbors {
                 let adj = &mut self.graph[n][lc as usize];
@@ -141,8 +148,38 @@ impl Hnsw {
                         .map(|&x| (hamming(&nv, &self.vectors[x]), x))
                         .collect();
                     scored.sort_by_key(|(d, _)| *d);
-                    scored.truncate(m_layer);
-                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    let evicted: Vec<usize> =
+                        scored.iter().skip(m_layer).map(|(_, x)| *x).collect();
+                    *adj = scored.iter().take(m_layer).map(|(_, x)| *x).collect();
+                    // Cascading connectivity preservation (spec §7.4): if an
+                    // evicted old node would lose its only incoming edge at
+                    // this layer, re-establish a back-edge by adding it to
+                    // the new node's adjacency. The new node's adj may grow
+                    // by one entry; we truncate it below.
+                    for &e in &evicted {
+                        if e == node {
+                            continue;
+                        }
+                        if !self.has_incoming_edge(e, lc as usize) {
+                            self.preserve_into_new_node_adj(node, e, lc as usize, m_layer);
+                        }
+                    }
+                }
+            }
+            // Bridge-owner connectivity invariant (spec §7.4).
+            let still_linked = neighbors
+                .iter()
+                .any(|&n| self.graph[n][lc as usize].contains(&node));
+            if !still_linked {
+                if let Some(bridge) = bridge {
+                    let force_evicted =
+                        self.compute_force_eviction_hamming(bridge, node, lc as usize, m_layer);
+                    self.force_bounded_edge_hamming(bridge, node, lc as usize, m_layer);
+                    if let Some(e) = force_evicted {
+                        if e != node && !self.has_incoming_edge(e, lc as usize) {
+                            self.preserve_into_new_node_adj(node, e, lc as usize, m_layer);
+                        }
+                    }
                 }
             }
             ep = candidates;
@@ -151,6 +188,131 @@ impl Hnsw {
             self.max_level = level;
             self.entry = Some(node);
         }
+    }
+
+    /// Force the bridge owner to retain `new_node` at `layer` while preserving
+    /// the `degree_limit` cap. If the adjacency is full, replace the farthest
+    /// retained edge (in Hamming distance) with `new_node`. No-op if the
+    /// owner already retains `new_node`.
+    fn force_bounded_edge_hamming(
+        &mut self,
+        owner: usize,
+        new_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) {
+        let adj = &mut self.graph[owner][layer];
+        if adj.contains(&new_node) {
+            return;
+        }
+        if adj.len() < degree_limit {
+            adj.push(new_node);
+            return;
+        }
+        // Find the farthest retained edge; if `new_node` is not strictly
+        // farther than it, replace. (Strictly farther keeps the eviction
+        // meaningful; otherwise we'd swap for no benefit.)
+        let owner_vec = self.vectors[owner].clone();
+        let mut worst_pos: usize = 0;
+        let mut worst_d: Dist = 0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = hamming(&owner_vec, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        let new_d = hamming(&owner_vec, &self.vectors[new_node]);
+        if new_d < worst_d {
+            adj[worst_pos] = new_node;
+        } else {
+            // `new_node` is the farthest — evict the previous worst to keep the
+            // invariant that the new node is reachable from the bridge owner.
+            adj[worst_pos] = new_node;
+        }
+    }
+
+    /// Compute (without mutating) which entry would be evicted by
+    /// [`force_bounded_edge_hamming`](Self::force_bounded_edge_hamming). Returns
+    /// `None` if the force would not evict anything (adjacency already
+    /// contains `new_node`, or has spare capacity).
+    fn compute_force_eviction_hamming(
+        &self,
+        owner: usize,
+        new_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) -> Option<usize> {
+        let adj = &self.graph[owner][layer];
+        if adj.contains(&new_node) {
+            return None;
+        }
+        if adj.len() < degree_limit {
+            return None;
+        }
+        let owner_vec = &self.vectors[owner];
+        let mut worst_pos: usize = 0;
+        let mut worst_d: Dist = 0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = hamming(owner_vec, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        Some(adj[worst_pos])
+    }
+
+    /// Whether `node` has at least one incoming edge at `layer` (any other
+    /// node has it in their `graph[...][layer]` adjacency list). Used by
+    /// the cascading connectivity preservation step.
+    fn has_incoming_edge(&self, node: usize, layer: usize) -> bool {
+        if layer > MAX_HNSW_LEVEL as usize {
+            return false;
+        }
+        for adj in &self.graph {
+            if layer < adj.len() && adj[layer].contains(&node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Re-establish a back-edge from the new node to `evicted_node` by
+    /// adding `evicted_node` to `new_node`'s adjacency at `layer`. The
+    /// degree bound is enforced: if full, the farthest edge (in Hamming
+    /// distance from `new_node`) is replaced — preserving the invariant
+    /// that `evicted_node` remains reachable from the entry point.
+    fn preserve_into_new_node_adj(
+        &mut self,
+        new_node: usize,
+        evicted_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) {
+        let adj = &mut self.graph[new_node][layer];
+        if adj.contains(&evicted_node) {
+            return;
+        }
+        if adj.len() < degree_limit {
+            adj.push(evicted_node);
+            return;
+        }
+        // Adjacency is full — replace the farthest retained edge.
+        let nv = self.vectors[new_node].clone();
+        let mut worst_pos: usize = 0;
+        let mut worst_d: Dist = 0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = hamming(&nv, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        // Always replace — the connectivity invariant requires the evicted
+        // node to remain reachable from the new node regardless of distance
+        // (spec §7.4).
+        adj[worst_pos] = evicted_node;
     }
 
     /// k-nearest neighbors of `query_bits` (Hamming). `ef` controls the beam
@@ -219,13 +381,18 @@ impl Hnsw {
             for &e in &self.graph[c][layer as usize] {
                 if visited.insert(e) {
                     let d = hamming(query_bits, &self.vectors[e]);
-                    let key = (d, self.row_ids[e]);
+                    // Always queue the neighbor for further exploration —
+                    // even when the result heap is full. The strict-key
+                    // admission check below would otherwise stop the beam at
+                    // row_ids larger than the worst in `W` and hide strictly
+                    // closer nodes reachable through equal-distance hops.
+                    candidates.push(Reverse((d, e)));
                     let worst_key = results
                         .peek()
                         .map(|(distance, row_id, _)| (*distance, *row_id))
                         .unwrap_or((Dist::MAX, RowId(u64::MAX)));
+                    let key = (d, self.row_ids[e]);
                     if key < worst_key || results.len() < ef {
-                        candidates.push(Reverse((d, e)));
                         results.push((d, self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
@@ -250,10 +417,17 @@ impl Hnsw {
         context: Option<&AiExecutionContext>,
     ) -> Result<Vec<(Dist, usize)>> {
         let mut visited: HashSet<usize> = entry_points.iter().map(|(_, n)| *n).collect();
+        // Candidate min-heap (by distance) drives exploration. Every unvisited
+        // neighbor is pushed so the beam keeps walking the graph even when
+        // its `W` set is full of nodes tied with the current candidate — a
+        // late node with a strictly smaller distance can only be discovered
+        // by walking through equal-distance intermediaries.
         let mut candidates: BinaryHeap<Reverse<(Dist, usize)>> = entry_points
             .iter()
             .map(|(d, n)| Reverse((*d, *n)))
             .collect();
+        // Result max-heap (by distance, bounded to `ef`) collects the beam's
+        // top hits. Ties break by `RowId` so the final sort is stable.
         let mut results: BinaryHeap<(Dist, RowId, usize)> = entry_points
             .iter()
             .map(|(d, n)| (*d, self.row_ids[*n], *n))
@@ -275,13 +449,18 @@ impl Hnsw {
                         ))?;
                     }
                     let d = hamming(query_bits, &self.vectors[e]);
-                    let key = (d, self.row_ids[e]);
+                    // Always queue the neighbor for further exploration —
+                    // even when the result heap is full. The strict-key
+                    // admission check below would otherwise stop the beam at
+                    // row_ids larger than the worst in `W` and hide strictly
+                    // closer nodes reachable through equal-distance hops.
+                    candidates.push(Reverse((d, e)));
                     let worst_key = results
                         .peek()
                         .map(|(distance, row_id, _)| (*distance, *row_id))
                         .unwrap_or((Dist::MAX, RowId(u64::MAX)));
+                    let key = (d, self.row_ids[e]);
                     if key < worst_key || results.len() < ef {
-                        candidates.push(Reverse((d, e)));
                         results.push((d, self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
@@ -295,6 +474,63 @@ impl Hnsw {
             .into_iter()
             .map(|(distance, _, node)| (distance, node))
             .collect())
+    }
+
+    /// Degree limit for `layer` (M at upper layers, 2M at layer 0).
+    /// Test-only structural invariant accessor.
+    pub fn degree_limit_for_layer(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.m * 2
+        } else {
+            self.m
+        }
+    }
+
+    /// Number of nodes reachable from the entry point at `layer` via a BFS
+    /// over outgoing edges at that layer. Test-only connectivity probe (see
+    /// the spec §7.3 structural invariant). Returns the row ids of every
+    /// reachable node in BFS order.
+    pub fn reachable_from_entry(&self, layer: usize) -> Vec<RowId> {
+        let Some(entry) = self.entry else {
+            return Vec::new();
+        };
+        if layer > self.max_level as usize {
+            return Vec::new();
+        }
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        visited.insert(entry);
+        queue.push_back(entry);
+        let mut order = Vec::new();
+        while let Some(node) = queue.pop_front() {
+            order.push(self.row_ids[node]);
+            for &n in &self.graph[node][layer] {
+                if visited.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        order
+    }
+
+    /// Maximum degree observed at `layer` across every node. Test-only.
+    pub fn max_adjacency_at(&self, layer: usize) -> usize {
+        self.graph
+            .iter()
+            .filter(|adj| layer < adj.len())
+            .map(|adj| adj[layer].len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Maximum top layer present in any node's graph. Test-only.
+    pub fn top_layer(&self) -> i32 {
+        self.max_level
+    }
+
+    /// Number of nodes in the graph. Test-only convenience.
+    pub fn node_count(&self) -> usize {
+        self.vectors.len()
     }
 }
 
@@ -530,6 +766,11 @@ impl DenseHnsw {
             chosen.sort_by(|(da, _), (db, _)| da.total_cmp(db));
             chosen.truncate(m_layer);
             let neighbors: Vec<usize> = chosen.iter().map(|(_, n)| *n).collect();
+            // Bridge-owner invariant (spec §7.4): closest selected neighbor is
+            // the designated bridge. If every old neighbor prunes the
+            // reciprocal edge, force the bridge to retain the new node while
+            // preserving the degree bound.
+            let bridge = neighbors.first().copied();
             self.graph[node][lc as usize] = neighbors.clone();
             for &n in &neighbors {
                 checkpoint()?;
@@ -543,8 +784,36 @@ impl DenseHnsw {
                         .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
                         .collect();
                     scored.sort_by(|(da, _), (db, _)| da.total_cmp(db));
-                    scored.truncate(m_layer);
-                    *adj = scored.iter().map(|(_, x)| *x).collect();
+                    let evicted: Vec<usize> =
+                        scored.iter().skip(m_layer).map(|(_, x)| *x).collect();
+                    *adj = scored.iter().take(m_layer).map(|(_, x)| *x).collect();
+                    // Cascading connectivity preservation (spec §7.4): if an
+                    // evicted old node would lose its only incoming edge at
+                    // this layer, re-establish a back-edge into the new node.
+                    for &e in &evicted {
+                        if e == node {
+                            continue;
+                        }
+                        if !self.has_incoming_edge(e, lc as usize) {
+                            self.preserve_into_new_node_adj_dense(node, e, lc as usize, m_layer);
+                        }
+                    }
+                }
+            }
+            // Bridge-owner connectivity invariant (spec §7.4).
+            let still_linked = neighbors
+                .iter()
+                .any(|&n| self.graph[n][lc as usize].contains(&node));
+            if !still_linked {
+                if let Some(bridge) = bridge {
+                    let force_evicted =
+                        self.compute_force_eviction_cosine(bridge, node, lc as usize, m_layer);
+                    self.force_bounded_edge_cosine(bridge, node, lc as usize, m_layer);
+                    if let Some(e) = force_evicted {
+                        if e != node && !self.has_incoming_edge(e, lc as usize) {
+                            self.preserve_into_new_node_adj_dense(node, e, lc as usize, m_layer);
+                        }
+                    }
                 }
             }
             ep = candidates;
@@ -554,6 +823,123 @@ impl DenseHnsw {
             self.entry = Some(node);
         }
         Ok(())
+    }
+
+    /// Force the bridge owner to retain `new_node` at `layer` while preserving
+    /// the `degree_limit` cap (cosine distance). No-op if the owner already
+    /// retains `new_node`; if full, replace the farthest retained edge.
+    fn force_bounded_edge_cosine(
+        &mut self,
+        owner: usize,
+        new_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) {
+        let adj = &mut self.graph[owner][layer];
+        if adj.contains(&new_node) {
+            return;
+        }
+        if adj.len() < degree_limit {
+            adj.push(new_node);
+            return;
+        }
+        let owner_vec = self.vectors[owner].clone();
+        let mut worst_pos: usize = 0;
+        let mut worst_d: f32 = -1.0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = cosine_distance(&owner_vec, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        let new_d = cosine_distance(&owner_vec, &self.vectors[new_node]);
+        if new_d < worst_d {
+            adj[worst_pos] = new_node;
+        } else {
+            // Preserve the connectivity invariant by replacing the farthest
+            // edge — the new node is reachable from the bridge owner at this
+            // layer regardless of relative distance.
+            adj[worst_pos] = new_node;
+        }
+    }
+
+    /// Compute (without mutating) which entry would be evicted by
+    /// [`force_bounded_edge_cosine`](Self::force_bounded_edge_cosine).
+    fn compute_force_eviction_cosine(
+        &self,
+        owner: usize,
+        new_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) -> Option<usize> {
+        let adj = &self.graph[owner][layer];
+        if adj.contains(&new_node) {
+            return None;
+        }
+        if adj.len() < degree_limit {
+            return None;
+        }
+        let owner_vec = &self.vectors[owner];
+        let mut worst_pos: usize = 0;
+        let mut worst_d: f32 = -1.0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = cosine_distance(owner_vec, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        Some(adj[worst_pos])
+    }
+
+    /// Whether `node` has at least one incoming edge at `layer` (any other
+    /// node has it in their `graph[...][layer]` adjacency list). Used by
+    /// the cascading connectivity preservation step.
+    fn has_incoming_edge(&self, node: usize, layer: usize) -> bool {
+        if layer > MAX_HNSW_LEVEL as usize {
+            return false;
+        }
+        for adj in &self.graph {
+            if layer < adj.len() && adj[layer].contains(&node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Re-establish a back-edge from the new node to `evicted_node` by
+    /// adding `evicted_node` to `new_node`'s adjacency at `layer`. The
+    /// degree bound is enforced via cosine distance.
+    fn preserve_into_new_node_adj_dense(
+        &mut self,
+        new_node: usize,
+        evicted_node: usize,
+        layer: usize,
+        degree_limit: usize,
+    ) {
+        let adj = &mut self.graph[new_node][layer];
+        if adj.contains(&evicted_node) {
+            return;
+        }
+        if adj.len() < degree_limit {
+            adj.push(evicted_node);
+            return;
+        }
+        let nv = self.vectors[new_node].clone();
+        let mut worst_pos: usize = 0;
+        let mut worst_d: f32 = -1.0;
+        for (pos, &x) in adj.iter().enumerate() {
+            let d = cosine_distance(&nv, &self.vectors[x]);
+            if d >= worst_d {
+                worst_d = d;
+                worst_pos = pos;
+            }
+        }
+        // Always replace — the connectivity invariant requires the evicted
+        // node to remain reachable from the new node regardless of distance
+        // (spec §7.4).
+        adj[worst_pos] = evicted_node;
     }
 
     /// k-nearest neighbors of `query` (cosine distance). `ef` controls beam
@@ -657,12 +1043,18 @@ impl DenseHnsw {
                 checkpoint()?;
                 if visited.insert(neighbor) {
                     let distance = cosine_distance(query, &self.vectors[neighbor]);
-                    let worst = results
+                    // Always queue the neighbor for further exploration —
+                    // even when the result heap is full. The strict-key
+                    // admission check below would otherwise stop the beam at
+                    // row_ids larger than the worst in `W` and hide strictly
+                    // closer nodes reachable through equal-distance hops.
+                    candidates.push(Reverse((DistF32(distance), neighbor)));
+                    let worst_key = results
                         .peek()
                         .map(|(distance, row_id, _)| (*distance, *row_id))
                         .unwrap_or((DistF32(f32::INFINITY), RowId(u64::MAX)));
-                    if (DistF32(distance), self.row_ids[neighbor]) < worst || results.len() < ef {
-                        candidates.push(Reverse((DistF32(distance), neighbor)));
+                    if (DistF32(distance), self.row_ids[neighbor]) < worst_key || results.len() < ef
+                    {
                         results.push((DistF32(distance), self.row_ids[neighbor], neighbor));
                         if results.len() > ef {
                             results.pop();
@@ -711,12 +1103,17 @@ impl DenseHnsw {
                         ))?;
                     }
                     let d = cosine_distance(query, &self.vectors[e]);
-                    let worst = results
+                    // Always queue the neighbor for further exploration —
+                    // even when the result heap is full. The strict-key
+                    // admission check below would otherwise stop the beam at
+                    // row_ids larger than the worst in `W` and hide strictly
+                    // closer nodes reachable through equal-distance hops.
+                    candidates.push(Reverse((DistF32(d), e)));
+                    let worst_key = results
                         .peek()
                         .map(|(distance, row_id, _)| (*distance, *row_id))
                         .unwrap_or((DistF32(f32::INFINITY), RowId(u64::MAX)));
-                    if (DistF32(d), self.row_ids[e]) < worst || results.len() < ef {
-                        candidates.push(Reverse((DistF32(d), e)));
+                    if (DistF32(d), self.row_ids[e]) < worst_key || results.len() < ef {
                         results.push((DistF32(d), self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
@@ -726,6 +1123,63 @@ impl DenseHnsw {
             }
         }
         Ok(results.into_iter().map(|(d, _, n)| (d.0, n)).collect())
+    }
+
+    /// Degree limit for `layer` (M at upper layers, 2M at layer 0).
+    /// Test-only structural invariant accessor.
+    pub fn degree_limit_for_layer(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.m * 2
+        } else {
+            self.m
+        }
+    }
+
+    /// Number of nodes reachable from the entry point at `layer` via a BFS
+    /// over outgoing edges at that layer. Test-only connectivity probe (see
+    /// the spec §7.3 structural invariant). Returns the row ids of every
+    /// reachable node in BFS order.
+    pub fn reachable_from_entry(&self, layer: usize) -> Vec<RowId> {
+        let Some(entry) = self.entry else {
+            return Vec::new();
+        };
+        if layer > self.max_level as usize {
+            return Vec::new();
+        }
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        visited.insert(entry);
+        queue.push_back(entry);
+        let mut order = Vec::new();
+        while let Some(node) = queue.pop_front() {
+            order.push(self.row_ids[node]);
+            for &n in &self.graph[node][layer] {
+                if visited.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        order
+    }
+
+    /// Maximum degree observed at `layer` across every node. Test-only.
+    pub fn max_adjacency_at(&self, layer: usize) -> usize {
+        self.graph
+            .iter()
+            .filter(|adj| layer < adj.len())
+            .map(|adj| adj[layer].len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Maximum top layer present in any node's graph. Test-only.
+    pub fn top_layer(&self) -> i32 {
+        self.max_level
+    }
+
+    /// Number of nodes in the graph. Test-only convenience.
+    pub fn node_count(&self) -> usize {
+        self.vectors.len()
     }
 }
 
