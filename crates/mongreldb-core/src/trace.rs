@@ -346,6 +346,50 @@ impl fmt::Display for HotFallbackReason {
     }
 }
 
+/// Diagnostic classification of a HOT (`Hash-Organized Table`) candidate row.
+///
+/// `Table::get` collapses several distinct failure modes into `None`
+/// (tombstone, TTL expiry, snapshot invisibility). To preserve observability
+/// across every HOT fallback path, [`Table::resolve_pk_with_hot_fallback`]
+/// inspects the candidate directly and tags the failure with one of these
+/// reasons before delegating to the PK equality scanner.
+///
+/// `PrimaryKeyMismatch` carries the mismatched bytes for diagnostics — the
+/// `materialized_pk` is the value read from the row's PK column and
+/// `requested` is the lookup key bytes (after HMAC tokenization). Neither is
+/// used as the authoritative result; the fallback scanner is the only
+/// source of the returned row set.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HotCandidateInspection {
+    /// Mapped `RowId` materialized, is visible, live, TTL-valid, and carries
+    /// the requested PK. The branch may return this row without a fallback.
+    Hit(crate::memtable::Row),
+    /// Row does not exist at the mapped `RowId` — overlay and all runs
+    /// returned no version. The base row was removed entirely.
+    MissingRow,
+    /// Row exists but is stamped with a `(committed_epoch, commit_ts)` that
+    /// the calling `Snapshot` does not observe. Distinct from a tombstone:
+    /// the row may still be visible at a later snapshot.
+    Invisible,
+    /// The newest visible row at the mapped `RowId` is a tombstone
+    /// (`deleted = true`). A replacement row with the same PK may exist
+    /// elsewhere — the scanner is responsible for finding it.
+    Tombstone,
+    /// The newest visible row exists and is not deleted, but the row's TTL
+    /// metadata says the row expired at the calling wall clock. Distinct
+    /// from `Tombstone`: the row is still durable, just hidden by TTL.
+    TtlExpired,
+    /// Row materialized with valid visibility/TTL, but its materialized PK
+    /// does not match the requested PK bytes. The HOT map is stale and must
+    /// not return this row — only the scanner's verified result is returned.
+    PrimaryKeyMismatch {
+        /// PK bytes encoded from the materialized row's PK column.
+        materialized_pk: Vec<u8>,
+        /// PK bytes that the caller requested (post-HMAC tokenization).
+        requested: Vec<u8>,
+    },
+}
+
 impl QueryTrace {
     /// Execute `f` with path tracing active on the current thread, returning
     /// the result and the captured trace. Recording calls inside `f` (and
@@ -555,6 +599,60 @@ impl QueryTrace {
         );
         self
     }
+}
+
+/// Inspect a HOT candidate at `rid` against the calling `snapshot` and the
+/// table's TTL policy. Returns the [`HotCandidateInspection`] diagnostic
+/// that the [`crate::engine::Table::resolve_pk_with_hot_fallback`] helper
+/// uses to choose between the fast-path hit and the per-reason fallback.
+///
+/// The classification preserves the **full reason** (HLC + epoch + TTL +
+/// materialized PK equality) — `Table::get` collapses several of these to
+/// `None` and is not sufficient on its own.
+///
+/// `now_nanos` is the wall-clock anchor for TTL evaluation; pass the same
+/// value the caller would use to materialize rows (`unix_nanos_now()` for the
+/// normal query path). `ttl_policy` is the table's [`TtlPolicy`] — when
+/// `None`, the candidate can never be classified as [`HotCandidateInspection::TtlExpired`].
+///
+/// `pk_encoded` is the encoded PK lookup bytes the caller would pass to
+/// `index_lookup_key` (post-HMAC tokenization). It is only compared against
+/// the materialized PK column when the row materializes successfully and is
+/// not tombstoned / expired / invisible.
+pub fn inspect_hot_candidate(
+    row: Option<&crate::memtable::Row>,
+    snapshot: crate::epoch::Snapshot,
+    ttl_policy: Option<crate::manifest::TtlPolicy>,
+    now_nanos: i64,
+    pk_column_id: u16,
+    pk_encoded: &[u8],
+    tokenize_pk: impl FnOnce(&crate::memtable::Row) -> Vec<u8>,
+) -> HotCandidateInspection {
+    let Some(row) = row else {
+        return HotCandidateInspection::MissingRow;
+    };
+    if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
+        return HotCandidateInspection::Invisible;
+    }
+    if row.deleted {
+        return HotCandidateInspection::Tombstone;
+    }
+    if let Some(policy) = ttl_policy {
+        if let Some(crate::Value::Int64(timestamp)) = row.columns.get(&policy.column_id) {
+            if timestamp.saturating_add(policy.duration_nanos as i64) <= now_nanos {
+                return HotCandidateInspection::TtlExpired;
+            }
+        }
+    }
+    let _ = pk_column_id; // pk_column_id documents the API; tokenize_pk encapsulates the encode.
+    let materialized = tokenize_pk(row);
+    if materialized != pk_encoded {
+        return HotCandidateInspection::PrimaryKeyMismatch {
+            materialized_pk: materialized,
+            requested: pk_encoded.to_vec(),
+        };
+    }
+    HotCandidateInspection::Hit(row.clone())
 }
 
 #[cfg(test)]

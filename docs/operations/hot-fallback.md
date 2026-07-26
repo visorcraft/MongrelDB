@@ -63,20 +63,20 @@ Anything else is unexpected.
 ## Commands
 
 ```bash
-# Inspect table metrics
-mongreldb-cli table metrics <table_id>
+# Inspect table metrics (per-table LookupMetricsSnapshot as Prometheus text)
+mongreldb-server table-metrics <db_dir>
 
-# Run rebuild_indexes
-mongreldb-cli table rebuild-indexes <table_id>
+# Run rebuild_indexes on every live table
+mongreldb-server table-rebuild-indexes <db_dir>
 
-# Capture a traced PK query
-mongreldb-cli trace query "SELECT * FROM accounts WHERE pk = ?" --snapshot=latest
+# Capture a traced PK query (per-table lookup metrics snapshot)
+mongreldb-server trace-query <db_dir>
 
-# Check global index checkpoint state
-mongreldb-cli index checkpoint-state
+# Check global index checkpoint state (mapping_rebuild vs checkpoint_rejected counters)
+mongreldb-server index-checkpoint-state <db_dir>
 
 # Compare HOT mapping with materialized PK
-mongreldb-cli index hot-compare <table_id> --pk=<pk>
+mongreldb-server index-hot-compare <db_dir> <table> --pk=<pk>
 ```
 
 ## Capturing a trace
@@ -85,7 +85,7 @@ A traced PK query reports `hot_lookup_attempted`, `hot_lookup_hit`,
 `hot_fallback_reason`, and the fallback work counters:
 
 ```bash
-mongreldb-cli trace query "SELECT * FROM accounts WHERE pk = 12345" --snapshot=latest
+mongreldb-server trace-query <db_dir>
 ```
 
 A healthy hit:

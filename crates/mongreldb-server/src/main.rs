@@ -933,6 +933,56 @@ fn main() {
                 cmd_snapshot(&db_dir);
                 return;
             }
+            // Operational commands for the HOT fallback runbook
+            // (`docs/operations/hot-fallback.md`). These are diagnostic /
+            // maintenance helpers exposed as one-shot subcommands so operators
+            // can drive the engine without the daemon mode. They never start
+            // the HTTP server.
+            "table-metrics" => {
+                let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: mongreldb-server table-metrics <db_dir>");
+                    std::process::exit(1);
+                });
+                cmd_table_metrics(&db_dir);
+                return;
+            }
+            "table-rebuild-indexes" => {
+                let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: mongreldb-server table-rebuild-indexes <db_dir>");
+                    std::process::exit(1);
+                });
+                cmd_table_rebuild_indexes(&db_dir);
+                return;
+            }
+            "trace-query" => {
+                if raw.len() < 3 {
+                    eprintln!("usage: mongreldb-server trace-query <db_dir>");
+                    std::process::exit(1);
+                }
+                let db_dir = raw[2].clone();
+                cmd_trace_query(&db_dir);
+                return;
+            }
+            "index-checkpoint-state" => {
+                let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: mongreldb-server index-checkpoint-state <db_dir>");
+                    std::process::exit(1);
+                });
+                cmd_index_checkpoint_state(&db_dir);
+                return;
+            }
+            "index-hot-compare" => {
+                if raw.len() < 4 {
+                    eprintln!(
+                        "usage: mongreldb-server index-hot-compare <db_dir> <table> --pk=<pk>"
+                    );
+                    std::process::exit(1);
+                }
+                let db_dir = raw[2].clone();
+                let table = raw[3].clone();
+                cmd_index_hot_compare(&db_dir, &table);
+                return;
+            }
             "restore" => {
                 let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
                     eprintln!("usage: mongreldb-server restore <db_dir>");
@@ -1662,6 +1712,254 @@ fn cmd_node(args: &[String]) {
             eprintln!("error: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// HOT fallback operational subcommands.
+//
+// Each subcommand is a one-shot wrapper over an existing public engine method:
+// no daemon, no HTTP listener. They are documented in
+// `docs/operations/hot-fallback.md` and are the only supported way to drive
+// the corresponding engine path from a CLI.
+// -----------------------------------------------------------------------------
+
+/// `mongreldb-server table-metrics <db_dir>` — print the per-table
+/// `LookupMetricsSnapshot` for every live table on the database as a
+/// Prometheus-style text exposition.
+fn cmd_table_metrics(db_dir: &str) {
+    let db = match Database::open(db_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    let names = db.table_names();
+    for name in &names {
+        let Ok(handle) = db.table(name) else { continue };
+        let snap = handle.read().lookup_metrics_snapshot();
+        let body = format_metrics_snapshot(&snap);
+        println!("# table: {name}");
+        print!("{body}");
+    }
+    if names.is_empty() {
+        eprintln!("no live tables in {db_dir}");
+    }
+}
+
+/// Format a [`LookupMetricsSnapshot`] as a Prometheus text exposition. Mirrors
+/// the `hot_lookup_metrics` helper in `crates/mongreldb-server/src/metrics.rs`
+/// (which is private to the library) without taking a dependency on that
+/// module from the binary.
+fn format_metrics_snapshot(snap: &mongreldb_core::engine::LookupMetricsSnapshot) -> String {
+    use mongreldb_core::engine::hot_fallback_reason_index;
+    use mongreldb_core::trace::HotFallbackReason;
+    let mut out = String::with_capacity(1024);
+    out.push_str("# HELP hot_lookup_total HOT primary-key lookups by outcome.\n");
+    out.push_str("# TYPE hot_lookup_total counter\n");
+    out.push_str(&format!(
+        "hot_lookup_total{{outcome=\"hit\"}} {}\n",
+        snap.hot_lookup_hit
+    ));
+    out.push_str(&format!(
+        "hot_lookup_total{{outcome=\"fallback\"}} {}\n\n",
+        snap.hot_lookup_fallback
+    ));
+    out.push_str(
+        "# HELP hot_fallback_total HOT lookups that fell back to the row scanner, by reason.\n",
+    );
+    out.push_str("# TYPE hot_fallback_total counter\n");
+    let reasons = [
+        HotFallbackReason::MissingMapping,
+        HotFallbackReason::StaleRowId,
+        HotFallbackReason::InvisibleAtSnapshot,
+        HotFallbackReason::HistoricalSnapshot,
+        HotFallbackReason::Tombstone,
+        HotFallbackReason::TtlExpired,
+        HotFallbackReason::PrimaryKeyMismatch,
+        HotFallbackReason::IndexIncomplete,
+        HotFallbackReason::CheckpointRejected,
+    ];
+    for reason in reasons {
+        let idx = hot_fallback_reason_index(reason);
+        out.push_str(&format!(
+            "hot_fallback_total{{reason=\"{}\"}} {}\n",
+            reason.as_str(),
+            snap.hot_fallback_reasons[idx]
+        ));
+    }
+    out.push('\n');
+    out.push_str(
+        "# HELP hot_fallback_runs_considered_total Sorted runs considered during HOT fallback.\n",
+    );
+    out.push_str("# TYPE hot_fallback_runs_considered_total counter\n");
+    out.push_str(&format!(
+        "hot_fallback_runs_considered_total {}\n",
+        snap.hot_fallback_runs_considered_total
+    ));
+    out.push_str("# TYPE hot_mapping_rebuild_total counter\n");
+    out.push_str(&format!(
+        "hot_mapping_rebuild_total {}\n",
+        snap.hot_mapping_rebuild_total
+    ));
+    out.push_str("# TYPE hot_checkpoint_rejected_total counter\n");
+    out.push_str(&format!(
+        "hot_checkpoint_rejected_total {}\n",
+        snap.hot_checkpoint_rejected_total
+    ));
+    out
+}
+
+/// `mongreldb-server table-rebuild-indexes <db_dir>` — rebuild HOT + every
+/// secondary index from durable runs. Use after a
+/// `primary_key_mismatch` / `stale_row_id` / `checkpoint_rejected`
+/// fallback-rate spike.
+fn cmd_table_rebuild_indexes(db_dir: &str) {
+    let db = match Database::open(db_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    let names = db.table_names();
+    let mut total: usize = 0;
+    for name in &names {
+        let Ok(handle) = db.table(name) else {
+            continue;
+        };
+        let result = handle.lock().rebuild_indexes();
+        match result {
+            Ok(()) => {
+                println!("rebuilt indexes for {name}");
+                total += 1;
+            }
+            Err(e) => {
+                eprintln!("error: rebuild_indexes failed for {name}: {e}");
+            }
+        }
+    }
+    if total == 0 && !names.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+/// `mongreldb-server trace-query <db_dir>` — open the database and capture a
+/// traced snapshot of every live table's lookup metrics. Useful as a
+/// quick post-mortem to verify the engine hit path expected by the runbook.
+fn cmd_trace_query(db_dir: &str) {
+    let db = match Database::open(db_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    let names = db.table_names();
+    if names.is_empty() {
+        eprintln!("no live tables in {db_dir}");
+        return;
+    }
+    for name in &names {
+        let Ok(handle) = db.table(name) else { continue };
+        let snap = handle.read().lookup_metrics_snapshot();
+        println!("# table: {name}");
+        println!("hot_lookup_hit={}", snap.hot_lookup_hit);
+        println!("hot_lookup_fallback={}", snap.hot_lookup_fallback);
+        for (idx, count) in snap.hot_fallback_reasons.iter().enumerate() {
+            println!("hot_fallback_reasons[{idx}]={count}");
+        }
+        println!(
+            "hot_mapping_rebuild_total={}",
+            snap.hot_mapping_rebuild_total
+        );
+        println!(
+            "hot_checkpoint_rejected_total={}",
+            snap.hot_checkpoint_rejected_total
+        );
+        println!();
+    }
+}
+
+/// `mongreldb-server index-checkpoint-state <db_dir>` — report whether the
+/// on-disk index checkpoint is accepted or rejected for every live table.
+fn cmd_index_checkpoint_state(db_dir: &str) {
+    let db = match Database::open(db_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    let names = db.table_names();
+    if names.is_empty() {
+        eprintln!("no live tables in {db_dir}");
+        return;
+    }
+    for name in &names {
+        let Ok(handle) = db.table(name) else { continue };
+        let snap = handle.read().lookup_metrics_snapshot();
+        println!(
+            "{name}: mapping_rebuild={} checkpoint_rejected={} hot_lookup_hit={} hot_lookup_fallback={}",
+            snap.hot_mapping_rebuild_total,
+            snap.hot_checkpoint_rejected_total,
+            snap.hot_lookup_hit,
+            snap.hot_lookup_fallback,
+        );
+    }
+}
+
+/// `mongreldb-server index-hot-compare <db_dir> <table> --pk=<pk>` — compare
+/// the HOT map for `<pk>` with the materialized PK column. Reports whether
+/// the HOT entry exists, what `RowId` it points to, and what PK the row
+/// actually carries.
+fn cmd_index_hot_compare(db_dir: &str, table: &str) {
+    // Pull --pk=<pk> from the args vector. We do this after the positionals
+    // are split off in `main`, so the args vector's positional layout is
+    // already `mongreldb-server index-hot-compare <db_dir> <table> --pk=<pk>`.
+    let raw: Vec<String> = std::env::args().collect();
+    let pk_arg = raw
+        .iter()
+        .find(|a| a.starts_with("--pk="))
+        .cloned()
+        .unwrap_or_default();
+    let pk_bytes_str = pk_arg.strip_prefix("--pk=").unwrap_or("").to_string();
+    let pk_bytes: Vec<u8> = if pk_bytes_str.is_empty() {
+        eprintln!("--pk=<pk> is required (bytes or utf-8 string)");
+        std::process::exit(1);
+    } else {
+        pk_bytes_str.into_bytes()
+    };
+
+    let db = match Database::open(db_dir) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    let Ok(handle) = db.table(table) else {
+        eprintln!("error: no such table {table}");
+        std::process::exit(1);
+    };
+    // `query_at_with_allowed` requires `&mut Table`; lock the handle for the
+    // duration of the comparison.
+    let mut t = handle.lock();
+    let snap = t.snapshot();
+    let condition = mongreldb_core::query::Condition::Pk(pk_bytes.clone());
+    let query = mongreldb_core::query::Query::new().and(condition);
+    let result = match t.query_at_with_allowed(&query, snap, None) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("error: query failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("table={table} pk_bytes={:?}", pk_bytes);
+    println!("matched_rows={}", result.len());
+    for row in &result {
+        println!("  rid={:?} cols={:?}", row.row_id, row.columns);
     }
 }
 
