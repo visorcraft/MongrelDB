@@ -378,6 +378,9 @@ fn persistent_cache_survives_restart_and_corruption_falls_back() {
         });
         let r = db.query_cached(&q).unwrap();
         assert_eq!(r.len(), 100);
+        // Drain the persistent-cache writer so the on-disk files are present
+        // before we drop the table handle.
+        let _ = db.flush_persistent_cache(2_000);
     }
 
     // Tamper with one cache file.
@@ -656,6 +659,9 @@ fn reopen_keeps_persistent_cache_consistent_after_mutation() {
         db.delete(rid).unwrap();
         db.commit().unwrap();
         assert_eq!(db.query_cached(&q).unwrap().len(), 99);
+        // Drain the writer so the on-disk files are present before the table
+        // handle is dropped and the test reads `_rcache/`.
+        let _ = db.flush_persistent_cache(2_000);
     }
 
     // On reopen, stale persistent files for the pre-delete cached entry may
@@ -675,6 +681,9 @@ fn reopen_keeps_persistent_cache_consistent_after_mutation() {
         );
 
         // There should still be cache files; they should not contain plaintext.
+        // Drain the writer so any enqueue from the reopened table's worker is
+        // settled before we list the directory.
+        let _ = db.flush_persistent_cache(2_000);
         let files: Vec<_> = std::fs::read_dir(&rcache_dir)
             .unwrap()
             .filter_map(|e| e.ok())

@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-cluster"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "getrandom 0.2.17",
  "mongreldb-consensus",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-consensus"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "bincode",
  "mongreldb-core",
@@ -3405,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -3447,14 +3447,14 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-fault"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "mongreldb-ffi"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "cc",
@@ -3469,9 +3469,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit-core"
-version = "0.64.9"
+version = "0.64.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063c8247a7f733a420866dee979d69b0168d7e289b499d143cbdf2128c267990"
+checksum = "0455e9ebf07d91ac2be5656bc7f432f0787cc471244f6154b9c3fa1e3752d837"
 dependencies = [
  "hex",
  "regex",
@@ -3484,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-log"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -3494,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-migrate-mysql"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "futures",
@@ -3516,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-mysql-wire"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3536,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-node"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "base64 0.22.1",
@@ -3556,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-perf"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "duckdb",
  "mongreldb-core",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-protocol"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "mongreldb-types",
  "prost",
@@ -3586,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-server"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-sim"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.64.9"
+version = "0.64.10"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
