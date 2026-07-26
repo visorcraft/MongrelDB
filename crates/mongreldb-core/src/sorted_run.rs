@@ -17,7 +17,7 @@
 
 use crate::columnar;
 use crate::encryption::{setup_run_encryption, Cipher, Kek, RunEncryption};
-use crate::epoch::Epoch;
+use crate::epoch::{Epoch, Snapshot};
 use crate::error::{MongrelError, Result};
 use crate::index::pgm::PgmIndex;
 use crate::memtable::{Row, Value};
@@ -129,7 +129,7 @@ fn encode_commit_ts_value(ts: Option<HlcTimestamp>) -> Value {
 }
 
 /// Decode a [`SYS_COMMIT_TS`] cell. Malformed/null/absent → `None` (legacy).
-fn decode_commit_ts_value(value: Option<&Value>) -> Option<HlcTimestamp> {
+pub(crate) fn decode_commit_ts_value(value: Option<&Value>) -> Option<HlcTimestamp> {
     match value {
         Some(Value::Bytes(bytes)) if bytes.len() == COMMIT_TS_BYTES => {
             let physical_micros = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
@@ -1939,24 +1939,28 @@ pub struct RunReader {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RunVisibleVersion {
-    pub(crate) row_id: RowId,
-    pub(crate) committed_epoch: Epoch,
-    pub(crate) deleted: bool,
+pub struct RunVisibleVersion {
+    pub row_id: RowId,
+    pub committed_epoch: Epoch,
+    pub deleted: bool,
     /// Optional HLC from SYS_COMMIT_TS when the run carries that column.
     /// Used by controlled merge for HLC-authoritative cross-tier winners
     /// without forcing full materialization first.
-    pub(crate) commit_ts: Option<HlcTimestamp>,
-    page_seq: usize,
-    within_page: usize,
+    pub commit_ts: Option<HlcTimestamp>,
+    pub(crate) page_seq: usize,
+    pub(crate) within_page: usize,
 }
 
 /// Page-bounded cursor over one run's newest snapshot-visible version per row.
 /// Only the three compact system columns and one user-data page are decoded at
 /// a time. Full `Vec<Row>` materialization is deliberately avoided.
-pub(crate) struct RunVisibleVersionCursor {
+///
+/// Visibility is evaluated against the full [`Snapshot`], not the local epoch
+/// alone, so HLC-stamped runs honor HLC authority when the snapshot is HLC-
+/// pinned (see [`crate::epoch::Snapshot::observes_row`]).
+pub struct RunVisibleVersionCursor {
     reader: RunReader,
-    snapshot: Epoch,
+    snapshot: Snapshot,
     page_row_counts: Vec<usize>,
     page_seq: usize,
     within_page: usize,
@@ -1973,7 +1977,7 @@ pub(crate) struct RunVisibleVersionCursor {
 }
 
 impl RunVisibleVersionCursor {
-    fn new(reader: RunReader, snapshot: Epoch) -> Result<Self> {
+    pub(crate) fn new(reader: RunReader, snapshot: Snapshot) -> Result<Self> {
         let page_row_counts = reader.page_row_counts(SYS_ROW_ID)?;
         let has_commit_ts_col = reader.has_column(SYS_COMMIT_TS);
         Ok(Self {
@@ -2074,7 +2078,7 @@ impl RunVisibleVersionCursor {
         }))
     }
 
-    pub(crate) fn next_visible_version(
+    pub fn next_visible_version(
         &mut self,
         control: &crate::ExecutionControl,
     ) -> Result<Option<RunVisibleVersion>> {
@@ -2087,13 +2091,22 @@ impl RunVisibleVersionCursor {
                 },
             };
             let row_id = first.row_id;
-            let mut best = (first.committed_epoch <= self.snapshot).then_some(first);
+            // Visibility under HLC authority: `Snapshot::observes_row` honors
+            // HLC when the snapshot is HLC-pinned; otherwise it falls back to
+            // the documented epoch/dual-model rule. Pre-filtering by epoch alone
+            // would discard HLC-visible winners.
+            let mut best = self
+                .snapshot
+                .observes_row(first.committed_epoch, first.commit_ts)
+                .then_some(first);
             while let Some(candidate) = self.next_raw(control)? {
                 if candidate.row_id != row_id {
                     self.lookahead = Some(candidate);
                     break;
                 }
-                if candidate.committed_epoch <= self.snapshot
+                if self
+                    .snapshot
+                    .observes_row(candidate.committed_epoch, candidate.commit_ts)
                     && best.is_none_or(|current| {
                         crate::epoch::Snapshot::version_is_newer(
                             candidate.committed_epoch,
@@ -2112,7 +2125,7 @@ impl RunVisibleVersionCursor {
         }
     }
 
-    pub(crate) fn materialize(
+    pub fn materialize(
         &mut self,
         version: RunVisibleVersion,
         control: &crate::ExecutionControl,
@@ -2535,9 +2548,23 @@ impl RunReader {
         }
     }
 
+    #[allow(dead_code)] // Epoch-only compatibility wrapper; new callers prefer
+                        // `into_visible_version_cursor_at`.
     pub(crate) fn into_visible_version_cursor(
         self,
         snapshot: Epoch,
+    ) -> Result<RunVisibleVersionCursor> {
+        // Epoch-only compatibility wrapper; new callers should prefer
+        // [`Self::into_visible_version_cursor_at`] so HLC authority is honored.
+        RunVisibleVersionCursor::new(self, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::into_visible_version_cursor`]: visibility
+    /// is evaluated under [`Snapshot::observes_row`], so an HLC-pinned snapshot
+    /// can surface a high-epoch / low-HLC row that an epoch-only pin would hide.
+    pub fn into_visible_version_cursor_at(
+        self,
+        snapshot: Snapshot,
     ) -> Result<RunVisibleVersionCursor> {
         RunVisibleVersionCursor::new(self, snapshot)
     }
@@ -2821,7 +2848,26 @@ impl RunReader {
     /// collects every page whose bounds include `row_id`, which is normally
     /// one page and two only in that split case.
     pub fn get_version(&mut self, row_id: RowId, snapshot: Epoch) -> Result<Option<(Epoch, Row)>> {
-        match self.find_version_page(row_id, snapshot)? {
+        self.get_version_at(row_id, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::get_version`]: visibility is resolved
+    /// under [`Snapshot::observes_row`], so an HLC-pinned snapshot can return
+    /// an HLC-visible winner whose local epoch exceeds the snapshot's. The
+    /// winning candidate is selected via [`Snapshot::version_is_newer`].
+    ///
+    /// Callers must own a real [`Snapshot`] (constructed via
+    /// [`Snapshot::at_hlc`], [`Snapshot::unbounded`], or [`Snapshot::at`]).
+    /// The legacy [`Self::get_version`] wrapper exists for code paths that
+    /// already have an [`Epoch`] only; do not flatten `Snapshot` to its epoch
+    /// here — that throws away HLC authority and can hide HLC-visible
+    /// winners from product reads.
+    pub fn get_version_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+    ) -> Result<Option<(Epoch, Row)>> {
+        match self.find_version_page_at(row_id, snapshot)? {
             None => Ok(None),
             Some((epoch, seq, local_index)) => Ok(Some((
                 Epoch(epoch),
@@ -2835,10 +2881,24 @@ impl RunReader {
     /// version exists in this run. Factored out of [`Self::get_version`] so
     /// [`Self::get_version_column`] can reuse the exact same page-finding
     /// logic without re-deriving it.
+    #[allow(dead_code)] // Epoch-only wrapper kept for compatibility.
     fn find_version_page(
         &mut self,
         row_id: RowId,
         snapshot: Epoch,
+    ) -> Result<Option<(u64, usize, usize)>> {
+        self.find_version_page_at(row_id, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot counterpart of [`Self::find_version_page`]: pre-loads the
+    /// per-row HLC stamps (when present) so version selection can use
+    /// [`Snapshot::observes_row`] and [`Snapshot::version_is_newer`]. HLC
+    /// authority is only consulted when the snapshot has a non-ZERO
+    /// `commit_ts`; otherwise the legacy epoch rule applies.
+    fn find_version_page_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
     ) -> Result<Option<(u64, usize, usize)>> {
         let n = self.row_count();
         if n == 0 {
@@ -2861,7 +2921,11 @@ impl RunReader {
             return Ok(None);
         }
         let ty = self.resolve_type(SYS_ROW_ID);
-        let mut best: Option<(u64, usize, usize)> = None; // (epoch, page_seq, local index)
+        let has_commit_ts_col = self.has_column(SYS_COMMIT_TS);
+        // Best version chosen with (epoch, hlc) snapshot-aware semantics.
+        // We track the candidate's epoch + (optional) HLC so the
+        // `version_is_newer` comparator can use both.
+        let mut best: Option<(u64, Option<HlcTimestamp>, usize, usize)> = None; // (epoch, commit_ts, page_seq, local index)
         for (seq, _page_row_start) in candidate_pages {
             let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
             let row_ids =
@@ -2889,14 +2953,40 @@ impl RunReader {
             while hi + 1 < row_ids.len() && row_ids[hi + 1] == target {
                 hi += 1;
             }
-            for (i, &epoch) in epochs[lo..=hi].iter().enumerate() {
-                let epoch = epoch as u64;
-                if epoch <= snapshot.0 && best.map(|(be, ..)| epoch > be).unwrap_or(true) {
-                    best = Some((epoch, seq, lo + i));
+            // Optionally decode SYS_COMMIT_TS for this page (P0.5-T3). The
+            // decode is amortized across the whole group loop, and skipped
+            // entirely for runs that don't carry the column.
+            let commit_ts_native = if has_commit_ts_col {
+                let page = self.read_page(SYS_COMMIT_TS, seq)?;
+                Some(columnar::decode_page_native(
+                    TypeId::Bytes,
+                    &page,
+                    page_rows,
+                )?)
+            } else {
+                None
+            };
+            for (i, &epoch_val) in epochs[lo..=hi].iter().enumerate() {
+                let epoch = epoch_val as u64;
+                let commit_ts = commit_ts_native
+                    .as_ref()
+                    .and_then(|col| decode_commit_ts_value(col.value_at(lo + i).as_ref()));
+                // `observes_row` is the HLC-aware predicate: when the snapshot
+                // is HLC-pinned, an HLC-stamped candidate whose HLC is within
+                // the snapshot wins regardless of its local epoch.
+                if !snapshot.observes_row(Epoch(epoch), commit_ts) {
+                    continue;
+                }
+                let candidate = (epoch, commit_ts, seq, lo + i);
+                let is_newer = best.as_ref().is_none_or(|cur| {
+                    Snapshot::version_is_newer(Epoch(candidate.0), candidate.1, Epoch(cur.0), cur.1)
+                });
+                if is_newer {
+                    best = Some(candidate);
                 }
             }
         }
-        Ok(best)
+        Ok(best.map(|(epoch, _, seq, local)| (epoch, seq, local)))
     }
 
     /// Like [`Self::get_version`], but decodes only `column_id` (plus the
@@ -2912,7 +3002,17 @@ impl RunReader {
         snapshot: Epoch,
         column_id: u16,
     ) -> Result<Option<(Epoch, bool, Option<Value>)>> {
-        let Some((epoch, seq, local_index)) = self.find_version_page(row_id, snapshot)? else {
+        self.get_version_column_at(row_id, Snapshot::at(snapshot), column_id)
+    }
+
+    /// Full-Snapshot variant of [`Self::get_version_column`].
+    pub fn get_version_column_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+        column_id: u16,
+    ) -> Result<Option<(Epoch, bool, Option<Value>)>> {
+        let Some((epoch, seq, local_index)) = self.find_version_page_at(row_id, snapshot)? else {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
@@ -2960,7 +3060,16 @@ impl RunReader {
         row_id: RowId,
         snapshot: Epoch,
     ) -> Result<Option<(Epoch, bool)>> {
-        let Some((epoch, seq, local_index)) = self.find_version_page(row_id, snapshot)? else {
+        self.get_version_visibility_at(row_id, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::get_version_visibility`].
+    pub fn get_version_visibility_at(
+        &mut self,
+        row_id: RowId,
+        snapshot: Snapshot,
+    ) -> Result<Option<(Epoch, bool)>> {
+        let Some((epoch, seq, local_index)) = self.find_version_page_at(row_id, snapshot)? else {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
@@ -3093,6 +3202,13 @@ impl RunReader {
     /// [`Self::gather_column`] each user column at these indices — no per-row
     /// `HashMap`/`Row` materialization.
     pub fn visible_indices(&mut self, snapshot: Epoch) -> Result<Vec<usize>> {
+        self.visible_indices_at(Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::visible_indices`]: visibility uses
+    /// [`Snapshot::observes_row`] and `version_is_newer` so an HLC-pinned
+    /// snapshot returns the HLC-visible winner.
+    pub fn visible_indices_at(&mut self, snapshot: Snapshot) -> Result<Vec<usize>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(Vec::new());
@@ -3100,23 +3216,32 @@ impl RunReader {
         let row_ids = self.column(SYS_ROW_ID)?.to_vec();
         let epochs = self.column(SYS_EPOCH)?.to_vec();
         let deleted = self.column(SYS_DELETED)?.to_vec();
-        let mut best: HashMap<u64, (u64, usize)> = HashMap::new();
+        let commit_ts_native = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column(SYS_COMMIT_TS)?.to_vec())
+        } else {
+            None
+        };
+        let mut best: HashMap<u64, (u64, Option<HlcTimestamp>, usize)> = HashMap::new();
         for i in 0..n {
             let rid = int_at(&row_ids, i);
             let e = int_at(&epochs, i);
-            if e > snapshot.0 {
+            let commit_ts = commit_ts_native
+                .as_ref()
+                .and_then(|vals| decode_commit_ts_value(vals.get(i)));
+            if !snapshot.observes_row(Epoch(e), commit_ts) {
                 continue;
             }
             best.entry(rid)
-                .and_modify(|(be, bi)| {
-                    if e > *be {
+                .and_modify(|(be, bts, bi)| {
+                    if Snapshot::version_is_newer(Epoch(e), commit_ts, Epoch(*be), *bts) {
                         *be = e;
+                        *bts = commit_ts;
                         *bi = i;
                     }
                 })
-                .or_insert((e, i));
+                .or_insert((e, commit_ts, i));
         }
-        let mut idxs: Vec<usize> = best.into_values().map(|(_, i)| i).collect();
+        let mut idxs: Vec<usize> = best.into_values().map(|(_, _, i)| i).collect();
         idxs.retain(|&i| !bool_at(&deleted, i));
         idxs.sort_unstable();
         Ok(idxs)
@@ -3557,28 +3682,42 @@ impl RunReader {
     }
 
     pub fn visible_indices_native(&mut self, snapshot: Epoch) -> Result<Vec<usize>> {
+        self.visible_indices_native_at(Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::visible_indices_native`].
+    pub fn visible_indices_native_at(&mut self, snapshot: Snapshot) -> Result<Vec<usize>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(Vec::new());
         }
         let (row_ids, epochs, deleted) = self.system_columns_native()?;
-        let mut best: HashMap<u64, (u64, usize)> = HashMap::new();
+        let commit_ts_native = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column_native_shared(SYS_COMMIT_TS)?)
+        } else {
+            None
+        };
+        let mut best: HashMap<u64, (u64, Option<HlcTimestamp>, usize)> = HashMap::new();
         for i in 0..n {
             let rid = row_ids[i] as u64;
             let e = epochs[i] as u64;
-            if e > snapshot.0 {
+            let commit_ts = commit_ts_native
+                .as_ref()
+                .and_then(|col| decode_commit_ts_value(col.value_at(i).as_ref()));
+            if !snapshot.observes_row(Epoch(e), commit_ts) {
                 continue;
             }
             best.entry(rid)
-                .and_modify(|(be, bi)| {
-                    if e > *be {
+                .and_modify(|(be, bts, bi)| {
+                    if Snapshot::version_is_newer(Epoch(e), commit_ts, Epoch(*be), *bts) {
                         *be = e;
+                        *bts = commit_ts;
                         *bi = i;
                     }
                 })
-                .or_insert((e, i));
+                .or_insert((e, commit_ts, i));
         }
-        let mut idxs: Vec<usize> = best.into_values().map(|(_, i)| i).collect();
+        let mut idxs: Vec<usize> = best.into_values().map(|(_, _, i)| i).collect();
         idxs.retain(|&i| deleted[i] == 0);
         idxs.sort_unstable();
         Ok(idxs)
@@ -3598,6 +3737,17 @@ impl RunReader {
         lo: i64,
         hi: i64,
         snapshot: Epoch,
+    ) -> Result<Vec<u64>> {
+        self.range_row_ids_visible_i64_at(column_id, lo, hi, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::range_row_ids_visible_i64`].
+    pub fn range_row_ids_visible_i64_at(
+        &mut self,
+        column_id: u16,
+        lo: i64,
+        hi: i64,
+        snapshot: Snapshot,
     ) -> Result<Vec<u64>> {
         let stats: Vec<(Option<i64>, Option<i64>, usize)> = match self.column_page_stats(column_id)
         {
@@ -3620,7 +3770,7 @@ impl RunReader {
         // plaintext runs) a missing min/max means an all-null page.
         let stats_pruneable =
             !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
-        let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
+        let (positions, rids) = self.visible_positions_with_rids_at(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
         let mut page_start = 0usize;
@@ -3668,6 +3818,26 @@ impl RunReader {
         hi_inclusive: bool,
         snapshot: Epoch,
     ) -> Result<Vec<u64>> {
+        self.range_row_ids_visible_f64_at(
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+            Snapshot::at(snapshot),
+        )
+    }
+
+    /// Full-Snapshot variant of [`Self::range_row_ids_visible_f64`].
+    pub fn range_row_ids_visible_f64_at(
+        &mut self,
+        column_id: u16,
+        lo: f64,
+        lo_inclusive: bool,
+        hi: f64,
+        hi_inclusive: bool,
+        snapshot: Snapshot,
+    ) -> Result<Vec<u64>> {
         let stats: Vec<(Option<f64>, Option<f64>, usize)> = match self.column_page_stats(column_id)
         {
             Some(s) => s
@@ -3689,7 +3859,7 @@ impl RunReader {
         // plaintext runs) a missing min/max means an all-null page.
         let stats_pruneable =
             !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
-        let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
+        let (positions, rids) = self.visible_positions_with_rids_at(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
         let mut page_start = 0usize;
@@ -3742,6 +3912,16 @@ impl RunReader {
         want_nulls: bool,
         snapshot: Epoch,
     ) -> Result<Vec<u64>> {
+        self.null_row_ids_visible_at(column_id, want_nulls, Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::null_row_ids_visible`].
+    pub fn null_row_ids_visible_at(
+        &mut self,
+        column_id: u16,
+        want_nulls: bool,
+        snapshot: Snapshot,
+    ) -> Result<Vec<u64>> {
         let stats: Vec<(usize, usize)> = match self.column_page_stats(column_id) {
             Some(s) => s
                 .iter()
@@ -3750,7 +3930,7 @@ impl RunReader {
             None => return Ok(Vec::new()),
         };
         let ty = self.resolve_type(column_id);
-        let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
+        let (positions, rids) = self.visible_positions_with_rids_at(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
         let mut page_start = 0usize;
@@ -3786,6 +3966,11 @@ impl RunReader {
     /// learned index (built only from run 0) or `range_row_ids_visible_i64`
     /// happily returned.
     pub fn tombstoned_row_ids(&mut self, snapshot: Epoch) -> Result<Vec<u64>> {
+        self.tombstoned_row_ids_at(Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::tombstoned_row_ids`].
+    pub fn tombstoned_row_ids_at(&mut self, snapshot: Snapshot) -> Result<Vec<u64>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(Vec::new());
@@ -3793,11 +3978,17 @@ impl RunReader {
         // Clean runs have no tombstones.
         if self.is_clean()
             && self.epoch_override.is_none()
-            && self.header.epoch_created <= snapshot.0
+            && self.header.epoch_created <= snapshot.epoch.0
+            && (!snapshot.uses_hlc_authority() || !self.has_column(SYS_COMMIT_TS))
         {
             return Ok(Vec::new());
         }
         let (row_ids, epochs, deleted) = self.system_columns_native()?;
+        let commit_ts_native = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column_native_shared(SYS_COMMIT_TS)?)
+        } else {
+            None
+        };
         let mut out = Vec::new();
         let mut i = 0;
         while i < n {
@@ -3805,7 +3996,22 @@ impl RunReader {
             let mut best: Option<usize> = None;
             let mut j = i;
             while j < n && row_ids[j] as u64 == rid {
-                if epochs[j] as u64 <= snapshot.0 {
+                let e = epochs[j] as u64;
+                let commit_ts = commit_ts_native
+                    .as_ref()
+                    .and_then(|col| decode_commit_ts_value(col.value_at(j).as_ref()));
+                if snapshot.observes_row(Epoch(e), commit_ts)
+                    && (best.is_none_or(|cur| {
+                        Snapshot::version_is_newer(
+                            Epoch(e),
+                            commit_ts,
+                            Epoch(epochs[cur] as u64),
+                            commit_ts_native
+                                .as_ref()
+                                .and_then(|col| decode_commit_ts_value(col.value_at(cur).as_ref())),
+                        )
+                    }))
+                {
                     best = Some(j);
                 }
                 j += 1;
@@ -3827,6 +4033,16 @@ impl RunReader {
         &mut self,
         snapshot: Epoch,
     ) -> Result<(Vec<usize>, Vec<i64>)> {
+        self.visible_positions_with_rids_at(Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::visible_positions_with_rids`]: visibility
+    /// uses [`Snapshot::observes_row`] and `version_is_newer` so an HLC-pinned
+    /// snapshot returns the HLC-visible winner per row.
+    pub fn visible_positions_with_rids_at(
+        &mut self,
+        snapshot: Snapshot,
+    ) -> Result<(Vec<usize>, Vec<i64>)> {
         let n = self.row_count();
         if n == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -3838,40 +4054,76 @@ impl RunReader {
         // mapping) and return identity positions [0..n).
         // A uniform-epoch overlay must still gate by snapshot, so skip the clean
         // fast path when an override is active (defensive: spill runs are never
-        // written clean).
+        // written clean). HLC authority requires honouring stamps, so when the
+        // snapshot is HLC-pinned the fast path is safe: clean + uniform → at
+        // most one stamped version per rid, and the row is observed iff
+        // `observes_row` admits it (epoch-gated by `header.epoch_created`,
+        // HLC-gated only when the run itself carries the stamp).
         if self.is_clean()
             && self.epoch_override.is_none()
-            && self.header.epoch_created <= snapshot.0
+            && self.header.epoch_created <= snapshot.epoch.0
         {
             let row_ids = match self.column_native_shared(SYS_ROW_ID)? {
                 columnar::NativeColumn::Int64 { data, .. } => data,
                 _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
             };
-            let positions: Vec<usize> = (0..n).collect();
-            return Ok((positions, row_ids));
+            // HLC authority still applies when stamps are present.
+            if !snapshot.uses_hlc_authority() || !self.has_column(SYS_COMMIT_TS) {
+                let positions: Vec<usize> = (0..n).collect();
+                return Ok((positions, row_ids));
+            }
+            // Drop positions whose HLC stamp (when present) is beyond the snapshot.
+            let commit_ts_native = self.column_native_shared(SYS_COMMIT_TS)?;
+            let mut idxs = Vec::with_capacity(n);
+            let mut rids = Vec::with_capacity(n);
+            for (i, &rid) in row_ids.iter().enumerate().take(n) {
+                let ts = decode_commit_ts_value(commit_ts_native.value_at(i).as_ref());
+                // Clean: at most one stamped or unstamped version per rid.
+                if snapshot.observes_row(Epoch(self.header.epoch_created), ts) {
+                    idxs.push(i);
+                    rids.push(rid);
+                }
+            }
+            return Ok((idxs, rids));
         }
         let (row_ids, epochs, deleted) = self.system_columns_native()?;
+        let commit_ts_native = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column_native_shared(SYS_COMMIT_TS)?)
+        } else {
+            None
+        };
         // Runs are written in `(RowId, Epoch)` ascending order (Bε-tree
         // composite key), so same-rid positions are consecutive with the
-        // newest (highest epoch) last. One linear pass keeps the last position
-        // per rid with `epoch <= snapshot`, dropping tombstones — no HashMap,
-        // no per-row hashing, sequential memory access. (Phase 16.3.)
-        //
-        // Invariant: every write path (memtable drain, mutable-run spill,
-        // bulk_load's sequential alloc) produces runs in this order; if a path
-        // ever wrote an unsorted run this would under-count (only consecutive
-        // dup groups merge) and must be reverted to the HashMap form.
+        // newest (highest epoch) last. One linear pass keeps the newest
+        // visible position per rid under [`Snapshot::observes_row`] and
+        // [`Snapshot::version_is_newer`], dropping tombstones — no HashMap,
+        // no per-row hashing, sequential memory access.
         let mut idxs: Vec<usize> = Vec::new();
         let mut i = 0;
         while i < n {
             let rid = row_ids[i] as u64;
-            // Walk the consecutive rid group; epochs rise within it, so the
-            // last position with epoch <= snapshot is the newest visible one.
             let mut best: Option<usize> = None;
             let mut j = i;
             while j < n && row_ids[j] as u64 == rid {
-                if epochs[j] as u64 <= snapshot.0 {
-                    best = Some(j);
+                let e = epochs[j] as u64;
+                let commit_ts = commit_ts_native
+                    .as_ref()
+                    .and_then(|col| decode_commit_ts_value(col.value_at(j).as_ref()));
+                if snapshot.observes_row(Epoch(e), commit_ts) {
+                    let candidate = j;
+                    let is_newer = best.is_none_or(|cur| {
+                        Snapshot::version_is_newer(
+                            Epoch(e),
+                            commit_ts,
+                            Epoch(epochs[cur] as u64),
+                            commit_ts_native
+                                .as_ref()
+                                .and_then(|col| decode_commit_ts_value(col.value_at(cur).as_ref())),
+                        )
+                    });
+                    if best.is_none() || is_newer {
+                        best = Some(candidate);
+                    }
                 }
                 j += 1;
             }
@@ -3882,7 +4134,6 @@ impl RunReader {
             }
             i = j;
         }
-        // Groups are processed in rid-ascending = position-ascending order.
         let rids: Vec<i64> = idxs.iter().map(|&k| row_ids[k]).collect();
         Ok((idxs, rids))
     }
@@ -3944,28 +4195,43 @@ impl RunReader {
     /// that hold a full [`crate::epoch::Snapshot`] still apply
     /// [`crate::epoch::Snapshot::observes_row`].
     pub fn visible_versions(&mut self, snapshot: Epoch) -> Result<Vec<Row>> {
+        self.visible_versions_at(Snapshot::at(snapshot))
+    }
+
+    /// Full-Snapshot variant of [`Self::visible_versions`]: visibility uses
+    /// [`Snapshot::observes_row`] and `version_is_newer` so the HLC-visible
+    /// candidate wins under an HLC-pinned snapshot.
+    pub fn visible_versions_at(&mut self, snapshot: Snapshot) -> Result<Vec<Row>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(Vec::new());
         }
         let row_ids = self.column(SYS_ROW_ID)?.to_vec();
         let epochs = self.column(SYS_EPOCH)?.to_vec();
-        let mut best: HashMap<u64, (u64, usize)> = HashMap::new();
+        let commit_ts_native = if self.has_column(SYS_COMMIT_TS) {
+            Some(self.column(SYS_COMMIT_TS)?.to_vec())
+        } else {
+            None
+        };
+        let mut best: HashMap<u64, (u64, Option<HlcTimestamp>, usize)> = HashMap::new();
         for i in 0..n {
             let rid = int_at(&row_ids, i);
-            let epoch = int_at(&epochs, i);
-            if epoch > snapshot.0 {
+            let e = int_at(&epochs, i);
+            let commit_ts = commit_ts_native
+                .as_ref()
+                .and_then(|vals| decode_commit_ts_value(vals.get(i)));
+            if !snapshot.observes_row(Epoch(e), commit_ts) {
                 continue;
             }
             best.entry(rid)
-                .and_modify(|e| {
-                    if epoch > e.0 {
-                        *e = (epoch, i);
+                .and_modify(|cur| {
+                    if Snapshot::version_is_newer(Epoch(e), commit_ts, Epoch(cur.0), cur.1) {
+                        *cur = (e, commit_ts, i);
                     }
                 })
-                .or_insert((epoch, i));
+                .or_insert((e, commit_ts, i));
         }
-        let mut picks: Vec<usize> = best.into_values().map(|(_, i)| i).collect();
+        let mut picks: Vec<usize> = best.into_values().map(|(_, _, i)| i).collect();
         picks.sort();
         let mut out = Vec::with_capacity(picks.len());
         for i in picks {
@@ -3977,7 +4243,7 @@ impl RunReader {
     /// All non-deleted rows visible at `snapshot`. Ascending `RowId`.
     pub fn visible_rows(&mut self, snapshot: Epoch) -> Result<Vec<Row>> {
         Ok(self
-            .visible_versions(snapshot)?
+            .visible_versions_at(Snapshot::at(snapshot))?
             .into_iter()
             .filter(|r| !r.deleted)
             .collect())
