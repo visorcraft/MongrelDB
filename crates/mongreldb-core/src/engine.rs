@@ -6942,6 +6942,7 @@ impl Table {
                     return Ok(Vec::new());
                 };
                 let cap = ann_candidate_cap(index.len(), context);
+                crate::trace::QueryTrace::record(|trace| trace.candidate_cap = cap);
                 if cap == 0 {
                     return Ok(Vec::new());
                 }
@@ -6953,6 +6954,28 @@ impl Table {
                         context.checkpoint()?;
                     }
                     let raw = index.search_with_context(query, breadth, context)?;
+                    crate::trace::QueryTrace::record(|trace| {
+                        trace.raw_candidates = raw.len();
+                        let unique = raw
+                            .iter()
+                            .map(|(row_id, _)| *row_id)
+                            .collect::<std::collections::HashSet<_>>()
+                            .len();
+                        trace.unique_candidates = unique;
+                        trace.duplicate_candidates = raw.len().saturating_sub(unique);
+                        trace.authorization_rejected = raw
+                            .iter()
+                            .filter(|(row_id, _)| {
+                                allowed.is_some_and(|allowed| !allowed.contains(row_id))
+                            })
+                            .count();
+                        trace.hard_filter_rejected = raw
+                            .iter()
+                            .filter(|(row_id, _)| {
+                                hard_filter.is_some_and(|filter| !filter.contains(row_id.0))
+                            })
+                            .count();
+                    });
                     let unchecked: Vec<_> = raw
                         .iter()
                         .map(|(row_id, _)| *row_id)
@@ -6994,6 +7017,7 @@ impl Table {
                         if filtered.len() < *k && index.len() > cap && breadth >= cap {
                             crate::trace::QueryTrace::record(|trace| {
                                 trace.ann_candidate_cap_hit = true;
+                                trace.candidate_cap_hit = true;
                             });
                         }
                         break filtered;
@@ -7122,6 +7146,21 @@ impl Table {
                 .transpose()?
                 .unwrap_or_default(),
         };
+        let requested_k = match retriever {
+            Retriever::Ann { k, .. }
+            | Retriever::Sparse { k, .. }
+            | Retriever::MinHash { k, .. } => *k,
+        };
+        crate::trace::QueryTrace::record(|trace| {
+            trace.final_hits = scored.len();
+            if scored.len() < requested_k {
+                trace.underfill_reason = Some(if trace.candidate_cap_hit {
+                    "candidate_cap"
+                } else {
+                    "eligible_candidates_exhausted"
+                });
+            }
+        });
         let elapsed = started.elapsed().as_nanos() as u64;
         crate::trace::QueryTrace::record(|trace| {
             match retriever {
@@ -9200,9 +9239,7 @@ impl Table {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
-                        RowIdSet::from_unsorted(
-                            li.range(*lo, *hi).into_iter().collect(),
-                        )
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
                         // Multi-run: learned_range only covers run_refs[0]; a
                         // tombstone in a later run wouldn't strip its alive
@@ -9211,15 +9248,9 @@ impl Table {
                         // leaked rid would surface as a wrong hit. Fall through
                         // to the MVCC-aware multi-run path so deletes land in
                         // any run are honored.
-                        let mut multi =
-                            self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
+                        let mut multi = self.range_scan_i64(*column_id, *lo, *hi, snapshot)?;
                         if lo == hi {
-                            self.union_bitmap_point_i64(
-                                &mut multi,
-                                *column_id,
-                                *lo,
-                                snapshot,
-                            );
+                            self.union_bitmap_point_i64(&mut multi, *column_id, *lo, snapshot);
                         }
                         return Ok(multi);
                     }

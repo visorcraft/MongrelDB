@@ -28,7 +28,8 @@ use mongreldb_core::schema::{
     AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind,
     IndexOptions, Schema, TypeId,
 };
-use mongreldb_core::{Epoch, PinGuard, PinSource, RowId, Snapshot, Table, Value};
+use mongreldb_core::{Epoch, PinGuard, PinSource, RowId, Snapshot, Table, TtlPolicy, Value};
+use mongreldb_types::hlc::HlcTimestamp;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
@@ -40,10 +41,23 @@ use tempfile::tempdir;
 const DEFAULT_SEED: u64 = 0xC0FFEE_BEEF_DEAD_BEu64;
 
 fn seed_from_env() -> u64 {
-    match std::env::var("MONGRELDB_ORACLE_SEED") {
-        Ok(raw) if !raw.is_empty() => raw.parse::<u64>().unwrap_or(DEFAULT_SEED),
-        _ => DEFAULT_SEED,
-    }
+    std::env::var("MONGRELDB_ORACLE_SEED")
+        .ok()
+        .filter(|raw| !raw.is_empty())
+        .or_else(|| {
+            std::env::var("MONGRELDB_ORACLE_SEEDS")
+                .ok()
+                .and_then(|raw| raw.split(',').next().map(str::to_owned))
+        })
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SEED)
+}
+
+fn operation_count(default: usize) -> usize {
+    std::env::var("MONGRELDB_ORACLE_OPERATIONS")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(default)
 }
 
 #[derive(Clone)]
@@ -149,10 +163,18 @@ struct ModelRow {
     /// `snap.epoch` only observes the row's current state when this value is
     /// `<= snap.epoch`.
     commit_epoch: Epoch,
+    /// Optional physical commit time for HLC-aware visibility drills.
+    commit_hlc: Option<HlcTimestamp>,
     /// Epoch at which the row was tombstoned. `None` while the row is alive.
     /// A snapshot at `snap.epoch` observes the tombstone when this value is
     /// `<= snap.epoch` (the delete had already happened by that snapshot).
     delete_epoch: Option<Epoch>,
+    /// Optional physical delete time for HLC-aware visibility drills.
+    delete_hlc: Option<HlcTimestamp>,
+    /// Policy copied onto the row, distinguishing never configured from expired.
+    ttl_policy: Option<TtlPolicy>,
+    /// Persistent authorization eligibility, independent of a query allowed set.
+    auth_eligible: bool,
     cols: BTreeMap<u16, ValueRepr>,
 }
 
@@ -233,7 +255,11 @@ impl Model {
                 pk,
                 rid,
                 commit_epoch,
+                commit_hlc: None,
                 delete_epoch: None,
+                delete_hlc: None,
+                ttl_policy: None,
+                auth_eligible: true,
                 cols: cols_map,
             });
         }
@@ -259,6 +285,11 @@ impl Model {
         self.rows
             .iter()
             .filter(|r| {
+                if !r.auth_eligible {
+                    return false;
+                }
+                let _logical_pk = r.pk;
+                let _hlc_state = (r.commit_hlc, r.delete_hlc);
                 if let Some(d) = r.delete_epoch {
                     if d <= snap.epoch {
                         return false;
@@ -267,10 +298,16 @@ impl Model {
                 if r.commit_epoch > snap.epoch {
                     return false;
                 }
-                if let Some((col_id, duration)) = self.ttl_policy {
-                    if let Some(ValueRepr::Int(ts)) = r.cols.get(&col_id) {
+                if let Some(policy) = r.ttl_policy.or_else(|| {
+                    self.ttl_policy
+                        .map(|(column_id, duration_nanos)| TtlPolicy {
+                            column_id,
+                            duration_nanos,
+                        })
+                }) {
+                    if let Some(ValueRepr::Int(ts)) = r.cols.get(&policy.column_id) {
                         // Engine treats a row as expired when ts + duration < now.
-                        if (*ts as u64).saturating_add(duration) < now_nanos as u64 {
+                        if (*ts as u64).saturating_add(policy.duration_nanos) < now_nanos as u64 {
                             return false;
                         }
                     }
@@ -286,6 +323,13 @@ impl Model {
 
     fn set_ttl(&mut self, column_id: u16, duration_nanos: u64) {
         self.ttl_policy = Some((column_id, duration_nanos));
+        let policy = TtlPolicy {
+            column_id,
+            duration_nanos,
+        };
+        for row in &mut self.rows {
+            row.ttl_policy = Some(policy);
+        }
     }
 }
 
@@ -316,13 +360,7 @@ fn fm_oracle(model: &Model, snap: Snapshot, column_id: u16, pattern: &[u8]) -> H
 }
 
 /// Oracle for `IndexKind::LearnedRange` inclusive range scan on Int64.
-fn range_oracle(
-    model: &Model,
-    snap: Snapshot,
-    column_id: u16,
-    lo: i64,
-    hi: i64,
-) -> HashSet<u64> {
+fn range_oracle(model: &Model, snap: Snapshot, column_id: u16, lo: i64, hi: i64) -> HashSet<u64> {
     let mut hits = HashSet::new();
     for row in model.live_rows(snap) {
         if let Some(ValueRepr::Int(v)) = row.cols.get(&column_id) {
@@ -582,40 +620,35 @@ fn apply_put(table: &mut Table, harness: &mut Harness, pk: i64, cols: Vec<(u16, 
 }
 
 fn apply_put_batch(table: &mut Table, harness: &mut Harness, rows: Vec<Vec<(u16, Value)>>) {
-    let pks: Vec<i64> = rows
+    let modeled_rows: Vec<_> = rows
         .iter()
-        .filter_map(|cols| {
-            cols.iter().find(|(c, _)| *c == 1).map(|(_, v)| match v {
-                Value::Int64(i) => *i,
-                _ => 0,
-            })
+        .map(|cols| {
+            let pk = cols
+                .iter()
+                .find(|(column_id, _)| *column_id == 1)
+                .and_then(|(_, value)| match value {
+                    Value::Int64(pk) => Some(*pk),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let values = cols
+                .iter()
+                .map(|(column_id, value)| (*column_id, ValueRepr::from_value(value)))
+                .collect();
+            (pk, values)
         })
         .collect();
+    let pks: Vec<_> = modeled_rows.iter().map(|(pk, _)| *pk).collect();
     let new_rids = pks.iter().any(|pk| harness.model.live_pks.contains_key(pk));
-    // Engine's put_batch stamps every row at one pending_epoch(); mirror it.
+    // Engine's put_batch stamps every row at one pending_epoch(); mirror it and
+    // use the allocator's returned ids rather than predicting allocation.
     let epoch = pending_epoch(table);
-    for cols in &rows {
-        let reprs: Vec<(u16, ValueRepr)> = cols
-            .iter()
-            .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
-            .collect();
-        let pk = cols
-            .iter()
-            .find(|(c, _)| *c == 1)
-            .and_then(|(_, v)| match v {
-                Value::Int64(i) => Some(*i),
-                _ => None,
-            })
-            .unwrap_or(0);
-        // Engine's put_batch allocates fresh rids; mirror that with
-        // new_rid=true so any existing row at this PK is tombstoned.
-        let reprs: Vec<(u16, ValueRepr)> = cols
-            .iter()
-            .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
-            .collect();
-        harness.model.upsert(pk, reprs, true, epoch);
+    let row_ids = table.put_batch(rows).unwrap();
+    for ((pk, values), row_id) in modeled_rows.into_iter().zip(row_ids) {
+        harness
+            .model
+            .upsert_with_rid(pk, values, true, row_id.0, epoch);
     }
-    table.put_batch(rows).unwrap();
     harness.record(Op::PutBatch { pks, new_rids });
 }
 
@@ -673,7 +706,7 @@ fn churn_oracle_fmindex() {
     // Snapshot for hard-filter + auth-allowed-set drill-downs.
     let query_pattern = b"the".to_vec();
 
-    let total_ops = 220;
+    let total_ops = operation_count(220);
     for step in 0..total_ops {
         let choice = rng.gen_range(0, 100);
         match choice {
@@ -900,7 +933,7 @@ fn churn_oracle_learned_range() {
     let mut harness = Harness::new();
     let mut rng = Lcg::new(seed_from_env());
 
-    let total_ops = 180;
+    let total_ops = operation_count(180);
     for step in 0..total_ops {
         let choice = rng.gen_range(0, 100);
         match choice {
@@ -1070,7 +1103,7 @@ fn churn_oracle_ann_hnsw_dense() {
         .collect();
     let k = 4;
 
-    let total_ops = 200;
+    let total_ops = operation_count(200);
     for step in 0..total_ops {
         let choice = rng.gen_range(0, 100);
         match choice {

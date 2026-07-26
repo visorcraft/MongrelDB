@@ -306,6 +306,8 @@ pub struct QueryTrace {
     pub candidate_cap_hit: bool,
     /// Final number of hits returned to the caller.
     pub final_hits: usize,
+    /// Stable explanation when a top-k retrieval legally returns fewer than k.
+    pub underfill_reason: Option<&'static str>,
 }
 
 /// Reasons a HOT (`Hash-Organized Table`) PK lookup may fall back to the slower
@@ -497,6 +499,9 @@ impl fmt::Display for QueryTrace {
         }
         if self.candidate_cap_hit {
             write!(f, " cap-hit={}", self.final_hits)?;
+        }
+        if let Some(reason) = self.underfill_reason {
+            write!(f, " underfill={reason}")?;
         }
         Ok(())
     }
