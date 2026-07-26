@@ -251,9 +251,10 @@ pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN
 
 pub use encryption::{AesCipher, ColumnKeyDescriptor, EncryptionDescriptor, Kek};
 pub use result_cache::{
-    decode_frame, decrypt_payload, encode_frame, encrypt_payload, read_header_only,
-    real_io_final_path, spawn_persistent_cache_worker, DrainOutcome, DrainedOp, IoError,
-    IoErrorKind, PersistableEntry, PersistedFrame, PersistedHeader, PersistentCacheIo,
-    PersistentResultCacheWriter, RealPersistentCacheIo, StalenessGuard, WriterLimits,
-    WriterStalenessGuard,
+    decode_frame, decode_persisted_entry, decrypt_payload, encode_frame, encode_persisted_entry,
+    encrypt_payload, read_header_only, real_io_final_path, spawn_persistent_cache_worker,
+    CacheLoadRejection, CachePersistError, DrainOutcome, DrainedOp, IoError, IoErrorKind,
+    PersistContext, PersistableEntry, PersistedFrame, PersistedHeader, PersistentCacheIdentity,
+    PersistentCacheIo, PersistentResultCacheWriter, RealPersistentCacheIo, StalenessGuard,
+    WriterLimits, WriterStalenessGuard, FRAME_FORMAT_VERSION, FRAME_MAGIC,
 };

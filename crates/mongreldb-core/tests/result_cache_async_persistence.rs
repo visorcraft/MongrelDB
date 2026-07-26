@@ -282,6 +282,7 @@ fn no_query_thread_io() {
         cipher: None,
         staleness,
         max_staleness_retries: 8,
+        completion: None,
     };
     let _worker = result_cache::spawn_persistent_cache_worker(config);
 
@@ -414,6 +415,7 @@ fn remove_supersedes_store() {
         cipher: None,
         staleness,
         max_staleness_retries: 8,
+        completion: None,
     };
     let _worker = result_cache::spawn_persistent_cache_worker(config);
 
@@ -461,6 +463,7 @@ fn clear_supersedes_all_old_stores() {
         cipher: None,
         staleness,
         max_staleness_retries: 8,
+        completion: None,
     };
     let _worker = result_cache::spawn_persistent_cache_worker(config);
 
@@ -513,6 +516,7 @@ fn stale_generation_rejected_on_reopen() {
         cipher: None,
         staleness,
         max_staleness_retries: 8,
+        completion: None,
     };
     let _worker = result_cache::spawn_persistent_cache_worker(config);
 

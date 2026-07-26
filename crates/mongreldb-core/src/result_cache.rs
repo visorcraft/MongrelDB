@@ -40,7 +40,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crc::{Crc, CRC_32_ISCSI};
 
@@ -164,6 +166,197 @@ pub fn decode_frame(bytes: &[u8]) -> Option<PersistedFrame> {
 /// would re-parse the entire buffer, so we simply delegate to [`decode_frame`].
 pub fn read_header_only(bytes: &[u8]) -> Option<PersistedHeader> {
     decode_frame(bytes).map(|f| f.header)
+}
+
+// ============================================================================
+// Persistent cache identity + shared encode/decode helpers
+// ============================================================================
+
+/// Stable identity bound to a persisted cache frame (REM-002 §18.1). The
+/// loader compares the on-disk frame header against this identity and rejects
+/// the entry on any mismatch. The `logical_generation` is the durable table
+/// epoch (`Table::current_epoch().0`) — never a process-local counter — so a
+/// valid frame from an older logical state cannot be served after a commit
+/// has advanced the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentCacheIdentity {
+    pub table_id: u64,
+    pub schema_id: u64,
+    pub logical_generation: u64,
+}
+
+/// Context passed to [`encode_persisted_entry`] and used by the worker to
+/// validate the on-disk frame matches what the queue said should be written.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistContext {
+    pub identity: PersistentCacheIdentity,
+    pub key: u64,
+    pub entry_generation: u64,
+}
+
+/// Error returned by [`encode_persisted_entry`] when the payload cannot be
+/// framed (e.g. encryption failure). The caller treats this as a transient
+/// per-op failure and increments the persist error counter.
+#[derive(Debug)]
+pub struct CachePersistError {
+    pub message: String,
+}
+
+impl std::fmt::Display for CachePersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CachePersistError {}
+
+/// Why a persisted frame was rejected by [`decode_persisted_entry`]. The
+/// caller maps each variant to a rejection metric / log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // some variants are reserved for future strictness
+pub enum CacheLoadRejection {
+    /// File does not start with the MLCP magic — legacy unframed data.
+    LegacyUnframed,
+    /// File is too small to contain a valid header / payload / trailer.
+    Truncated,
+    /// Stored CRC does not match the body bytes.
+    BadCrc,
+    /// Format version is not one we can read.
+    UnsupportedVersion(u16),
+    /// Table identity does not match the open table.
+    TableIdMismatch { expected: u64, found: u64 },
+    /// Schema identity does not match the open table.
+    SchemaIdMismatch { expected: u64, found: u64 },
+    /// Logical generation is older than the open table's current epoch.
+    GenerationMismatch { expected: u64, found: u64 },
+    /// The cache key embedded in the header does not match the on-disk file
+    /// name (e.g. a file got renamed but its header still references the
+    /// old key — the safest response is to reject the whole entry).
+    KeyMismatch { expected: u64, found: u64 },
+    /// File claimed an encrypted payload but a cipher was not provided.
+    MissingCipher,
+    /// Cipher was provided but the GCM tag check failed (wrong key, bit rot).
+    DecryptionFailed,
+    /// Frame decoded cleanly but the inner payload did not deserialize.
+    PayloadInvalid,
+}
+
+impl std::fmt::Display for CacheLoadRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyUnframed => f.write_str("legacy unframed data"),
+            Self::Truncated => f.write_str("truncated frame"),
+            Self::BadCrc => f.write_str("bad crc"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported format version {v}"),
+            Self::TableIdMismatch { expected, found } => {
+                write!(f, "table id mismatch: expected {expected}, found {found}")
+            }
+            Self::SchemaIdMismatch { expected, found } => {
+                write!(f, "schema id mismatch: expected {expected}, found {found}")
+            }
+            Self::GenerationMismatch { expected, found } => write!(
+                f,
+                "logical generation mismatch: expected {expected}, found {found}"
+            ),
+            Self::KeyMismatch { expected, found } => {
+                write!(f, "cache key mismatch: expected {expected}, found {found}")
+            }
+            Self::MissingCipher => f.write_str("cipher required for encrypted frame"),
+            Self::DecryptionFailed => f.write_str("decryption failed"),
+            Self::PayloadInvalid => f.write_str("payload deserialize failed"),
+        }
+    }
+}
+
+impl std::error::Error for CacheLoadRejection {}
+
+/// Frame an already-bincode-serialized payload using the MLCP layout. Both
+/// the async worker and the synchronous fallback call this — the on-disk
+/// format is unified across both paths (REM-002 §18.2). The payload is
+/// encrypted (or left as plaintext) before framing; the magic / version /
+/// table / schema / generation / key / payload_len / CRC32C layout is the
+/// same for both encrypted and plaintext frames.
+pub fn encode_persisted_entry(
+    context: PersistContext,
+    payload: &[u8],
+    cipher: Option<&AesCipher>,
+) -> Result<Vec<u8>, CachePersistError> {
+    let inner = encrypt_payload(cipher, payload).map_err(|e| CachePersistError {
+        message: format!("encrypt_persisted_entry: {:?}", e),
+    })?;
+    let frame = PersistedFrame {
+        header: PersistedHeader {
+            format_version: FRAME_FORMAT_VERSION,
+            table_id: context.identity.table_id,
+            schema_id: context.identity.schema_id,
+            run_generation: context.identity.logical_generation,
+            cache_key: context.key,
+            entry_generation: context.entry_generation,
+            payload_len: inner.len() as u32,
+        },
+        payload: inner,
+    };
+    Ok(encode_frame(&frame))
+}
+
+/// Decode + validate a frame produced by [`encode_persisted_entry`]. On
+/// rejection, the caller removes the on-disk file (the cache is disposable).
+/// On success, the plaintext payload is returned so the engine can perform
+/// the bincode-specific `SerializedEntry` deserialize.
+pub fn decode_persisted_entry(
+    expected: PersistentCacheIdentity,
+    expected_key: u64,
+    bytes: &[u8],
+    cipher: Option<&AesCipher>,
+) -> Result<Vec<u8>, CacheLoadRejection> {
+    // Legacy unframed files: anything that does not start with MLCP is
+    // treated as legacy data. The safe policy is to delete and recompute
+    // (REM-002 §18.5).
+    if bytes.len() < FRAME_MAGIC.len() || bytes[..FRAME_MAGIC.len()] != FRAME_MAGIC {
+        return Err(CacheLoadRejection::LegacyUnframed);
+    }
+    let frame = decode_frame(bytes).ok_or(CacheLoadRejection::BadCrc)?;
+    if frame.header.format_version != FRAME_FORMAT_VERSION {
+        return Err(CacheLoadRejection::UnsupportedVersion(
+            frame.header.format_version,
+        ));
+    }
+    if frame.header.table_id != expected.table_id {
+        return Err(CacheLoadRejection::TableIdMismatch {
+            expected: expected.table_id,
+            found: frame.header.table_id,
+        });
+    }
+    if frame.header.schema_id != expected.schema_id {
+        return Err(CacheLoadRejection::SchemaIdMismatch {
+            expected: expected.schema_id,
+            found: frame.header.schema_id,
+        });
+    }
+    if frame.header.run_generation < expected.logical_generation {
+        // Strict monotonic: a frame at an older logical generation cannot
+        // be served. Anything from the same or newer generation is accepted;
+        // a newer generation can only appear via a fresh write through the
+        // shared encoder.
+        return Err(CacheLoadRejection::GenerationMismatch {
+            expected: expected.logical_generation,
+            found: frame.header.run_generation,
+        });
+    }
+    if frame.header.cache_key != expected_key {
+        return Err(CacheLoadRejection::KeyMismatch {
+            expected: expected_key,
+            found: frame.header.cache_key,
+        });
+    }
+    let plaintext = decrypt_payload(cipher, &frame.payload).map_err(|_e| {
+        // The encrypt path reports `IoError`, but on the load path any
+        // encryption error is treated as a key/auth failure (the file is
+        // untrusted). Convert the error to a typed rejection so the loader
+        // can return a clean variant.
+        CacheLoadRejection::DecryptionFailed
+    })?;
+    plaintext.ok_or(CacheLoadRejection::DecryptionFailed)
 }
 
 // ============================================================================
@@ -1100,6 +1293,11 @@ pub struct WorkerConfig {
     /// Maximum stale-checks to perform per op. Prevents unbounded work on a
     /// single contended key.
     pub max_staleness_retries: u32,
+    /// Optional completion signal. When `Some`, the worker sends `()`
+    /// immediately before exiting. The receiver (held by the engine) uses
+    /// `recv_timeout(remaining_deadline)` to wait for a bounded shutdown.
+    /// Send errors (receiver dropped) are ignored.
+    pub completion: Option<mpsc::Sender<()>>,
 }
 
 /// Hook for the worker to validate that a drained op is still current. The
@@ -1151,11 +1349,19 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
         cipher,
         staleness,
         max_staleness_retries,
+        completion,
     } = config;
     loop {
         let drained = match writer.drain_one() {
             Some(d) => d,
-            None => return, // shutdown + queue empty
+            None => {
+                // shutdown + queue empty — emit the completion signal so the
+                // engine's deadline-bounded shutdown can return promptly.
+                if let Some(tx) = completion {
+                    let _ = tx.send(());
+                }
+                return;
+            }
         };
         // Re-validate staleness after the lock is released. We give the
         // queue a brief moment to settle, but bounded by `max_staleness_retries`
@@ -1183,6 +1389,26 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
             // generation mismatch: a newer Remove wins anyway.
             continue;
         }
+        // Final staleness check just before the publish point. Closes the
+        // race where `enqueue_clear` (or a per-key invalidate) advances the
+        // writer's generation after the top-of-loop check but before the
+        // I/O. With a locked final check, a generation bump that happens
+        // between the two checks will either:
+        //   * happen before the second check — and abort this write, or
+        //   * happen after the second check — and the write is allowed
+        //     because the user's intent was captured before the shutdown.
+        // The I/O itself is uninterruptible; an in-flight `write_atomic`
+        // either completes or fails.
+        if !staleness.is_current(
+            drained.key,
+            drained.key_generation,
+            drained.clear_generation,
+        ) {
+            if matches!(drained.op, PendingCacheOp::Store(_)) {
+                writer.record_outcome(DrainOutcome::StoreStale);
+            }
+            continue;
+        }
         match drained.op {
             PendingCacheOp::Store(entry) => {
                 writer.writes_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -1194,27 +1420,23 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
                         continue;
                     }
                 };
-                let payload = match encrypt_payload(cipher.as_deref(), &payload) {
-                    Ok(p) => p,
+                let context = PersistContext {
+                    identity: PersistentCacheIdentity {
+                        table_id: entry.table_id,
+                        schema_id: entry.schema_id,
+                        logical_generation: entry.run_generation,
+                    },
+                    key: entry.key,
+                    entry_generation: entry.entry_generation,
+                };
+                let bytes = match encode_persisted_entry(context, &payload, cipher.as_deref()) {
+                    Ok(b) => b,
                     Err(_) => {
                         writer.record_outcome(DrainOutcome::StoreErrored);
                         writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
                         continue;
                     }
                 };
-                let frame = PersistedFrame {
-                    header: PersistedHeader {
-                        format_version: FRAME_FORMAT_VERSION,
-                        table_id: entry.table_id,
-                        schema_id: entry.schema_id,
-                        run_generation: entry.run_generation,
-                        cache_key: entry.key,
-                        entry_generation: entry.entry_generation,
-                        payload_len: payload.len() as u32,
-                    },
-                    payload,
-                };
-                let bytes = encode_frame(&frame);
                 let outcome = match io.write_atomic(entry.key, &bytes) {
                     Ok(()) => DrainOutcome::StorePublished,
                     Err(_) => DrainOutcome::StoreErrored,
@@ -1242,4 +1464,12 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
             }
         }
     }
+}
+
+/// Try to receive a worker completion signal with a bounded timeout. Used by
+/// `shutdown_persistent_cache(deadline)` so the engine returns even if the
+/// worker is blocked in filesystem I/O. Returns `true` if the signal was
+/// received (worker has exited), `false` on timeout.
+pub fn recv_completion_with_timeout(rx: &mpsc::Receiver<()>, timeout: Duration) -> bool {
+    matches!(rx.recv_timeout(timeout), Ok(()))
 }
