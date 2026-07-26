@@ -9909,7 +9909,7 @@ impl Table {
                 // desynced run/LearnedRange plan can no longer hide a live row
                 // that still has a correct Bitmap membership (and vice versa
                 // the overlay merge still covers pure-memtable puts).
-                let mut set = if let Some(_li) = self.learned_range.get(column_id) {
+                let mut set = if let Some(li) = self.learned_range.get(column_id) {
                     if self.run_refs.len() == 1 {
                         // Single-run: learned_range was built from this run and
                         // excludes tombstones, so it's MVCC-correct.
