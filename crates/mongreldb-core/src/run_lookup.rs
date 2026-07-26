@@ -14,18 +14,33 @@
 //!   produced the directory; rejected on reopen if the active manifest
 //!   diverges;
 //! - a CRC32C footer for corruption detection.
+//!
+//! Large tables use a sharded checkpoint layout (one file per `RowId` range).
+//! The single-file API is retained for tests and small tables; the
+//! production open path uses [`RunLookupDirectory::read_checkpoint_sharded`].
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::epoch::Epoch;
+use crate::epoch::{Epoch, Snapshot};
 use crate::manifest::RunRef;
 use crate::rowid::RowId;
 use crate::{Result, Table};
 use crc::{Crc, CRC_32_ISCSI};
 use mongreldb_types::hlc::HlcTimestamp;
+
+/// On-disk filename of the single-file directory checkpoint. Production tables
+/// use the sharded layout (see `directory_shard_path`).
+pub const DIRECTORY_FILENAME: &str = "directory.bin";
+/// Prefix for sharded directory files (`directory.shard-<start>.bin`).
+pub const DIRECTORY_SHARD_PREFIX: &str = "directory.shard-";
+pub const DIRECTORY_SHARD_SUFFIX: &str = ".bin";
+/// Default max bytes per shard when publishing a large directory. Keeps the
+/// in-memory buffer under 16 MiB so rebuilds/checkpoint publishes never need
+/// the entire directory resident at once on a 256-run workload.
+pub const DEFAULT_SHARD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Magic bytes that prefix the on-disk checkpoint (`MLKP` = Mongrel Lookup).
 const LOOKUP_MAGIC: [u8; 4] = *b"MLKP";
@@ -377,64 +392,335 @@ impl RunLookupDirectory {
     /// `RunLocator` is emitted per `(RowId, run_id)` pair, aggregating
     /// min/max epoch + HLC and the unstamped-row presence flag across every
     /// version that run carries for that row.
+    ///
+    /// The implementation is the system-column-only iterator
+    /// ([`crate::sorted_run::RunReader::for_each_system`]); the full-row
+    /// fallback is intentionally absent so directory rebuilds never pay to
+    /// materialize user columns. See spec §8.4 step 4.
     pub fn rebuild_from_runs(runs: &[RunRef], table: &Table) -> Result<Self> {
-        let mut dir = Self::empty();
-        type RunRowAgg = (
-            Epoch,
-            Epoch,
-            Option<HlcTimestamp>,
-            Option<HlcTimestamp>,
-            bool,
-        );
-        for run_ref in runs {
-            let mut reader = table.open_reader(run_ref.run_id)?;
-            let rows = reader.all_rows()?;
-            let mut per_row: BTreeMap<RowId, RunRowAgg> = BTreeMap::new();
-            for row in rows {
-                let entry = per_row.entry(row.row_id).or_insert((
-                    row.committed_epoch,
-                    row.committed_epoch,
-                    row.commit_ts,
-                    row.commit_ts,
-                    row.commit_ts.is_none(),
-                ));
-                if row.committed_epoch < entry.0 {
-                    entry.0 = row.committed_epoch;
+        rebuild_from_runs_system_only(runs, table)
+    }
+
+    /// Persist the directory as a sequence of shard files in `base_dir`, one
+    /// per `RowId` range, bounded by `max_shard_bytes` each (default
+    /// [`DEFAULT_SHARD_BYTES`]). Any previous `directory.shard-*.bin` files
+    /// in `base_dir` are unlinked first so a torn-tail publication cannot
+    /// leave a stale shard from the previous run.
+    pub fn write_checkpoint_sharded(
+        &self,
+        base_dir: &Path,
+        max_shard_bytes: u64,
+    ) -> io::Result<()> {
+        let _ = self.fingerprint.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run-lookup directory has no fingerprint; refusing to checkpoint",
+            )
+        })?;
+        // Best-effort: clear any prior shards before publishing new ones.
+        clear_shards(base_dir)?;
+        let max = max_shard_bytes.max(1024 * 1024); // sanity floor
+        let mut iter = self.postings.iter().peekable();
+        let mut shard_no: usize = 0;
+        while let Some((first_row_id, _)) = iter.peek() {
+            shard_no += 1;
+            let shard_start = first_row_id.0;
+            // The shard spans at least one entry. Determine a clean upper
+            // boundary in row_id space by accumulating entries until the
+            // projected body length would exceed `max`.
+            let mut shard_entries: Vec<(RowId, RunLocatorList)> = Vec::new();
+            let mut body_len: usize = 4 + 8 + 4; // magic + fp + key_count
+            while let Some((_row_id, list)) = iter.peek() {
+                let entry_cost = 1 + 8 // varint delta
+                    + 4 // locator count
+                    + list.locators.len()
+                        * (16 + 8 + 8 + 1 + 1 + 16 + 16 + 1); // worst case per locator
+                if !shard_entries.is_empty() && body_len + entry_cost > max as usize {
+                    break;
                 }
-                if row.committed_epoch > entry.1 {
-                    entry.1 = row.committed_epoch;
-                }
-                match (row.commit_ts, entry.2) {
-                    (Some(ts), Some(prev)) if ts < prev => entry.2 = Some(ts),
-                    (Some(_), None) => entry.2 = row.commit_ts,
-                    _ => {}
-                }
-                match (row.commit_ts, entry.3) {
-                    (Some(ts), Some(prev)) if ts > prev => entry.3 = Some(ts),
-                    (Some(_), None) => entry.3 = row.commit_ts,
-                    _ => {}
-                }
-                if row.commit_ts.is_none() {
-                    entry.4 = true;
-                }
+                body_len += entry_cost;
+                let (rid, list) = iter.next().unwrap();
+                shard_entries.push((*rid, list.clone()));
             }
-            for (row_id, (min_epoch, max_epoch, min_hlc, max_hlc, contains_unstamped)) in per_row {
-                dir.insert(
-                    row_id,
-                    RunLocator {
-                        run_id: run_ref.run_id,
-                        min_epoch,
-                        max_epoch,
-                        min_hlc,
-                        max_hlc,
-                        contains_unstamped_versions: contains_unstamped,
-                    },
-                );
+            let last = shard_entries
+                .last()
+                .map(|(rid, _)| rid.0)
+                .unwrap_or(shard_start);
+            let path = if iter.peek().is_some() {
+                directory_shard_path(base_dir, shard_start, Some(last))
+            } else {
+                directory_shard_path(base_dir, shard_start, None)
+            };
+            write_single_shard(&path, &shard_entries, self.fingerprint.unwrap())?;
+        }
+        if shard_no == 0 {
+            // Empty directory: still emit one zero-row shard so the open path
+            // can confirm the checkpoint was published atomically.
+            let path = directory_shard_path(base_dir, 0, None);
+            write_single_shard(&path, &[], self.fingerprint.unwrap())?;
+        }
+        // Final best-effort directory sync.
+        if let Ok(dir) = OpenOptions::new().read(true).open(base_dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Read the directory from the sharded layout in `base_dir`. Validates
+    /// every shard's magic, CRC, and fingerprint independently. Returns the
+    /// merged directory; a missing or unreadable shard is propagated as
+    /// `io::Error` so the caller can fall back to rebuild-from-runs.
+    pub fn read_checkpoint_sharded(base_dir: &Path, fingerprint: u64) -> io::Result<Self> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(base_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            // Shards use the `directory.shard-` prefix; the last shard is
+            // published as `directory.shard-<start>-open` (no `.bin` suffix)
+            // so the open boundary is unambiguous. Both layouts are matched
+            // here.
+            if name.starts_with(DIRECTORY_SHARD_PREFIX)
+                && (name.ends_with(DIRECTORY_SHARD_SUFFIX) || name.ends_with("-open"))
+            {
+                paths.push(entry.path());
             }
         }
-        Ok(dir)
+        paths.sort();
+        if paths.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no run-lookup directory shards present",
+            ));
+        }
+        let mut merged: BTreeMap<RowId, RunLocatorList> = BTreeMap::new();
+        for path in paths {
+            let shard = read_single_shard(&path, fingerprint)?;
+            for (rid, list) in shard {
+                merged.insert(rid, list);
+            }
+        }
+        Ok(Self {
+            postings: merged,
+            fingerprint: Some(fingerprint),
+        })
     }
 }
+
+fn clear_shards(base_dir: &Path) -> io::Result<()> {
+    if !base_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(base_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(DIRECTORY_SHARD_PREFIX)
+            && (name.ends_with(DIRECTORY_SHARD_SUFFIX) || name.ends_with("-open"))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn write_single_shard(
+    path: &Path,
+    entries: &[(RowId, RunLocatorList)],
+    fingerprint: u64,
+) -> io::Result<()> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&LOOKUP_MAGIC);
+    body.extend_from_slice(&fingerprint.to_le_bytes());
+    let key_count = entries.len() as u32;
+    body.extend_from_slice(&key_count.to_le_bytes());
+    let mut prev: u64 = 0;
+    for (row_id, list) in entries {
+        let cur = row_id.0;
+        let delta = cur.checked_sub(prev).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run-lookup row_id sequence is not non-decreasing",
+            )
+        })?;
+        encode_varint(delta, &mut body);
+        let locator_count = list.locators.len() as u32;
+        body.extend_from_slice(&locator_count.to_le_bytes());
+        for loc in &list.locators {
+            body.extend_from_slice(&loc.run_id.to_le_bytes());
+            body.extend_from_slice(&loc.min_epoch.0.to_le_bytes());
+            body.extend_from_slice(&loc.max_epoch.0.to_le_bytes());
+            write_optional_hlc(loc.min_hlc, &mut body);
+            write_optional_hlc(loc.max_hlc, &mut body);
+            body.push(if loc.contains_unstamped_versions {
+                1
+            } else {
+                0
+            });
+        }
+        prev = cur;
+    }
+    let crc = CRC32C.checksum(&body);
+    body.extend_from_slice(&crc.to_le_bytes());
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let staging = parent.join(format!(
+        ".{}.{}.{}.staging",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shard"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    {
+        let _ = std::fs::remove_file(&staging);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&staging)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&staging, path) {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn read_single_shard(path: &Path, fingerprint: u64) -> io::Result<BTreeMap<RowId, RunLocatorList>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    // Shards are bounded by `max_shard_bytes`. A pathologically large shard
+    // is treated as corruption so the caller can fall back to rebuild.
+    if len < 4 + 8 + 4 + FOOTER_LEN as u64 || len > MAX_SHARD_BYTES * 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard length is out of range",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut bytes)?;
+    let split = bytes.len() - FOOTER_LEN;
+    let (body, footer) = bytes.split_at(split);
+    let expected = u32::from_le_bytes(footer.try_into().unwrap());
+    let actual = CRC32C.checksum(body);
+    if expected != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard CRC mismatch",
+        ));
+    }
+    if body.len() < 4 + 8 + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard body too short",
+        ));
+    }
+    if body[..4] != LOOKUP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard magic mismatch",
+        ));
+    }
+    let stored_fp = u64::from_le_bytes(body[4..12].try_into().unwrap());
+    if stored_fp != fingerprint {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard fingerprint does not match active run set",
+        ));
+    }
+    let key_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let mut cursor = &body[16..];
+    let mut postings: BTreeMap<RowId, RunLocatorList> = BTreeMap::new();
+    let mut prev: u64 = 0;
+    for _ in 0..key_count {
+        let (delta, consumed) = decode_varint(cursor)?;
+        cursor = &cursor[consumed..];
+        let cur = prev.checked_add(delta).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run-lookup shard varint overflows u64",
+            )
+        })?;
+        if cur < prev {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run-lookup shard row_id sequence is not monotonic",
+            ));
+        }
+        if cursor.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "run-lookup shard truncates locator count",
+            ));
+        }
+        let locator_count = u32::from_le_bytes(cursor[..4].try_into().unwrap()) as usize;
+        cursor = &cursor[4..];
+        let mut list = RunLocatorList {
+            locators: Vec::with_capacity(locator_count),
+        };
+        for _ in 0..locator_count {
+            let need = 16 + 8 + 8 + 1 + 1 + 1;
+            if cursor.len() < need {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "run-lookup shard truncates locator fields",
+                ));
+            }
+            let run_id_bytes: [u8; 16] = cursor[..16].try_into().unwrap();
+            let run_id = u128::from_le_bytes(run_id_bytes);
+            cursor = &cursor[16..];
+            let min_epoch = u64::from_le_bytes(cursor[..8].try_into().unwrap());
+            cursor = &cursor[8..];
+            let max_epoch = u64::from_le_bytes(cursor[..8].try_into().unwrap());
+            cursor = &cursor[8..];
+            let (min_hlc, used) = read_optional_hlc(cursor)?;
+            cursor = &cursor[used..];
+            let (max_hlc, used) = read_optional_hlc(cursor)?;
+            cursor = &cursor[used..];
+            if cursor.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "run-lookup shard truncates unstamped flag",
+                ));
+            }
+            let contains_unstamped = cursor[0] != 0;
+            cursor = &cursor[1..];
+            list.locators.push(RunLocator {
+                run_id,
+                min_epoch: Epoch(min_epoch),
+                max_epoch: Epoch(max_epoch),
+                min_hlc,
+                max_hlc,
+                contains_unstamped_versions: contains_unstamped,
+            });
+        }
+        postings.insert(RowId(cur), list);
+        prev = cur;
+    }
+    if !cursor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-lookup shard has trailing bytes after declared key count",
+        ));
+    }
+    Ok(postings)
+}
+
+// PathBuf is referenced by `read_checkpoint_sharded`; import for clarity.
+use std::path::PathBuf;
 
 fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
     loop {
@@ -532,6 +818,164 @@ fn locator_is_newer(newer: RunLocator, older: RunLocator) -> bool {
         (None, None) => false,
     }
 }
+
+impl RunLocator {
+    /// `true` when this locator *cannot* contain a version visible to
+    /// `snapshot`. Conservative: when in doubt, return `false` so the caller
+    /// opens the run. Mirrors the snapshot rules in spec §8.4 step 7:
+    ///
+    /// - HLC-authoritative snapshot + all-stamped locator → compare HLC
+    ///   bounds; the locator must be entirely above the snapshot.
+    /// - Epoch-only snapshot + locator without HLC → compare epoch bounds.
+    /// - Mixed stamped/unstamped locator → conservative (return `false`).
+    /// - Unknown / missing bound → conservative.
+    pub fn is_impossible_for(&self, snapshot: Snapshot) -> bool {
+        // A run that also carries legacy (unstamped) versions may still host
+        // a version that's only visible under the epoch rule. Conservative
+        // means we must NOT skip such a run.
+        if self.contains_unstamped_versions {
+            return false;
+        }
+        match (snapshot.uses_hlc_authority(), self.max_hlc, self.min_hlc) {
+            // HLC-authoritative + locator fully stamped: skip when the locator's
+            // minimum HLC already exceeds the snapshot — every version it
+            // contains is too new to be visible.
+            (true, Some(min_hlc), _) => min_hlc > snapshot.commit_ts,
+            // Epoch-only + locator has no HLC at all: skip when the locator's
+            // minimum epoch already exceeds the snapshot.
+            (false, None, _) => {
+                let snap_epoch = snapshot.epoch;
+                self.min_epoch > snap_epoch
+            }
+            // Any other mix is incomparable — stay conservative.
+            _ => false,
+        }
+    }
+}
+
+/// Deterministic fingerprint of the run-set + schema/index generations that
+/// produced this directory. `format_version` is the directory's own wire
+/// version so a future format bump invalidates older checkpoints even if the
+/// run set is unchanged. Uses xxh3 (already a workspace dependency) with a
+/// fixed seed, so the value is reproducible across processes/restarts.
+pub fn compute_fingerprint(
+    run_ids_ordered: &[u128],
+    schema_id: u64,
+    index_generation: u64,
+    run_generation: u64,
+    format_version: u32,
+) -> u64 {
+    let mut buf: Vec<u8> = Vec::with_capacity(8 + 8 + 8 + 4 + run_ids_ordered.len() * (16 + 2));
+    buf.extend_from_slice(&schema_id.to_le_bytes());
+    buf.extend_from_slice(&index_generation.to_le_bytes());
+    buf.extend_from_slice(&run_generation.to_le_bytes());
+    buf.extend_from_slice(&format_version.to_le_bytes());
+    // Include the run level alongside the run id so a compacted-down topology
+    // (level 0 → level 1 promotion) doesn't accidentally share a fingerprint
+    // with the pre-compaction set.
+    for run in run_ids_ordered {
+        let run_id_bytes = run.to_le_bytes();
+        buf.extend_from_slice(&run_id_bytes);
+    }
+    // Stable, fixed seed (NOT process-local / time-based).
+    xxhash_rust::xxh3::xxh3_64_with_seed(&buf, 0x9E37_79B1_854A_0001)
+}
+
+/// Build the file path of a single sharded directory checkpoint for the
+/// `RowId` range `[start, end_inclusive]`. `end_inclusive == None` means
+/// the trailing shard (last open-ended range).
+pub fn directory_shard_path(
+    base_dir: &Path,
+    start: u64,
+    end_inclusive: Option<u64>,
+) -> std::path::PathBuf {
+    match end_inclusive {
+        Some(end) => base_dir.join(format!(
+            "{DIRECTORY_SHARD_PREFIX}{start:020}-{end:020}{DIRECTORY_SHARD_SUFFIX}"
+        )),
+        None => base_dir.join(format!("{DIRECTORY_SHARD_PREFIX}{start:020}-open")),
+    }
+}
+
+/// Build a `RunLookupDirectory` for a single sorted run without materializing
+/// any user columns. Uses [`crate::sorted_run::RunReader::for_each_system`]
+/// (a system-column-only iterator) and folds the result into one
+/// [`RunLocator`] per `RowId` that the run carries. The caller is expected
+/// to call this from inside an `Arc<Table>` or equivalent — `table` is
+/// borrowed for `open_reader`.
+pub fn rebuild_from_runs_system_only(runs: &[RunRef], table: &Table) -> Result<RunLookupDirectory> {
+    let mut dir = RunLookupDirectory::empty();
+    for run_ref in runs {
+        let mut reader = table.open_reader(run_ref.run_id)?;
+        // Per-row agg: min epoch, max epoch, min hlc, max hlc,
+        // contains_unstamped.
+        type RunRowAgg = (
+            Epoch,
+            Epoch,
+            Option<HlcTimestamp>,
+            Option<HlcTimestamp>,
+            bool,
+        );
+        let mut per_row: BTreeMap<RowId, RunRowAgg> = BTreeMap::new();
+        reader.for_each_system(|row_id, committed_epoch, commit_ts, deleted| {
+            let entry = per_row.entry(row_id).or_insert((
+                committed_epoch,
+                committed_epoch,
+                commit_ts,
+                commit_ts,
+                commit_ts.is_none(),
+            ));
+            if committed_epoch < entry.0 {
+                entry.0 = committed_epoch;
+            }
+            if committed_epoch > entry.1 {
+                entry.1 = committed_epoch;
+            }
+            match (commit_ts, entry.2) {
+                (Some(ts), Some(prev)) if ts < prev => entry.2 = Some(ts),
+                (Some(_), None) => entry.2 = commit_ts,
+                _ => {}
+            }
+            match (commit_ts, entry.3) {
+                (Some(ts), Some(prev)) if ts > prev => entry.3 = Some(ts),
+                (Some(_), None) => entry.3 = commit_ts,
+                _ => {}
+            }
+            if commit_ts.is_none() {
+                entry.4 = true;
+            }
+            // Tombstones do not change the locator's min/max envelope (they
+            // share the row's commit epoch/HLC with the live version that
+            // preceded them), so the deleted flag is intentionally ignored
+            // for envelope construction. The HOT/manifest already removes
+            // tombstones that are superseded by a newer live version.
+            let _ = deleted;
+            Ok(())
+        })?;
+        for (row_id, (min_epoch, max_epoch, min_hlc, max_hlc, contains_unstamped)) in per_row {
+            dir.insert(
+                row_id,
+                RunLocator {
+                    run_id: run_ref.run_id,
+                    min_epoch,
+                    max_epoch,
+                    min_hlc,
+                    max_hlc,
+                    contains_unstamped_versions: contains_unstamped,
+                },
+            );
+        }
+    }
+    Ok(dir)
+}
+
+/// Format version of the on-disk directory. Bumped when the wire format
+/// changes in a way that older readers cannot safely interpret.
+pub const DIRECTORY_FORMAT_VERSION: u32 = 1;
+/// Hard upper bound for a single shard, raised from the 64 MiB legacy limit so
+/// very large tables (e.g. 256-run benchmarks) can checkpoint without
+/// truncation. The reader enforces only a soft sanity check.
+pub const MAX_SHARD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

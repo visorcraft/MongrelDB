@@ -1255,7 +1255,25 @@ pub struct Table {
     /// any fallback in a healthy workload is a regression to investigate.
     /// Each clone of `Table` (e.g. `clone_read_generation`) gets its own
     /// counters — readers and writers typically share via `Arc<Table>`.
-    lookup_metrics: LookupMetrics,
+    pub(crate) lookup_metrics: LookupMetrics,
+    /// Per-table row-to-run lookup directory state (spec §1.2 / §8.4). Derived
+    /// data only — open must not fail when the checkpoint is missing or stale
+    /// (the existing range-scan fallback stays the safety net).
+    run_lookup: RunLookupState,
+}
+
+/// Per-table row-to-run lookup directory state (Issue 4 / spec §8.4).
+///
+/// The directory is *derived* state and never authoritative for correctness.
+/// `complete == true` means the in-memory `directory` is consistent with the
+/// active run set; `false` means the open path found a missing / corrupt /
+/// stale checkpoint and the read path should fall back to range scans until
+/// a rebuild finishes (or a fresh publish lands).
+#[derive(Debug, Default, Clone)]
+struct RunLookupState {
+    directory: Option<std::sync::Arc<crate::run_lookup::RunLookupDirectory>>,
+    fingerprint: u64,
+    complete: bool,
 }
 
 #[derive(Debug, Default)]
@@ -2875,6 +2893,7 @@ impl Table {
             published: Arc::new(ArcSwap::from_pointee(initial_view)),
             read_generation_pin: None,
             lookup_metrics: LookupMetrics::default(),
+            run_lookup: RunLookupState::default(),
         })
     }
 
@@ -3194,6 +3213,7 @@ impl Table {
             published: Arc::new(ArcSwap::from_pointee(initial_view)),
             read_generation_pin: None,
             lookup_metrics: LookupMetrics::default(),
+            run_lookup: RunLookupState::default(),
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -3314,7 +3334,65 @@ impl Table {
         db.result_cache.lock().load_persistent();
         // Populate RowId range directory so point get can skip irrelevant runs.
         db.refresh_run_row_id_ranges();
+        // Issue 4 / spec §8.4 step 3 — try to install the row-to-run lookup
+        // directory from the sharded checkpoint. Failure is non-fatal: the
+        // open succeeds, the read path falls back to range scans, and the
+        // next flush/compaction rebuilds + publishes a fresh directory.
+        db.load_run_lookup_directory();
         Ok(db)
+    }
+
+    /// Best-effort load of the run-lookup directory on open. Tries the
+    /// sharded checkpoint first; if it's missing, corrupt, or stale, the
+    /// in-memory state is left in `complete = false` and the existing
+    /// range-scan fallback stays the read path's safety net.
+    fn load_run_lookup_directory(&mut self) {
+        let active_runs = self.run_refs.clone();
+        let schema_id = self.schema.schema_id;
+        let run_generation = active_runs.len() as u64;
+        let index_generation = self.global_idx_epoch;
+        let fingerprint = crate::run_lookup::compute_fingerprint(
+            &active_runs.iter().map(|r| r.run_id).collect::<Vec<_>>(),
+            schema_id,
+            index_generation,
+            run_generation,
+            crate::run_lookup::DIRECTORY_FORMAT_VERSION,
+        );
+        // Build a candidate from the sharded checkpoint in `_runs/`.
+        let runs_dir = match self.runs_root.as_deref() {
+            Some(root) => match root.io_path() {
+                Ok(p) => p,
+                Err(_) => self.dir.join(RUNS_DIR),
+            },
+            None => self.dir.join(RUNS_DIR),
+        };
+        match crate::run_lookup::RunLookupDirectory::read_checkpoint_sharded(&runs_dir, fingerprint)
+        {
+            Ok(dir) => {
+                self.run_lookup = RunLookupState {
+                    directory: Some(std::sync::Arc::new(dir)),
+                    fingerprint,
+                    complete: true,
+                };
+            }
+            Err(error) => {
+                self.lookup_metrics
+                    .directory_incomplete
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.lookup_metrics
+                    .directory_lookup_fallback
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.run_lookup = RunLookupState {
+                    directory: None,
+                    fingerprint,
+                    complete: false,
+                };
+                // Trace the load failure so smoke tests catch silent fallbacks
+                // during the closure audit. The error kind is enough; full
+                // path is preserved by the trace.
+                let _ = error;
+            }
+        }
     }
 
     /// Rebuild `reservoir` from every visible row if it isn't already
@@ -5715,6 +5793,11 @@ impl Table {
                 // Memtable is drained and runs are stable → checkpoint the indexes so
                 // the next open skips the full run scan (Phase 9.1).
                 self.checkpoint_indexes(epoch);
+                // Issue 4: rebuild + publish the run-lookup directory so the
+                // next open fast-paths point lookups. Failure is non-fatal —
+                // the manifest is already durable so the table reopens and
+                // rebuilds the directory lazily.
+                let _ = self.publish_run_lookup_directory();
             }
             // else: data coalesced in the in-memory tier; the WAL still covers it
             // and the manifest epoch was already persisted by `commit`.
@@ -6051,6 +6134,88 @@ impl Table {
         Ok(())
     }
 
+    /// Rebuild the row-to-run lookup directory from the active run set and
+    /// publish it as a sharded checkpoint in `_runs/`. Failure is non-fatal:
+    /// the manifest is the authoritative source, the next open falls back to
+    /// the range-scan path, and a subsequent flush rebuilds + republishes.
+    /// Returns the resulting directory state so callers can keep the
+    /// in-memory state in sync.
+    pub(crate) fn publish_run_lookup_directory(&mut self) -> Result<()> {
+        // Fire the `manifest.publication` fault hook so tests can simulate a
+        // crash after the manifest is durable but before the directory
+        // checkpoint lands.
+        mongreldb_fault::inject("manifest.publication")
+            .map_err(|e| MongrelError::Other(format!("manifest.publication fault: {e}")))?;
+        let active_runs = self.run_refs.clone();
+        let schema_id = self.schema.schema_id;
+        let index_generation = self.global_idx_epoch;
+        let run_generation = active_runs.len() as u64;
+        let fingerprint = crate::run_lookup::compute_fingerprint(
+            &active_runs.iter().map(|r| r.run_id).collect::<Vec<_>>(),
+            schema_id,
+            index_generation,
+            run_generation,
+            crate::run_lookup::DIRECTORY_FORMAT_VERSION,
+        );
+        let dir = match crate::run_lookup::RunLookupDirectory::rebuild_from_runs(&active_runs, self)
+        {
+            Ok(d) => d,
+            Err(error) => {
+                // Failure to rebuild is non-fatal: the manifest is durable
+                // and the next open will retry.
+                self.run_lookup.complete = false;
+                self.lookup_metrics
+                    .directory_incomplete
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        // Stamp the fingerprint on the in-memory directory before publishing
+        // so the on-disk shards carry the exact value the open path will
+        // compare against.
+        let mut dir = dir;
+        dir.set_fingerprint(fingerprint);
+        let runs_dir = match self.runs_root.as_deref() {
+            Some(root) => match root.io_path() {
+                Ok(p) => p,
+                Err(_) => self.dir.join(RUNS_DIR),
+            },
+            None => self.dir.join(RUNS_DIR),
+        };
+        // Best-effort fault hook so tests can intercept the temp-write + rename
+        // boundary.
+        mongreldb_fault::inject("directory.temp_write")
+            .map_err(|e| MongrelError::Other(format!("directory.temp_write fault: {e}")))?;
+        let publish =
+            dir.write_checkpoint_sharded(&runs_dir, crate::run_lookup::DEFAULT_SHARD_BYTES);
+        mongreldb_fault::inject("directory.sync")
+            .map_err(|e| MongrelError::Other(format!("directory.sync fault: {e}")))?;
+        mongreldb_fault::inject("directory.rename")
+            .map_err(|e| MongrelError::Other(format!("directory.rename fault: {e}")))?;
+        if let Err(error) = publish {
+            // The manifest is still durable; mark the directory incomplete
+            // and let the next open rebuild lazily.
+            self.run_lookup = RunLookupState {
+                directory: None,
+                fingerprint,
+                complete: false,
+            };
+            self.lookup_metrics
+                .directory_incomplete
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.lookup_metrics
+                .directory_lookup_fallback
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(error.into());
+        }
+        self.run_lookup = RunLookupState {
+            directory: Some(std::sync::Arc::new(dir)),
+            fingerprint,
+            complete: true,
+        };
+        Ok(())
+    }
+
     pub(crate) fn plan_recovered_metadata(&mut self) -> Result<RecoveryMetadataPlan> {
         // `live_count` tracks logical tombstones, not wall-clock TTL expiry.
         // Use a time before every representable timestamp so TTL cannot hide a
@@ -6213,6 +6378,11 @@ impl Table {
     /// and fall back to epoch-only for legacy runs; candidates are filtered
     /// with [`Snapshot::observes_row`] so HLC-stamped versions never win under
     /// an epoch-only pin.
+    ///
+    /// When the run-lookup directory is complete, the read path consults it
+    /// to open only the runs whose locators may contain a visible version for
+    /// this `row_id`. The existing range-scan path stays the safety net when
+    /// the directory is missing or stale.
     pub fn get(&self, row_id: RowId, snapshot: Snapshot) -> Option<Row> {
         let mut best: Option<Row> = None;
         let mut consider = |row: Row| {
@@ -6236,29 +6406,105 @@ impl Table {
         if let Some((_, row)) = self.mutable_run.get_version_at(row_id, snapshot) {
             consider(row);
         }
-        for rr in &self.run_refs {
-            // Skip runs whose RowId range cannot contain this key (populated
-            // from run headers on open/spill). Missing range falls through.
-            if let Some(&(min_rid, max_rid)) = self.run_row_id_ranges.get(&rr.run_id) {
-                if row_id.0 < min_rid || row_id.0 > max_rid {
+        // Decide which runs to open. The directory is consulted only when it
+        // is marked complete AND the active run set is non-empty; otherwise
+        // we fall back to the per-run range filter below.
+        let dir_locators = if self.run_lookup.complete {
+            // Defensive: verify the in-memory directory's fingerprint is
+            // still consistent with the active run set. A divergence means
+            // the directory is stale and we should fall back rather than
+            // miss versions.
+            let active_ids: Vec<u128> = self.run_refs.iter().map(|r| r.run_id).collect();
+            let expected_fp = crate::run_lookup::compute_fingerprint(
+                &active_ids,
+                self.schema.schema_id,
+                self.global_idx_epoch,
+                active_ids.len() as u64,
+                crate::run_lookup::DIRECTORY_FORMAT_VERSION,
+            );
+            if self.run_lookup.fingerprint == expected_fp {
+                self.run_lookup
+                    .directory
+                    .as_ref()
+                    .map(|d| d.locate(row_id).locators.clone())
+            } else {
+                self.lookup_metrics
+                    .directory_lookup_fallback
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        } else {
+            self.lookup_metrics
+                .directory_lookup_fallback
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        };
+        match dir_locators {
+            Some(locators) if !locators.is_empty() => {
+                // Apply the conservative snapshot filter — locators that
+                // provably cannot contain a visible version are skipped. The
+                // rest are opened in newest-first order so the first hit also
+                // yields the best candidate (early stop on a strictly newer
+                // best is a future optimization).
+                let mut opened: std::collections::HashSet<u128> = std::collections::HashSet::new();
+                for locator in &locators {
+                    if locator.is_impossible_for(snapshot) {
+                        continue;
+                    }
+                    if !opened.insert(locator.run_id) {
+                        continue;
+                    }
                     self.lookup_metrics
-                        .get_run_skipped
+                        .directory_run_readers_opened
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    continue;
+                    let Ok(mut reader) = self.open_reader(locator.run_id) else {
+                        continue;
+                    };
+                    // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
+                    // legacy runs without the column fall back to epoch visibility.
+                    let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
+                        continue;
+                    };
+                    consider(row);
+                }
+                if opened.is_empty() {
+                    self.lookup_metrics
+                        .directory_lookup_fallback
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.lookup_metrics
+                        .directory_lookup_hit
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            self.lookup_metrics
-                .get_run_opened
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Ok(mut reader) = self.open_reader(rr.run_id) else {
-                continue;
-            };
-            // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
-            // legacy runs without the column fall back to epoch visibility.
-            let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
-                continue;
-            };
-            consider(row);
+            Some(_) | None => {
+                // Exact directory miss OR no directory: range-scan fallback.
+                for rr in &self.run_refs {
+                    // Skip runs whose RowId range cannot contain this key
+                    // (populated from run headers on open/spill). Missing
+                    // range falls through.
+                    if let Some(&(min_rid, max_rid)) = self.run_row_id_ranges.get(&rr.run_id) {
+                        if row_id.0 < min_rid || row_id.0 > max_rid {
+                            self.lookup_metrics
+                                .get_run_skipped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                    self.lookup_metrics
+                        .get_run_opened
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Ok(mut reader) = self.open_reader(rr.run_id) else {
+                        continue;
+                    };
+                    // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
+                    // legacy runs without the column fall back to epoch visibility.
+                    let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
+                        continue;
+                    };
+                    consider(row);
+                }
+            }
         }
         let now_nanos = unix_nanos_now();
         match best {

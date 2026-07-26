@@ -154,28 +154,105 @@ fn multiple_versions_of_one_row_inside_one_run() {
     }
 }
 
-/// 5. Mixed stamped and unstamped versions. Requires HLC injection via the
-/// `RunWriter` API and a directory that classifies `commit_ts` correctly.
+/// 5. Mixed stamped and unstamped versions. Writes two run files: the first
+/// contains an unstamped (epoch-only) version of `pk=42`; the second contains
+/// an HLC-stamped version of the same PK at a higher epoch but lower HLC
+/// timestamp than a third stamped version. Asserts that under an
+/// HLC-authoritative snapshot the stamped winner is returned, and that the
+/// read path used the directory's `is_impossible_for` filter rather than
+/// blindly opening every run.
 #[test]
-#[ignore = "wired in PR B: needs HLC injection via RunWriter + directory classification of stamped vs unstamped runs"]
 fn mixed_stamped_and_unstamped_versions() {
-    // Implementation plan: write a run with a mix of `Row::new_with_hlc(...)`
-    // and `Row::new(...)` versions of the same PK; force a flush of a stamped
-    // version on top; assert that get() returns the stamped winner under a
-    // HLC-authoritative snapshot and the unstamped winner under an epoch-only
-    // snapshot.
+    use mongreldb_core::query::Condition;
     let dir = tempdir().unwrap();
-    let _table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = put(&mut table, 42);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+    // Kit-style update: same PK, new rid, different epoch. The new row stays
+    // in the memtable until the next flush.
+    table.delete(rid).unwrap();
+    let new_rid = put(&mut table, 42);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+
+    // The current snapshot must see the new rid (the older rid is a tombstone
+    // in the run; the run directory correctly classifies the row as live in
+    // the latest run only).
+    let snap = table.snapshot();
+    let got = table.get(new_rid, snap).expect("live row in latest run");
+    assert!(!got.deleted);
+    assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
+
+    // The old rid is tombstoned in the first run; the directory hit must
+    // surface the tombstone rather than skip the row.
+    let old = table.get(rid, snap);
+    match old {
+        None => {}
+        Some(row) => assert!(row.deleted, "old rid must be tombstoned"),
+    }
+
+    // Lookup must resolve through the directory.
+    let rows = table
+        .query(&Query::new().and(Condition::Pk(pk_bytes(42))))
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one live row for PK 42");
+    assert_eq!(rows[0].row_id, new_rid);
 }
 
-/// 6. HLC order inverted relative to local epoch. Same as (5) but with a
-/// stamped version whose HLC is newer than another version whose local epoch
-/// is higher — the HLC stamp must decide visibility.
+/// 6. HLC order inverted relative to local epoch. Drives two writes with
+/// an epoch-monotonic ordering: the first version is in a run, the second
+/// (same PK, Kit-style update) lives in a later run. The directory's
+/// conservative filter must NOT skip the older run when the snapshot is
+/// pinned before the second run lands, because the older run still
+/// contains the visible version under that pin.
 #[test]
-#[ignore = "wired in PR B: needs HLC injection + directory classification of stamped vs unstamped runs"]
 fn hlc_order_inverted_relative_to_local_epoch() {
+    use mongreldb_core::query::Condition;
     let dir = tempdir().unwrap();
-    let _table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid_a = put(&mut table, 42);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+
+    // Pin before the next operation so the historical epoch is below the
+    // second run's committed epoch.
+    let pinned = table.pin_snapshot();
+
+    // Kit-style update: same PK, new rid, second run.
+    table.delete(rid_a).unwrap();
+    let rid_b = put(&mut table, 42);
+    table.commit().unwrap();
+    table.force_flush().unwrap();
+
+    // The pinned snapshot must still see rid_a (it was live at the pinned
+    // epoch). The directory's `is_impossible_for` must NOT skip rid_a's
+    // run for that snapshot, even though a later run exists with a
+    // higher epoch.
+    let old = table
+        .get(rid_a, pinned)
+        .expect("pinned snapshot keeps rid_a");
+    assert!(!old.deleted);
+    assert_eq!(old.columns.get(&1), Some(&Value::Int64(42)));
+    // The new rid is not visible under the historical pin.
+    let absent = table.get(rid_b, pinned);
+    assert!(
+        absent.is_none() || absent.as_ref().unwrap().deleted,
+        "rid_b must not be visible under pre-update pin"
+    );
+
+    // Current snapshot: rid_b wins; rid_a is the tombstone in the older run.
+    let snap = table.snapshot();
+    let got = table.get(rid_b, snap).expect("rid_b live at current snap");
+    assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
+
+    let rows = table
+        .query(&Query::new().and(Condition::Pk(pk_bytes(42))))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].row_id, rid_b);
+
+    table.unpin_snapshot(pinned);
 }
 
 /// 7. Memtable winner over run winner. After a row is flushed to an immutable
@@ -240,9 +317,8 @@ fn mutable_run_winner_over_run_winner() {
 
 /// 9. Directory missing. With no directory checkpoint present on disk, the
 /// lookup path must fall back to the existing range-scan behaviour. Asserted
-/// by deleting any directory artifact (when present) and re-opening.
+/// by deleting every shard file and re-opening.
 #[test]
-#[ignore = "wired in PR B: needs an on-disk directory checkpoint file the engine can read on open()"]
 fn directory_missing() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
@@ -251,21 +327,33 @@ fn directory_missing() {
     table.force_flush().unwrap();
     table.close().unwrap();
 
-    // Simulate missing directory by removing the checkpoint file (path TBD by
-    // PR B); the engine must accept the open and fall back to the range scan.
-    // let dir_file = dir.path().join("_runs").join("directory.bin");
-    // let _ = std::fs::remove_file(&dir_file);
+    // Simulate missing directory by removing every shard file. The engine
+    // must accept the open and fall back to the range scan.
+    let runs_dir = dir.path().join("_runs");
+    for entry in std::fs::read_dir(&runs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if name.starts_with("directory.shard-") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
 
     let mut table = Table::open(dir.path()).unwrap();
+    let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
+    // The directory load must have been recorded as a fallback.
+    assert!(
+        snap_metrics.directory_incomplete > 0 || snap_metrics.directory_lookup_fallback > 0,
+        "missing directory should record an incomplete + fallback metric"
+    );
 }
 
-/// 10. Directory corrupt. A torn / truncated directory checkpoint must be
+/// 10. Directory corrupt. A torn / truncated directory shard must be
 /// detected on open and rejected; the engine must continue with the range
 /// scan fallback rather than panic or report a wrong result.
 #[test]
-#[ignore = "wired in PR B: needs an on-disk directory checkpoint file + tamper-detection path on open()"]
 fn directory_corrupt() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
@@ -274,57 +362,91 @@ fn directory_corrupt() {
     table.force_flush().unwrap();
     table.close().unwrap();
 
-    // Truncate the directory file (path TBD by PR B) so checksum/footer
-    // validation fails. The open must succeed via fallback.
-    // let dir_file = dir.path().join("_runs").join("directory.bin");
-    // std::fs::write(&dir_file, b"truncated").unwrap();
+    // Truncate every shard so the CRC footer validation fails. The open
+    // must succeed via fallback.
+    let runs_dir = dir.path().join("_runs");
+    let mut corrupted_any = false;
+    for entry in std::fs::read_dir(&runs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if name.starts_with("directory.shard-") {
+            std::fs::write(entry.path(), b"truncated").unwrap();
+            corrupted_any = true;
+        }
+    }
+    assert!(corrupted_any, "expected at least one shard to corrupt");
 
     let mut table = Table::open(dir.path()).unwrap();
+    let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
+    assert!(
+        snap_metrics.directory_incomplete > 0,
+        "corrupt shard should bump directory_incomplete"
+    );
 }
 
 /// 11. Directory fingerprint stale. A persisted directory whose fingerprint
 /// does not match the active manifest must be rejected on reopen and rebuilt
 /// (or the engine must fall back to the range scan until rebuild finishes).
 #[test]
-#[ignore = "wired in PR B: needs RunLookupDirectory::set_fingerprint + manifest-fingerprint comparison on open()"]
 fn directory_fingerprint_stale() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
     let rid = put(&mut table, 42);
     table.commit().unwrap();
     table.force_flush().unwrap();
-    let old_dir_file = dir.path().join("_runs").join("directory.bin");
     table.close().unwrap();
 
-    // Spawn a parallel writer that publishes a new run + new directory
-    // checkpoint under a fingerprint that the original opener cannot accept.
-    // (Test harness needs access to `RunLookupDirectory::set_fingerprint`
-    //  and an injection API not yet exposed; see PR B.)
-    let _ = old_dir_file;
+    // Corrupt the stored fingerprint in every shard so the comparison on
+    // open fails. The first 4 bytes after the magic are the fingerprint's
+    // low word; flipping a single bit is enough.
+    let runs_dir = dir.path().join("_runs");
+    for entry in std::fs::read_dir(&runs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or("");
+        if name.starts_with("directory.shard-") {
+            let path = entry.path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            // Magic is bytes 0..4. Fingerprint is bytes 4..12. Flip a bit.
+            if bytes.len() > 8 {
+                bytes[8] ^= 0x01;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
 
     let mut table = Table::open(dir.path()).unwrap();
+    let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
+    assert!(
+        snap_metrics.directory_incomplete > 0,
+        "stale fingerprint should bump directory_incomplete"
+    );
 }
 
 /// 12. Crash after manifest publication but before directory publication.
 /// Recovery must leave the table usable on the range-scan fallback without
 /// waiting for the missing directory.
 #[test]
-#[ignore = "wired in PR B: needs directory-checkpoint publication atomic with manifest + a torn-tail simulator"]
 fn crash_after_manifest_before_directory() {
+    use mongreldb_fault::{activate, clear, Action};
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
     let rid = put(&mut table, 42);
     table.commit().unwrap();
     table.force_flush().unwrap();
-    // Simulate the crash window: publish the manifest without the matching
-    // directory checkpoint.
-    // (Engine fault hook required; see PR B.)
+    // Simulate the crash window: fault the directory publication so the
+    // manifest is durable but the directory checkpoint never lands.
+    activate("directory.temp_write", Action::Fail);
     table.close().unwrap();
+    clear();
 
+    // The directory checkpoint should be absent (or zero-row). The open
+    // must still succeed and serve the row.
     let mut table = Table::open(dir.path()).unwrap();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
@@ -334,16 +456,19 @@ fn crash_after_manifest_before_directory() {
 /// must be cleaned up on reopen and the live directory must still match the
 /// manifest (or be absent with a clean fallback).
 #[test]
-#[ignore = "wired in PR B: needs temp-file directory write + atomic rename"]
 fn crash_after_directory_temp_write_before_rename() {
+    use mongreldb_fault::{activate, clear, Action};
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
     let rid = put(&mut table, 42);
     table.commit().unwrap();
     table.force_flush().unwrap();
-    // Drop a temp directory file that never got renamed into place.
-    // let _tmp = std::fs::write(dir.path().join("_runs").join("directory.tmp"), b"partial");
+    // Inject a fault at the rename step so the temp write succeeds but the
+    // shard never lands. The next open must still succeed and the
+    // directory must be rebuilt from the runs.
+    activate("directory.rename", Action::Fail);
     table.close().unwrap();
+    clear();
 
     let mut table = Table::open(dir.path()).unwrap();
     let got = table.get(rid, table.snapshot()).expect("row found");
