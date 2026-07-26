@@ -140,7 +140,7 @@ impl ColumnLearnedRange {
         if start > end {
             return self.linear_range(lo_key, hi_key);
         }
-        let mut hits: HashSet<u64> = self.row_ids[start..end].iter().copied().collect();
+        let hits: HashSet<u64> = self.row_ids[start..end].iter().copied().collect();
         if hits.is_empty() {
             let fallback = self.linear_range(lo_key, hi_key);
             if !fallback.is_empty() {

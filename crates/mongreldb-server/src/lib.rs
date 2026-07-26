@@ -5878,7 +5878,7 @@ async fn acquire_sql_permit(
             }
         };
 
-        return Ok(admission::SqlAdmissionGuard::new(permit, parent));
+        Ok(admission::SqlAdmissionGuard::new(permit, parent))
     }
     #[cfg(not(feature = "cluster"))]
     {

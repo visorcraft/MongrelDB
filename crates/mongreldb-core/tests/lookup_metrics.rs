@@ -90,14 +90,9 @@ fn healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback() {
     let after = table.lookup_metrics_snapshot();
     let hit_delta = after.hot_lookup_hit - before.hot_lookup_hit;
     let fallback_delta = after.hot_lookup_fallback - before.hot_lookup_fallback;
+    assert_eq!(hit_delta, 50, "expected 50 HOT hits from Pk lookups");
     assert_eq!(
-        hit_delta,
-        50,
-        "expected 50 HOT hits from Pk lookups"
-    );
-    assert_eq!(
-        fallback_delta,
-        0,
+        fallback_delta, 0,
         "healthy Pk lookups must not trigger fallback"
     );
     emit_metric!(

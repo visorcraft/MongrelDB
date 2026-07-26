@@ -536,4 +536,3 @@ fn dml_count_update_delete_regression_fixture_still_passes() {
         .unwrap();
     assert_eq!(count, oracle);
 }
-

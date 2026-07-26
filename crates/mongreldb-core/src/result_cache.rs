@@ -355,11 +355,7 @@ impl PersistentResultCacheWriter {
         let key_cap = guard.limits.max_pending_keys;
         let byte_cap = guard.limits.max_pending_bytes;
         if (would_grow && guard.state.operations.len() >= key_cap)
-            || guard
-                .state
-                .approx_bytes
-                .saturating_add(bytes)
-                > byte_cap
+            || guard.state.approx_bytes.saturating_add(bytes) > byte_cap
         {
             self.dropped_total.fetch_add(1, Ordering::Relaxed);
             self.metrics
@@ -417,10 +413,7 @@ impl PersistentResultCacheWriter {
         if let Some(PendingCacheOp::Store(prev)) = guard.state.operations.get(&key) {
             guard.state.approx_bytes = guard.state.approx_bytes.saturating_sub(prev.bytes);
         }
-        guard
-            .state
-            .operations
-            .insert(key, PendingCacheOp::Remove);
+        guard.state.operations.insert(key, PendingCacheOp::Remove);
         let depth = guard.state.operations.len() as u64;
         drop(guard);
         self.remove_total.fetch_add(1, Ordering::Relaxed);
@@ -468,8 +461,17 @@ impl PersistentResultCacheWriter {
         let mut guard = self.inner.lock().expect("writer mutex poisoned");
         loop {
             if let Some(next_key) = guard.state.operations.keys().next().copied() {
-                let op = guard.state.operations.remove(&next_key).expect("just observed");
-                let key_gen = guard.state.key_generations.get(&next_key).copied().unwrap_or(0);
+                let op = guard
+                    .state
+                    .operations
+                    .remove(&next_key)
+                    .expect("just observed");
+                let key_gen = guard
+                    .state
+                    .key_generations
+                    .get(&next_key)
+                    .copied()
+                    .unwrap_or(0);
                 // Subtract the queued op's contribution to the byte total.
                 if let PendingCacheOp::Store(s) = &op {
                     guard.state.approx_bytes = guard.state.approx_bytes.saturating_sub(s.bytes);
@@ -506,7 +508,11 @@ impl PersistentResultCacheWriter {
             let (k, _) = iter.next()?;
             *k
         };
-        let op = guard.state.operations.remove(&next_key).expect("just observed");
+        let op = guard
+            .state
+            .operations
+            .remove(&next_key)
+            .expect("just observed");
         let key_gen = guard
             .state
             .key_generations
@@ -585,7 +591,9 @@ impl PersistentResultCacheWriter {
                     .result_cache_persist_stale_store_skipped_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            DrainOutcome::StoreErrored | DrainOutcome::RemoveErrored | DrainOutcome::ClearErrored => {
+            DrainOutcome::StoreErrored
+            | DrainOutcome::RemoveErrored
+            | DrainOutcome::ClearErrored => {
                 self.errors_total.fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .result_cache_persist_errors_total
@@ -638,9 +646,13 @@ impl PersistentResultCacheWriter {
             result_cache_persist_coalesced_total: self.coalesced_total.load(Ordering::Relaxed),
             result_cache_persist_dropped_store_total: self.dropped_total.load(Ordering::Relaxed),
             result_cache_persist_remove_total: self.remove_total.load(Ordering::Relaxed),
-            result_cache_persist_stale_store_skipped_total: self.stale_total.load(Ordering::Relaxed),
+            result_cache_persist_stale_store_skipped_total: self
+                .stale_total
+                .load(Ordering::Relaxed),
             result_cache_persist_errors_total: self.errors_total.load(Ordering::Relaxed),
-            result_cache_persist_shutdown_abandoned_total: self.abandoned_total.load(Ordering::Relaxed),
+            result_cache_persist_shutdown_abandoned_total: self
+                .abandoned_total
+                .load(Ordering::Relaxed),
             result_cache_persist_queue_depth: self.queue_depth.load(Ordering::Relaxed),
             ..LookupMetricsSnapshot::default()
         }
@@ -741,7 +753,10 @@ impl PersistentCacheIo for RealPersistentCacheIo {
         let _ = std::fs::remove_file(&tmp_path);
         {
             let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
-                IoError::new(IoErrorKind::Other, format!("create {}: {e}", tmp_path.display()))
+                IoError::new(
+                    IoErrorKind::Other,
+                    format!("create {}: {e}", tmp_path.display()),
+                )
             })?;
             f.write_all(frame)
                 .map_err(|e| IoError::new(IoErrorKind::Other, format!("write tmp: {e}")))?;
@@ -755,7 +770,11 @@ impl PersistentCacheIo for RealPersistentCacheIo {
             let _ = std::fs::remove_file(&tmp_path);
             IoError::new(
                 IoErrorKind::Other,
-                format!("rename {} -> {}: {e}", tmp_path.display(), final_path.display()),
+                format!(
+                    "rename {} -> {}: {e}",
+                    tmp_path.display(),
+                    final_path.display()
+                ),
             )
         })?;
         // Durability: fsync the parent dir so the rename is durable.
@@ -819,17 +838,13 @@ impl PersistentCacheIo for RealPersistentCacheIo {
 
 /// Helper used by the worker to encrypt a payload before it is written.
 /// Returns the plaintext bytes untouched when no DEK is present.
-pub fn encrypt_payload(
-    cipher: Option<&AesCipher>,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, IoError> {
+pub fn encrypt_payload(cipher: Option<&AesCipher>, plaintext: &[u8]) -> Result<Vec<u8>, IoError> {
     let Some(cipher) = cipher else {
         return Ok(plaintext.to_vec());
     };
     let mut nonce = [0u8; NONCE_LEN];
-    crate::encryption::fill_random(&mut nonce).map_err(|e| {
-        IoError::new(IoErrorKind::Other, format!("fill_random nonce: {e}"))
-    })?;
+    crate::encryption::fill_random(&mut nonce)
+        .map_err(|e| IoError::new(IoErrorKind::Other, format!("fill_random nonce: {e}")))?;
     let ct = cipher
         .encrypt_page(&nonce, plaintext)
         .map_err(|e| IoError::new(IoErrorKind::Other, format!("aes encrypt: {e}")))?;
@@ -1147,8 +1162,11 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
         // to prevent unbounded spinning under heavy contention.
         let mut attempts = 0u32;
         let is_current = loop {
-            if staleness.is_current(drained.key, drained.key_generation, drained.clear_generation)
-            {
+            if staleness.is_current(
+                drained.key,
+                drained.key_generation,
+                drained.clear_generation,
+            ) {
                 break true;
             }
             if attempts >= max_staleness_retries {

@@ -1811,7 +1811,9 @@ impl ResultCache {
 
     /// Borrow the writer (when installed). Used by `flush_persistent_cache` /
     /// `shutdown_persistent_cache` to wait for the queue to drain.
-    fn persistent_writer(&self) -> Option<&std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>> {
+    fn persistent_writer(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>> {
         self.writer.as_ref()
     }
 
@@ -2205,11 +2207,6 @@ impl ResultCache {
         }
     }
 
-    /// True when the cache has installed a background writer.
-    fn has_persistent_writer(&self) -> bool {
-        self.writer.is_some()
-    }
-
     /// Drain the writer's queue synchronously until empty or `deadline`
     /// expires. The caller invokes this on `Database::close` or before a
     /// checkpoint; the worker keeps running and the queue depth is checked
@@ -2292,9 +2289,7 @@ impl ResultCache {
     /// Snapshot of the writer's persist counters. `None` when no writer is
     /// installed (early test paths).
     fn persist_snapshot(&self) -> Option<LookupMetricsSnapshot> {
-        self.writer
-            .as_ref()
-            .map(|w| w.persist_snapshot())
+        self.writer.as_ref().map(|w| w.persist_snapshot())
     }
 
     /// Fine-grained invalidation (hardening (c)). Drop only entries that are
@@ -2422,8 +2417,8 @@ fn spawn_persistent_cache_worker(
     std::thread::JoinHandle<()>,
 )> {
     use crate::result_cache::{
-        RealPersistentCacheIo, StalenessGuard, WorkerConfig,
-        WriterStalenessGuard, spawn_persistent_cache_worker as spawn,
+        spawn_persistent_cache_worker as spawn, RealPersistentCacheIo, StalenessGuard,
+        WorkerConfig, WriterStalenessGuard,
     };
     let io: std::sync::Arc<dyn crate::result_cache::PersistentCacheIo> =
         std::sync::Arc::new(RealPersistentCacheIo::new(dir)?);
@@ -2435,14 +2430,12 @@ fn spawn_persistent_cache_worker(
         }
         None => None,
     };
-    let writer =
-        std::sync::Arc::new(crate::result_cache::PersistentResultCacheWriter::new(
-            metrics,
-            crate::result_cache::WriterLimits::default(),
-        ));
-    let staleness: std::sync::Arc<dyn StalenessGuard> = std::sync::Arc::new(
-        WriterStalenessGuard::new(writer.clone()),
-    );
+    let writer = std::sync::Arc::new(crate::result_cache::PersistentResultCacheWriter::new(
+        metrics,
+        crate::result_cache::WriterLimits::default(),
+    ));
+    let staleness: std::sync::Arc<dyn StalenessGuard> =
+        std::sync::Arc::new(WriterStalenessGuard::new(writer.clone()));
     let config = WorkerConfig {
         writer: writer.clone(),
         io,
@@ -3166,9 +3159,11 @@ impl Table {
                 // `Table::lookup_metrics_snapshot`.
                 let metrics = Arc::new(LookupMetrics::default());
                 let cache_arc = Arc::new(parking_lot::Mutex::new(cache));
-                if let Ok((writer, handle)) =
-                    spawn_persistent_cache_worker(rcache_dir.clone(), cache_dek.clone(), (*metrics).clone())
-                {
+                if let Ok((writer, handle)) = spawn_persistent_cache_worker(
+                    rcache_dir.clone(),
+                    cache_dek.clone(),
+                    (*metrics).clone(),
+                ) {
                     cache_arc.lock().install_persistent_writer(writer, handle);
                 }
                 cache_arc
@@ -7069,11 +7064,15 @@ impl Table {
         // Merge the writer's persist counters so tests and observability
         // surfaces see the full picture.
         if let Some(writer_snap) = cache.persist_snapshot() {
-            snap.result_cache_persist_enqueued_total = writer_snap.result_cache_persist_enqueued_total;
-            snap.result_cache_persist_coalesced_total = writer_snap.result_cache_persist_coalesced_total;
-            snap.result_cache_persist_dropped_store_total = writer_snap.result_cache_persist_dropped_store_total;
+            snap.result_cache_persist_enqueued_total =
+                writer_snap.result_cache_persist_enqueued_total;
+            snap.result_cache_persist_coalesced_total =
+                writer_snap.result_cache_persist_coalesced_total;
+            snap.result_cache_persist_dropped_store_total =
+                writer_snap.result_cache_persist_dropped_store_total;
             snap.result_cache_persist_remove_total = writer_snap.result_cache_persist_remove_total;
-            snap.result_cache_persist_stale_store_skipped_total = writer_snap.result_cache_persist_stale_store_skipped_total;
+            snap.result_cache_persist_stale_store_skipped_total =
+                writer_snap.result_cache_persist_stale_store_skipped_total;
             snap.result_cache_persist_errors_total = writer_snap.result_cache_persist_errors_total;
             snap.result_cache_persist_shutdown_abandoned_total =
                 writer_snap.result_cache_persist_shutdown_abandoned_total;
@@ -11369,7 +11368,14 @@ impl Table {
             // section.
             let mut cache = self.result_cache.lock();
             let entry_generation = cache.allocate_persist_generation(key);
-            cache.enqueue_persist(key, &entry, table_id, schema_id, data_generation, entry_generation);
+            cache.enqueue_persist(
+                key,
+                &entry,
+                table_id,
+                schema_id,
+                data_generation,
+                entry_generation,
+            );
             cache.insert(key, entry);
         }
         Ok(res)
@@ -11411,7 +11417,14 @@ impl Table {
         // because `ResultCache` uses a non-reentrant `parking_lot::Mutex`.
         let mut cache = self.result_cache.lock();
         let entry_generation = cache.allocate_persist_generation(key);
-        cache.enqueue_persist(key, &entry, table_id, schema_id, data_generation, entry_generation);
+        cache.enqueue_persist(
+            key,
+            &entry,
+            table_id,
+            schema_id,
+            data_generation,
+            entry_generation,
+        );
         cache.insert(key, entry);
         Ok(rows)
     }

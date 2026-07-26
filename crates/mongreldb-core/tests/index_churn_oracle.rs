@@ -1,4 +1,5 @@
 //! Permanent non-Bitmap churn oracle (TODO §4.1, §4.2, §4.3).
+#![allow(dead_code)]
 //!
 //! The Bitmap churn oracle in `audit_residual_closure.rs` is good for the
 //! roaring secondary, but the public AI index families (FM, LearnedRange,
@@ -54,6 +55,7 @@ macro_rules! emit_oracle_metric {
 // Deterministic RNG (linear-congruential, seed from env).
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::unusual_byte_groupings)]
 const DEFAULT_SEED: u64 = 0xC0FFEE_BEEF_DEAD_BEu64;
 
 fn seed_from_env() -> u64 {

@@ -1086,7 +1086,7 @@ mod tests {
             list7.locators[0].min_hlc.map(|t| t.physical_micros),
             Some(100)
         );
-        assert_eq!(list7.locators[1].contains_unstamped_versions, true);
+        assert!(list7.locators[1].contains_unstamped_versions);
     }
 
     #[test]

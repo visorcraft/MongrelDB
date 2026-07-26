@@ -1292,8 +1292,9 @@ mod dense_tests {
         let mut index = AnnIndex::with_quantization(dim, 16, 64, 64, AnnQuantization::Dense);
 
         // Deterministic signed-random generator so the assertions are stable.
-        let mut seed = 0xC0FFEE_1234_5678u64;
-        let mut next = |s: &mut u64| {
+        #[allow(clippy::unusual_byte_groupings)]
+        let mut seed: u64 = 0xC0FFEE_1234_5678;
+        let next = |s: &mut u64| {
             *s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);

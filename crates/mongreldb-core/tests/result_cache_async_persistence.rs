@@ -1,4 +1,5 @@
 //! Persistent result-cache async publication tests (TODO §2.7).
+#![allow(dead_code, unused_imports, unused_variables)]
 //!
 //! These tests pin the contract for the background writer thread against
 //! the **production** writer. The query thread (where
@@ -49,23 +50,38 @@ impl RecordingPersistentCacheIo {
 
 impl PersistentCacheIo for RecordingPersistentCacheIo {
     fn write_atomic(&self, key: u64, frame: &[u8]) -> Result<(), IoError> {
-        self.log.lock().unwrap().push((std::thread::current().id(), "write_atomic"));
+        self.log
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), "write_atomic"));
         self.inner.write_atomic(key, frame)
     }
     fn remove(&self, key: u64) -> Result<(), IoError> {
-        self.log.lock().unwrap().push((std::thread::current().id(), "remove"));
+        self.log
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), "remove"));
         self.inner.remove(key)
     }
     fn clear(&self) -> Result<(), IoError> {
-        self.log.lock().unwrap().push((std::thread::current().id(), "clear"));
+        self.log
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), "clear"));
         self.inner.clear()
     }
     fn load(&self, key: u64) -> Result<Option<Vec<u8>>, IoError> {
-        self.log.lock().unwrap().push((std::thread::current().id(), "load"));
+        self.log
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), "load"));
         self.inner.load(key)
     }
     fn exists(&self, key: u64) -> bool {
-        self.log.lock().unwrap().push((std::thread::current().id(), "exists"));
+        self.log
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), "exists"));
         self.inner.exists(key)
     }
 }
@@ -126,9 +142,17 @@ impl FailingPersistentCacheIo {
 
 impl PersistentCacheIo for FailingPersistentCacheIo {
     fn write_atomic(&self, key: u64, frame: &[u8]) -> Result<(), IoError> {
-        if self.fail_remaining.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-            if v > 0 { Some(v - 1) } else { None }
-        }).is_ok() {
+        if self
+            .fail_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                if v > 0 {
+                    Some(v - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
             return Err(IoError::new(IoErrorKind::Other, "test-injected failure"));
         }
         self.inner.write_atomic(key, frame)
@@ -212,13 +236,11 @@ fn rows_city_cost(n: usize) -> Vec<Vec<(u16, mongreldb_core::Value)>> {
                 (1, mongreldb_core::Value::Int64(i as i64)),
                 (
                     2,
-                    mongreldb_core::Value::Bytes(
-                        if i % 2 == 0 {
-                            b"alpha".to_vec()
-                        } else {
-                            b"beta".to_vec()
-                        },
-                    ),
+                    mongreldb_core::Value::Bytes(if i % 2 == 0 {
+                        b"alpha".to_vec()
+                    } else {
+                        b"beta".to_vec()
+                    }),
                 ),
                 (3, mongreldb_core::Value::Float64(i as f64)),
             ]
@@ -249,7 +271,9 @@ fn no_query_thread_io() {
     let table_dir = dir.path().to_path_buf();
     let rcache_dir = table_dir.join("_rcache");
     let io = Arc::new(RecordingPersistentCacheIo::new(rcache_dir.clone()));
-    let writer = Arc::new(PersistentResultCacheWriter::for_test(WriterLimits::default()));
+    let writer = Arc::new(PersistentResultCacheWriter::for_test(
+        WriterLimits::default(),
+    ));
     let staleness: Arc<dyn result_cache::StalenessGuard> =
         Arc::new(result_cache::WriterStalenessGuard::new(writer.clone()));
     let config = result_cache::WorkerConfig {
@@ -299,7 +323,10 @@ fn blocked_writer_does_not_block_query() {
     // can only assert the query-time latency. A test that wants to inject
     // a blocking I/O backend must run the writer externally — see
     // `blocked_writer_via_explicit_worker_does_not_block_query` below.
-    let _io = Arc::new(BlockingPersistentCacheIo::new(rcache_dir.clone(), Duration::from_millis(100)));
+    let _io = Arc::new(BlockingPersistentCacheIo::new(
+        rcache_dir.clone(),
+        Duration::from_millis(100),
+    ));
 
     let mut db = Table::create(&table_dir, test_schema(), 1).unwrap();
     db.bulk_load(rows_city_cost(200)).unwrap();
@@ -361,8 +388,8 @@ fn queue_overflow_drops_or_coalesces() {
     );
     // The total accounted enqueues (enqueued + dropped) should equal the
     // number of distinct keys (4) + same-key coalescings (0 in this test).
-    let total_accounted = snap.result_cache_persist_enqueued_total
-        + snap.result_cache_persist_dropped_store_total;
+    let total_accounted =
+        snap.result_cache_persist_enqueued_total + snap.result_cache_persist_dropped_store_total;
     assert_eq!(total_accounted, 32, "every enqueue must be accounted");
     writer.shutdown();
 }
@@ -376,7 +403,9 @@ fn remove_supersedes_store() {
     let dir = tempdir().unwrap();
     let rcache_dir = dir.path().to_path_buf();
     let io = Arc::new(RecordingPersistentCacheIo::new(rcache_dir.clone()));
-    let writer = Arc::new(PersistentResultCacheWriter::for_test(WriterLimits::default()));
+    let writer = Arc::new(PersistentResultCacheWriter::for_test(
+        WriterLimits::default(),
+    ));
     let staleness: Arc<dyn result_cache::StalenessGuard> =
         Arc::new(result_cache::WriterStalenessGuard::new(writer.clone()));
     let config = result_cache::WorkerConfig {
@@ -421,7 +450,9 @@ fn clear_supersedes_all_old_stores() {
     let dir = tempdir().unwrap();
     let rcache_dir = dir.path().to_path_buf();
     let io = Arc::new(RecordingPersistentCacheIo::new(rcache_dir.clone()));
-    let writer = Arc::new(PersistentResultCacheWriter::for_test(WriterLimits::default()));
+    let writer = Arc::new(PersistentResultCacheWriter::for_test(
+        WriterLimits::default(),
+    ));
     let staleness: Arc<dyn result_cache::StalenessGuard> =
         Arc::new(result_cache::WriterStalenessGuard::new(writer.clone()));
     let config = result_cache::WorkerConfig {
@@ -471,7 +502,9 @@ fn stale_generation_rejected_on_reopen() {
     let dir = tempdir().unwrap();
     let rcache_dir = dir.path().to_path_buf();
     let io = Arc::new(RecordingPersistentCacheIo::new(rcache_dir.clone()));
-    let writer = Arc::new(PersistentResultCacheWriter::for_test(WriterLimits::default()));
+    let writer = Arc::new(PersistentResultCacheWriter::for_test(
+        WriterLimits::default(),
+    ));
     let staleness: Arc<dyn result_cache::StalenessGuard> =
         Arc::new(result_cache::WriterStalenessGuard::new(writer.clone()));
     let config = result_cache::WorkerConfig {
@@ -800,11 +833,17 @@ fn concurrent_insert_invalidate() {
     }
     let _ = db.flush_persistent_cache(2_000);
     let snap = db.lookup_metrics_snapshot();
-    let stored = snap.result_cache_persist_enqueued_total
-        + snap.result_cache_persist_dropped_store_total;
+    let stored =
+        snap.result_cache_persist_enqueued_total + snap.result_cache_persist_dropped_store_total;
     let removed = snap.result_cache_persist_remove_total;
-    assert!(stored >= 1, "at least one store must be enqueued (got {stored})");
-    assert!(removed >= 1, "at least one remove must be enqueued (got {removed})");
+    assert!(
+        stored >= 1,
+        "at least one store must be enqueued (got {stored})"
+    );
+    assert!(
+        removed >= 1,
+        "at least one remove must be enqueued (got {removed})"
+    );
     let _ = rcache_dir;
 }
 

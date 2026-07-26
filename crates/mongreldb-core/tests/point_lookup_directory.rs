@@ -1,4 +1,5 @@
 //! Correctness tests for the `RunLookupDirectory` point-lookup path
+#![allow(clippy::doc_lazy_continuation)]
 //! (TODO §1.5). All tests drive the public `Table` / `Database` API;
 //! directory internals stay private to the engine. Tests that depend on
 //! `RunLookupDirectory::set_fingerprint` and on-disk directory plumbing
@@ -340,7 +341,7 @@ fn directory_missing() {
         }
     }
 
-    let mut table = Table::open(dir.path()).unwrap();
+    let table = Table::open(dir.path()).unwrap();
     let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
@@ -378,7 +379,7 @@ fn directory_corrupt() {
     }
     assert!(corrupted_any, "expected at least one shard to corrupt");
 
-    let mut table = Table::open(dir.path()).unwrap();
+    let table = Table::open(dir.path()).unwrap();
     let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
@@ -419,7 +420,7 @@ fn directory_fingerprint_stale() {
         }
     }
 
-    let mut table = Table::open(dir.path()).unwrap();
+    let table = Table::open(dir.path()).unwrap();
     let snap_metrics = table.lookup_metrics_snapshot();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
@@ -448,7 +449,7 @@ fn crash_after_manifest_before_directory() {
 
     // The directory checkpoint should be absent (or zero-row). The open
     // must still succeed and serve the row.
-    let mut table = Table::open(dir.path()).unwrap();
+    let table = Table::open(dir.path()).unwrap();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
 }
@@ -471,7 +472,7 @@ fn crash_after_directory_temp_write_before_rename() {
     table.close().unwrap();
     clear();
 
-    let mut table = Table::open(dir.path()).unwrap();
+    let table = Table::open(dir.path()).unwrap();
     let got = table.get(rid, table.snapshot()).expect("row found");
     assert_eq!(got.columns.get(&1), Some(&Value::Int64(42)));
 }
@@ -640,15 +641,13 @@ fn randomized_model_test_directory_vs_full_run_scan() {
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
 
     let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABE;
-    let mut next_pk: i64 = 0;
     let mut live: std::collections::HashMap<i64, RowId> = std::collections::HashMap::new();
 
     for op in 0..200u64 {
         rng = rng
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let pk = next_pk;
-        next_pk += 1;
+        let pk: i64 = op as i64;
         let rid = put(&mut table, pk);
         live.insert(pk, rid);
 
