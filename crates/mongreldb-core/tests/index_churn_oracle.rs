@@ -33,6 +33,22 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
+/// Emit a structured one-line JSON record for `scripts/run-residual-closure.sh`
+/// to harvest. The script greps for lines starting with `{"test":` and writes
+/// them to the corresponding `<topic>-results.jsonl` artifact.
+macro_rules! emit_oracle_metric {
+    ($name:literal, $metric:expr, $unit:literal) => {
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": $name,
+                "metric": $metric,
+                "unit": $unit,
+            })
+        )
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic RNG (linear-congruential, seed from env).
 // ---------------------------------------------------------------------------
@@ -890,6 +906,11 @@ fn churn_oracle_fmindex() {
         .map(|r| r.row_id.0)
         .collect();
     assert_eq!(final_engine_rids, harness.live_rids(table.snapshot()));
+    emit_oracle_metric!(
+        "index_churn_oracle::churn_oracle_fmindex",
+        final_engine_rids.len(),
+        "live_rid_count"
+    );
 }
 
 #[test]
@@ -1054,6 +1075,11 @@ fn churn_oracle_learned_range() {
             );
         }
     }
+    emit_oracle_metric!(
+        "index_churn_oracle::churn_oracle_learned_range",
+        seed_from_env(),
+        "seed"
+    );
 }
 
 #[test]
@@ -1294,6 +1320,11 @@ fn churn_oracle_ann_hnsw_dense() {
             }
         }
     }
+    emit_oracle_metric!(
+        "index_churn_oracle::churn_oracle_ann_hnsw_dense",
+        seed_from_env(),
+        "seed"
+    );
 }
 
 #[test]
@@ -1314,6 +1345,11 @@ fn churn_oracle_seed_determinism() {
     assert_ne!(
         log_a, log_c,
         "different seeds must produce different operation logs"
+    );
+    emit_oracle_metric!(
+        "index_churn_oracle::churn_oracle_seed_determinism",
+        seed,
+        "seed"
     );
 }
 

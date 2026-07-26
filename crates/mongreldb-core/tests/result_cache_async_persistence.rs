@@ -38,6 +38,22 @@ use mongreldb_core::result_cache::{
 use roaring::RoaringBitmap;
 use tempfile::tempdir;
 
+/// Emit a structured one-line JSON record for `scripts/run-residual-closure.sh`
+/// to harvest. The script greps for lines starting with `{"test":` and writes
+/// them to the corresponding `<topic>-results.jsonl` artifact.
+macro_rules! emit_cache_metric {
+    ($name:literal, $metric:expr, $unit:literal) => {
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": $name,
+                "metric": $metric,
+                "unit": $unit,
+            })
+        )
+    };
+}
+
 // ============================================================================
 // I/O trait
 // ============================================================================
