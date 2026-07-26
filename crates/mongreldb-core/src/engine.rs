@@ -377,6 +377,7 @@ fn merge_controlled_visible_sources<'a>(
             .peek()
             .is_some_and(|Reverse((candidate, _))| *candidate == row_id)
         {
+            control.checkpoint()?;
             let Some(Reverse((_, source_index))) = heap.pop() else {
                 break;
             };
@@ -6885,20 +6886,19 @@ impl Table {
             Vec::with_capacity(self.run_refs.len() + 2);
         control.checkpoint()?;
         checkpoints += 1;
-        // Hot-tier sources. The streaming cursor variants are implemented
-        // (PR D follow-up) but they regress `count()`-style callers
-        // (dml_phase1::update_many_and_delete_many); fall back to the
-        // legacy `newest_visible_map` + `memory_from_map` path until the
-        // bug is fixed.
-        let memtable_map = self.memtable.newest_visible_map(snapshot);
-        if !memtable_map.is_empty() {
-            sources.push(ControlledVisibleSource::memory_from_map(memtable_map));
+        // Hot-tier sources use borrowing cursors: only the current version
+        // group is retained, so setup does not scale with the live row count.
+        if !self.memtable.is_empty() {
+            sources.push(ControlledVisibleSource::memtable_cursor(
+                self.memtable.newest_visible_iter(&snapshot),
+            ));
         }
         control.checkpoint()?;
         checkpoints += 1;
-        let mutable_map = self.mutable_run.newest_visible_map(snapshot);
-        if !mutable_map.is_empty() {
-            sources.push(ControlledVisibleSource::memory_from_map(mutable_map));
+        if !self.mutable_run.is_empty() {
+            sources.push(ControlledVisibleSource::mutable_run_cursor(
+                self.mutable_run.newest_visible_iter(&snapshot),
+            ));
         }
         for run in &self.run_refs {
             control.checkpoint()?;
@@ -6908,12 +6908,10 @@ impl Table {
                 reader.into_visible_version_cursor_at(snapshot)?,
             ));
         }
-        // `start` is captured AFTER the source materialisation, so the
-        // "time-to-first-row" measures the streaming portion only. The
-        // materialisation cost is captured separately by the setup counters
-        // (versions_examined already includes the source sizes).
-        let start = std::time::Instant::now();
-        let _setup_us = start.duration_since(setup_start).as_micros() as u64;
+        // Time-to-first-row includes source construction; setup_us captures
+        // the construction cost separately.
+        let first_row_start = setup_start;
+        let _setup_us = setup_start.elapsed().as_micros() as u64;
         let now_nanos = unix_nanos_now();
         let mut first_row_us: u64 = 0;
         let result = merge_controlled_visible_sources(
@@ -6926,7 +6924,7 @@ impl Table {
                 }
                 versions_examined += 1;
                 if !first_row_recorded {
-                    first_row_us = start.elapsed().as_micros() as u64;
+                    first_row_us = first_row_start.elapsed().as_micros() as u64;
                     first_row_recorded = true;
                 }
                 rows_emitted += 1;
@@ -6947,6 +6945,8 @@ impl Table {
             t.controlled_scan_time_to_first_row_us = t
                 .controlled_scan_time_to_first_row_us
                 .saturating_add(time_to_first_row_us);
+            t.controlled_scan_setup_time_us =
+                t.controlled_scan_setup_time_us.saturating_add(_setup_us);
         });
         result
     }
