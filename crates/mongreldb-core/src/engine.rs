@@ -1303,6 +1303,12 @@ pub struct LookupMetrics {
     pub(crate) directory_incomplete: std::sync::atomic::AtomicU64,
     pub(crate) directory_run_readers_opened: std::sync::atomic::AtomicU64,
     pub(crate) directory_early_stop_total: std::sync::atomic::AtomicU64,
+    /// REM-004: directory returned an empty complete lookup for a row (no
+    /// postings at all). Distinct from `directory_lookup_fallback`, which
+    /// records only `UnavailableOrStale` (no usable directory). Incremented
+    /// alongside `directory_lookup_hit` because the directory itself was
+    /// usable; the answer just happened to be "no immutable runs".
+    pub(crate) directory_complete_miss_total: std::sync::atomic::AtomicU64,
     // ---- TODO §2: persistent result cache async counters ----
     pub(crate) result_cache_persist_enqueued_total: std::sync::atomic::AtomicU64,
     pub(crate) result_cache_persist_coalesced_total: std::sync::atomic::AtomicU64,
@@ -1366,6 +1372,7 @@ impl Clone for LookupMetrics {
             directory_incomplete: copy_atomic(&self.directory_incomplete),
             directory_run_readers_opened: copy_atomic(&self.directory_run_readers_opened),
             directory_early_stop_total: copy_atomic(&self.directory_early_stop_total),
+            directory_complete_miss_total: copy_atomic(&self.directory_complete_miss_total),
             result_cache_persist_enqueued_total: copy_atomic(
                 &self.result_cache_persist_enqueued_total,
             ),
@@ -1451,6 +1458,9 @@ impl LookupMetrics {
                 .load(std::sync::atomic::Ordering::Relaxed),
             directory_early_stop_total: self
                 .directory_early_stop_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            directory_complete_miss_total: self
+                .directory_complete_miss_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             result_cache_persist_enqueued_total: self
                 .result_cache_persist_enqueued_total
@@ -1538,6 +1548,7 @@ pub struct LookupMetricsSnapshot {
     pub directory_incomplete: u64,
     pub directory_run_readers_opened: u64,
     pub directory_early_stop_total: u64,
+    pub directory_complete_miss_total: u64,
     // ---- TODO §2 ----
     pub result_cache_persist_enqueued_total: u64,
     pub result_cache_persist_coalesced_total: u64,
@@ -6707,9 +6718,22 @@ impl Table {
     /// to open only the runs whose locators may contain a visible version for
     /// this `row_id`. The existing range-scan path stays the safety net when
     /// the directory is missing or stale.
+    ///
+    /// REM-004: the directory consultation returns one of three explicit
+    /// decisions ([`crate::run_lookup::DirectoryLookupDecision`]):
+    ///
+    /// - [`CompleteMiss`](crate::run_lookup::DirectoryLookupDecision::CompleteMiss) —
+    ///   authoritative "no immutable run hosts this row"; open zero readers.
+    /// - [`Candidates`](crate::run_lookup::DirectoryLookupDecision::Candidates) —
+    ///   walk locators with the conservative filter plus a safe early-stop
+    ///   proof ([`crate::run_lookup::RunLocator::can_contain_version_newer_than`]).
+    /// - [`UnavailableOrStale`](crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale) —
+    ///   fall back to the existing per-run range filter.
     pub fn get(&self, row_id: RowId, snapshot: Snapshot) -> Option<Row> {
         let mut best: Option<Row> = None;
-        let mut consider = |row: Row| {
+        // `consider` is a free function (not a closure) so the caller can
+        // also inspect `best` between iterations without colliding borrows.
+        fn consider(best: &mut Option<Row>, row: Row, snapshot: Snapshot) {
             if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
                 return;
             }
@@ -6721,19 +6745,19 @@ impl Table {
                     current.commit_ts,
                 )
             }) {
-                best = Some(row);
+                *best = Some(row);
             }
-        };
+        }
         if let Some((_, row)) = self.memtable.get_version_at(row_id, snapshot) {
-            consider(row);
+            consider(&mut best, row, snapshot);
         }
         if let Some((_, row)) = self.mutable_run.get_version_at(row_id, snapshot) {
-            consider(row);
+            consider(&mut best, row, snapshot);
         }
         // Decide which runs to open. The directory is consulted only when it
         // is marked complete AND the active run set is non-empty; otherwise
         // we fall back to the per-run range filter below.
-        let dir_locators = if self.run_lookup.complete {
+        let decision = if self.run_lookup.complete {
             // Defensive: verify the in-memory directory's fingerprint is
             // still consistent with the active run set. A divergence means
             // the directory is stale and we should fall back rather than
@@ -6747,31 +6771,58 @@ impl Table {
                 crate::run_lookup::DIRECTORY_FORMAT_VERSION,
             );
             if self.run_lookup.fingerprint == expected_fp {
-                self.run_lookup
-                    .directory
-                    .as_ref()
-                    .map(|d| d.locate(row_id).locators.clone())
+                match self.run_lookup.directory.as_ref() {
+                    Some(dir) => dir.decide(row_id),
+                    None => crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale,
+                }
             } else {
                 self.lookup_metrics
                     .directory_lookup_fallback
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                None
+                crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale
             }
         } else {
             self.lookup_metrics
                 .directory_lookup_fallback
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
+            crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale
         };
-        match dir_locators {
-            Some(locators) if !locators.is_empty() => {
-                // Apply the conservative snapshot filter — locators that
-                // provably cannot contain a visible version are skipped. The
-                // rest are opened in newest-first order so the first hit also
-                // yields the best candidate (early stop on a strictly newer
-                // best is a future optimization).
+        match decision {
+            crate::run_lookup::DirectoryLookupDecision::CompleteMiss => {
+                // REM-004: a complete directory miss is authoritative — the
+                // memtable + mutable-run tiers have already been searched,
+                // so no immutable run can host a visible version. Skip the
+                // range scan and return whatever the in-memory tiers said.
+                self.lookup_metrics
+                    .directory_lookup_hit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.lookup_metrics
+                    .directory_complete_miss_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            crate::run_lookup::DirectoryLookupDecision::Candidates(locators) => {
+                // Apply the conservative snapshot filter and the safe
+                // early-stop proof — locators that provably cannot contain a
+                // visible version, or whose maximum visible version is
+                // provably ≤ the current winner, are skipped. The remainder
+                // is opened in newest-first order.
                 let mut opened: std::collections::HashSet<u128> = std::collections::HashSet::new();
+                let mut early_stopped: u64 = 0;
                 for locator in &locators {
+                    // REM-004 early-stop: once we have a winner, skip
+                    // locators that provably cannot beat it.
+                    let stamp = best
+                        .as_ref()
+                        .map(|current| crate::run_lookup::VersionStamp {
+                            epoch: current.committed_epoch,
+                            hlc: current.commit_ts,
+                        });
+                    if let Some(s) = stamp {
+                        if !locator.can_contain_version_newer_than(s, snapshot) {
+                            early_stopped += 1;
+                            continue;
+                        }
+                    }
                     if locator.is_impossible_for(snapshot) {
                         continue;
                     }
@@ -6792,19 +6843,18 @@ impl Table {
                     let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
                         continue;
                     };
-                    consider(row);
+                    consider(&mut best, row, snapshot);
                 }
-                if opened.is_empty() {
+                if early_stopped > 0 {
                     self.lookup_metrics
-                        .directory_lookup_fallback
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    self.lookup_metrics
-                        .directory_lookup_hit
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .directory_early_stop_total
+                        .fetch_add(early_stopped, std::sync::atomic::Ordering::Relaxed);
                 }
+                self.lookup_metrics
+                    .directory_lookup_hit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            Some(_) | None => {
+            crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale => {
                 // Exact directory miss OR no directory: range-scan fallback.
                 for rr in &self.run_refs {
                     // Skip runs whose RowId range cannot contain this key
@@ -6829,7 +6879,7 @@ impl Table {
                     let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
                         continue;
                     };
-                    consider(row);
+                    consider(&mut best, row, snapshot);
                 }
             }
         }
