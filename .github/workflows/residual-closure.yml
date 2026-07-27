@@ -72,6 +72,8 @@ jobs:
         with:
           toolchain: 1.97.1
           components: clippy, rustfmt
+      # mongreldb-protocol's build script needs protoc (workspace scope).
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo clippy -D warnings
@@ -197,6 +199,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
+      # mongreldb-server (all-features → native-rpc → mongreldb-protocol)
+      # needs protoc for the build script.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test -p mongreldb-core --test lookup_metrics --all-features
       - run: cargo test -p mongreldb-server --test hot_metrics_export --all-features
 
@@ -228,6 +233,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
+      # Workspace scope pulls in mongreldb-protocol; its build script
+      # needs protoc.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace --all-features --exclude mongreldb-perf --tests
 
   # -------------------------------------------------------------------------
@@ -350,6 +358,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
+      # The orchestrator builds server and workspace targets; protoc is
+      # required by mongreldb-protocol's build script.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Capture requested SHA
         id: sha
         run: |
