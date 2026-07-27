@@ -77,7 +77,7 @@ done
 # headroom above measured healthy values in BENCHMARKS.md (µs unless noted).
 # Fail closed when fewer than REPS samples exist or any median exceeds the gate.
 python3 - "$OUT_DIR" "$REPS" <<'PY'
-import json, sys, statistics
+import json, sys, statistics, os
 from pathlib import Path
 
 out = Path(sys.argv[1])
@@ -238,55 +238,155 @@ verdicts.append({
 if len(p0) < reps or len(p2s) < reps or len(p2f) < reps:
     failed.append(f"insufficient reps: p0={len(p0)} p2s={len(p2s)} p2f={len(p2f)} need {reps}")
 
-# R170-08: same-runner ratio gates vs published healthy baselines.
-# Absolute tripwires above remain catastrophic/sanity gates; ratios catch
-# original-magnitude regressions (≈10–15%) against BENCHMARKS.md baselines.
+# FF-10/11/12: ratio gates. Prefer same-runner baseline harvest in
+# out/baseline/ (or P0P2_BASELINE_DIR). Missing surface measurements fail closed.
+# Static reference medians from config are only used when ratio_mode is
+# "static_reference" (never labeled same_runner).
 ratio_cfg_path = Path("docs/ai/p0p2-baseline-ratios.json")
-if ratio_cfg_path.is_file():
+if not ratio_cfg_path.is_file():
+    failed.append("missing docs/ai/p0p2-baseline-ratios.json — ratio gates required (FF-10)")
+else:
     ratio_cfg = json.loads(ratio_cfg_path.read_text())
-    baselines = ratio_cfg.get("baseline_median_p95_us") or {}
-    max_ratios = ratio_cfg.get("maximum_ratio") or {}
-    # Map absolute-gate verdicts already computed to ratio checks.
+    ratio_mode = ratio_cfg.get("ratio_mode") or "same_runner"
+    surfaces = ratio_cfg.get("surfaces") or {}
+    # Collect candidate medians from absolute-gate verdicts already computed.
     measured = {}
     for v in verdicts:
         m = v.get("metric") or {}
-        if m.get("status") == "pass" and "median_p95_us" in m:
-            name = v["test"].split("::")[-1]
-            # p0 components are last path segment after p0::
-            if v["test"].startswith("p0p2::threshold::p0::"):
-                name = v["test"].rsplit("::", 1)[-1]
+        if m.get("status") in ("pass", "fail") and "median_p95_us" in m:
+            name = v["test"].rsplit("::", 1)[-1]
             measured[name] = float(m["median_p95_us"])
-    for key, base in baselines.items():
-        if key not in max_ratios:
-            continue
-        if key not in measured:
-            # Prefer short name matches
-            short = key
-            if short not in measured:
-                continue
+    # Load same-runner baseline harvest if present.
+    baseline_dir = Path(os.environ.get("P0P2_BASELINE_DIR", str(out / "baseline")))
+    baseline_measured = {}
+    def load_baseline_surface(name, path_keys):
+        # optional helper unused — surfaces use static or baseline jsonl later
+        pass
+    # Map baseline files into medians when baseline_dir exists.
+    if baseline_dir.is_dir():
+        def medians_from(file, extractor):
+            path = baseline_dir / file
+            if not path.is_file():
+                return {}
+            rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+            return extractor(rows)
+        def p0_extract(rows):
+            outm = {}
+            for component in ["put_steady_state_on_reused_table","first_put_after_create","commit_fsync","table_create_only"]:
+                vals=[]
+                for r in rows:
+                    samples=r.get("samples") or {}
+                    comp=samples.get(component) or {}
+                    if "p95_us" in comp:
+                        vals.append(float(comp["p95_us"]))
+                if vals:
+                    outm[component]=statistics.median(vals)
+            return outm
+        def p2_extract(rows, warm=True):
+            warm_vals=[]; loop_vals=[]
+            for r in rows:
+                pql=r.get("point_query_latency") or {}
+                if "p95_us" not in pql:
+                    continue
+                p95=float(pql["p95_us"])
+                test=str(r.get("test",""))
+                if "warm" in test or p95 < 100:
+                    warm_vals.append(p95)
+                else:
+                    loop_vals.append(p95)
+            outm={}
+            if warm_vals: outm["p2_standalone_warm_point_query"]=statistics.median(warm_vals)
+            if loop_vals: outm["p2_standalone_loopback_point_query"]=statistics.median(loop_vals)
+            return outm
+        baseline_measured.update(p0_extract(load("p0-results.jsonl") if False else []))
+        # load from baseline dir files
+        bp0 = baseline_dir / "p0-results.jsonl"
+        if bp0.is_file():
+            brows=[json.loads(l) for l in bp0.read_text().splitlines() if l.strip()]
+            baseline_measured.update(p0_extract(brows))
+        bp2s = baseline_dir / "p2-standalone-results.jsonl"
+        if bp2s.is_file():
+            brows=[json.loads(l) for l in bp2s.read_text().splitlines() if l.strip()]
+            warm_vals=[]; loop_vals=[]
+            for r in brows:
+                pql=r.get("point_query_latency") or {}
+                if "p95_us" not in pql: continue
+                p95=float(pql["p95_us"]); test=str(r.get("test",""))
+                if "warm" in test or p95 < 100: warm_vals.append(p95)
+                else: loop_vals.append(p95)
+            if warm_vals: baseline_measured["p2_standalone_warm_point_query"]=statistics.median(warm_vals)
+            if loop_vals: baseline_measured["p2_standalone_loopback_point_query"]=statistics.median(loop_vals)
+        bp2f = baseline_dir / "p2-full-feature-results.jsonl"
+        if bp2f.is_file():
+            brows=[json.loads(l) for l in bp2f.read_text().splitlines() if l.strip()]
+            vals=[float((r.get("point_query_latency") or {}).get("p95_us")) for r in brows if (r.get("point_query_latency") or {}).get("p95_us") is not None]
+            if vals: baseline_measured["p2_full_feature_loopback"]=statistics.median(vals)
+
+    for key, cfg in surfaces.items():
+        max_ratio = float(cfg.get("maximum_ratio") or 1.10)
+        base_sha = cfg.get("baseline_sha")
         cand = measured.get(key)
         if cand is None:
+            verdicts.append({
+                "test": f"p0p2::threshold::ratio::{key}",
+                "metric": {"status": "fail", "reason": "missing_candidate_surface", "surface": key},
+                "unit": "verdict",
+            })
+            failed.append(f"ratio/{key}: missing candidate measurement (fail closed FF-12)")
             continue
-        limit = float(base) * float(max_ratios[key])
+        if ratio_mode == "same_runner":
+            base = baseline_measured.get(key)
+            if base is None:
+                # Allow explicit static_reference only when env opts in for fixtures.
+                if os.environ.get("P0P2_ALLOW_STATIC_REFERENCE") == "1":
+                    base = cfg.get("static_reference_median_p95_us")
+                    mode_label = "static_reference_opt_in"
+                else:
+                    verdicts.append({
+                        "test": f"p0p2::threshold::ratio::{key}",
+                        "metric": {
+                            "status": "fail",
+                            "reason": "missing_same_runner_baseline",
+                            "surface": key,
+                            "hint": "populate OUT_DIR/baseline/*.jsonl from baseline SHA on same runner",
+                            "baseline_sha": base_sha,
+                        },
+                        "unit": "verdict",
+                    })
+                    failed.append(f"ratio/{key}: missing same-runner baseline (FF-10/12)")
+                    continue
+            else:
+                mode_label = "same_runner"
+        else:
+            base = cfg.get("static_reference_median_p95_us")
+            mode_label = "static_reference"
+            if base is None:
+                verdicts.append({
+                    "test": f"p0p2::threshold::ratio::{key}",
+                    "metric": {"status": "fail", "reason": "missing_static_reference", "surface": key},
+                    "unit": "verdict",
+                })
+                failed.append(f"ratio/{key}: missing static reference")
+                continue
+        base = float(base)
+        limit = base * max_ratio
         ok = cand <= limit + 1e-9
         verdicts.append({
             "test": f"p0p2::threshold::ratio::{key}",
             "metric": {
                 "status": "pass" if ok else "fail",
                 "candidate_median_p95_us": cand,
-                "baseline_median_p95_us": float(base),
-                "maximum_ratio": float(max_ratios[key]),
+                "baseline_median_p95_us": base,
+                "maximum_ratio": max_ratio,
                 "limit_p95_us": limit,
-                "baseline_sha": ratio_cfg.get("p0_baseline_sha") or ratio_cfg.get("p2_baseline_sha"),
+                "baseline_sha": base_sha,
+                "ratio_mode": mode_label,
             },
             "unit": "verdict",
         })
         if not ok:
-            failed.append(
-                f"ratio/{key}: candidate median {cand} > baseline {base} × {max_ratios[key]} = {limit}"
-            )
-else:
-    failed.append("missing docs/ai/p0p2-baseline-ratios.json — ratio gates required (R170-08)")
+            failed.append(f"ratio/{key}: candidate {cand} > baseline {base} × {max_ratio} = {limit}")
+
 
 verdict_path = out / "p0p2-threshold-verdict.jsonl"
 with verdict_path.open("w") as f:

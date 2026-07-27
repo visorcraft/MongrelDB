@@ -479,3 +479,16 @@ working tree.
 - **Exact-SHA residual-closure workflow**: required for final closure; local
   self-test + oracle gates are the development bar when the full multi-hour
   workflow is not dispatched in this environment.
+
+
+## FF577180 residual evidence status
+
+- Oracle pin pairing + boundary compact retention and measured ineligible hits are in
+  `index_churn_oracle` (see residual commits after `ff577180`).
+- P0/P2 **same-runner** ratios require `OUT_DIR/baseline/*.jsonl` harvested from the
+  configured per-surface `baseline_sha` on the **same runner**; missing surfaces fail
+  closed. Static reference medians in `docs/ai/p0p2-baseline-ratios.json` are **not**
+  same-runner evidence.
+- Exact-SHA residual-closure artifact for this train is **not** claimed until the
+  multi-hour workflow completes on a clean SHA.
+- 30-nightly / 4-weekly history remains **ACCUMULATING** (tooling present; not fabricated).

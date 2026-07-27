@@ -1298,6 +1298,18 @@ EOF
     failures+=("r170_evidence_records_present_in_bundle")
   fi
 
+  # FF-08: missing jsonl for a semantic threshold must fail closed.
+  set +e
+  assert_jsonl_threshold "$SELF_TEST_DIR/does-not-exist.jsonl"     'true' "missing jsonl" 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] semantic_threshold_missing_jsonl_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("semantic_threshold_missing_jsonl_fails")
+  fi
+
   echo "self-test summary: passed=$passed failed=${#failures[@]}"
   if [[ ${#failures[@]} -gt 0 ]]; then
     printf '  - %s\n' "${failures[@]}" >&2
@@ -1610,6 +1622,34 @@ if [[ -s "$OUT/p0p2-threshold-verdict.jsonl" ]]; then
   fi
 else
   echo "  [FAIL] p0p2-threshold-verdict.jsonl missing" >&2
+fi
+
+# FF-08: execute every semantic object under contract .thresholds against
+# the relevant JSONL in $OUT. Missing file or failed jq fails closed.
+echo "[*] Contract semantic thresholds (FF-08)"
+SEMANTIC_THRESHOLDS_OK=1
+while IFS= read -r tkey; do
+  [[ -z "$tkey" ]] && continue
+  jsonl="$(jq -r --arg k "$tkey" '.thresholds[$k].jsonl // empty' "$CONTRACT")"
+  jq_expr="$(jq -r --arg k "$tkey" '.thresholds[$k].jq // empty' "$CONTRACT")"
+  label="$(jq -r --arg k "$tkey" '.thresholds[$k].label // $k' "$CONTRACT")"
+  [[ -z "$jsonl" || -z "$jq_expr" || "$jq_expr" == "null" ]] && continue
+  path="$OUT/$jsonl"
+  if [[ ! -s "$path" ]]; then
+    # Fall back to suite jsonl names used in fixtures
+    path="$OUT/$jsonl"
+  fi
+  if [[ ! -s "$path" ]]; then
+    echo "  [FAIL] threshold $tkey — missing $jsonl" >&2
+    SEMANTIC_THRESHOLDS_OK=0
+    continue
+  fi
+  if ! assert_jsonl_threshold "$path" "$jq_expr" "$label"; then
+    SEMANTIC_THRESHOLDS_OK=0
+  fi
+done < <(jq -r '.thresholds | keys[]' "$CONTRACT")
+if [[ "$SEMANTIC_THRESHOLDS_OK" -ne 1 ]]; then
+  overall_status=1
 fi
 
 # §13.8: every top-level threshold affects the overall verdict.

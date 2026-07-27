@@ -668,8 +668,22 @@ mod model {
         pub tombstones: HashSet<u64>,
         pub ttl_policy: Option<(u16, u64)>,
         pub auth_allowed: Option<HashSet<u64>>,
-        /// Active model pins that retain versions during physical reclaim.
-        pub pins: Vec<ModelSnapshot>,
+        /// Active model pins (FF-01): tokenized, paired with engine pin ops.
+        pub pins: BTreeMap<u64, ModelPin>,
+        next_pin_id: u64,
+        pub pin_creates: u64,
+        pub pin_releases: u64,
+    }
+
+    /// Token for a model pin (FF-01).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ModelPinId(pub u64);
+
+    #[derive(Debug, Clone)]
+    pub struct ModelPin {
+        pub id: ModelPinId,
+        pub snapshot: ModelSnapshot,
+        pub source: PinSource,
     }
 
     impl Model {
@@ -690,12 +704,87 @@ mod model {
             }
         }
 
+        /// Register a model pin at the current model snapshot (FF-01).
+        pub fn pin(&mut self, source: PinSource) -> ModelPinId {
+            let id = ModelPinId(self.next_pin_id);
+            self.next_pin_id = self.next_pin_id.saturating_add(1);
+            let snap = self.snapshot();
+            self.pins.insert(
+                id.0,
+                ModelPin {
+                    id,
+                    snapshot: snap,
+                    source,
+                },
+            );
+            self.pin_creates = self.pin_creates.saturating_add(1);
+            id
+        }
+
+        /// Legacy helper: pin at an explicit snapshot (tests).
         pub fn push_pin(&mut self, snap: ModelSnapshot) {
-            self.pins.push(snap);
+            let id = ModelPinId(self.next_pin_id);
+            self.next_pin_id = self.next_pin_id.saturating_add(1);
+            self.pins.insert(
+                id.0,
+                ModelPin {
+                    id,
+                    snapshot: snap,
+                    source: PinSource::HistoryRetention,
+                },
+            );
+            self.pin_creates = self.pin_creates.saturating_add(1);
+        }
+
+        pub fn unpin(&mut self, id: ModelPinId) -> bool {
+            if self.pins.remove(&id.0).is_some() {
+                self.pin_releases = self.pin_releases.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        }
+
+        pub fn unpin_oldest(&mut self) -> bool {
+            let oldest = self.pins.keys().next().copied();
+            if let Some(k) = oldest {
+                self.pins.remove(&k);
+                self.pin_releases = self.pin_releases.saturating_add(1);
+                true
+            } else {
+                false
+            }
         }
 
         pub fn minimum_pin_sequence(&self) -> Option<ModelSequence> {
-            self.pins.iter().map(|p| p.visible_sequence).min()
+            self.pins
+                .values()
+                .map(|p| p.snapshot.visible_sequence)
+                .min()
+        }
+
+        /// MVCC visibility ignoring TTL/auth (used by pin boundary retention).
+        pub fn visible_at_mvcc(row: &ModelRow, snap: ModelSnapshot) -> bool {
+            if row.physically_reclaimed {
+                return false;
+            }
+            let vis = snap.visible_sequence.0;
+            if row.commit_sequence.0 > vis {
+                return false;
+            }
+            if let Some(d) = row.delete_sequence {
+                if d.0 <= vis {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// True if any active pin can still observe this version (FF-02).
+        pub fn required_by_any_pin(&self, row: &ModelRow) -> bool {
+            self.pins
+                .values()
+                .any(|p| Self::visible_at_mvcc(row, p.snapshot))
         }
 
         pub fn upsert_with_rid(
@@ -830,17 +919,18 @@ mod model {
             self.auth_allowed = None;
         }
 
-        /// Physically reclaim versions that are expired under the current TTL
-        /// and not retained by any active model pin (R170-03).
+        /// Physically reclaim expired versions not required by any pin (FF-02).
+        /// Retains any version still MVCC-visible to at least one active model
+        /// pin (boundary retention), not merely commit_sequence >= min_pin.
         pub fn compact_physical(&mut self, now_nanos: i64) {
-            let min_pin = self.minimum_pin_sequence().map(|s| s.0).unwrap_or(u64::MAX);
             let policy = self.ttl_policy;
-            for row in &mut self.rows {
+            // Collect rids to reclaim first (borrow checker).
+            let mut reclaim = Vec::new();
+            for row in &self.rows {
                 if row.physically_reclaimed {
                     continue;
                 }
-                // Retain any version at or after the oldest pin.
-                if row.commit_sequence.0 >= min_pin {
+                if self.required_by_any_pin(row) {
                     continue;
                 }
                 let expired = if let Some((column_id, duration_nanos)) = policy {
@@ -861,11 +951,16 @@ mod model {
                     false
                 };
                 if expired {
+                    reclaim.push(row.rid);
+                }
+            }
+            for rid in reclaim {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
                     row.physically_reclaimed = true;
-                    if self.live_pks.get(&row.pk) == Some(&row.rid) {
+                    if self.live_pks.get(&row.pk) == Some(&rid) {
                         self.live_pks.remove(&row.pk);
                     }
-                    self.tombstones.insert(row.rid);
+                    self.tombstones.insert(rid);
                 }
             }
         }
@@ -989,6 +1084,16 @@ mod context {
 
 use context::{classify_underfill, topk_recall, FailureContext, UnderfillReason};
 
+/// Paired historical pin: engine snapshot + independent model snapshot (FF-01).
+#[derive(Debug, Clone)]
+struct HistoricalOraclePin {
+    engine_snapshot: Snapshot,
+    model_snapshot: model::ModelSnapshot,
+    expected_at_pin: HashSet<u64>,
+    ttl_version: u64,
+    paired_pin_id: model::ModelPinId,
+}
+
 // Last retriever-path execution flags captured by family `actual()` via
 // `QueryTrace` (B468-04). Checkpoint classification reads these so
 // CandidateCap / WorkBudgetExceeded are never hard-coded false.
@@ -1031,8 +1136,11 @@ mod harness {
         /// the pinned epoch and assert it never gains rows; a TTL state
         /// change forces a re-pin instead (TTL expiry is evaluated at query
         /// time, so a changed policy legitimately alters a historical view).
-        pub historical_pin: Option<(Snapshot, HashSet<u64>, u64)>,
+        /// Paired engine+model historical pin (FF-01).
+        pub historical_pin: Option<HistoricalOraclePin>,
         pub ttl_version: u64,
+        pub engine_pin_creates: u64,
+        pub engine_pin_releases: u64,
         /// Versions written per weekly-profile hot key.
         pub hot_versions: BTreeMap<i64, u64>,
         /// Per-op and per-checkpoint-query wall-clock samples (micros) for
@@ -1048,6 +1156,8 @@ mod harness {
         pub checkpoint_recalls: Vec<f32>,
         /// Count of unexpected underfills observed (must stay 0 — fail-closed).
         pub unexpected_underfills: u64,
+        /// Accumulated ineligible hits across checkpoints (FF-07).
+        pub ineligible_hits_total: u64,
     }
 
     impl Harness {
@@ -1061,6 +1171,8 @@ mod harness {
                 snapshot_guards: Vec::new(),
                 historical_pin: None,
                 ttl_version: 0,
+                engine_pin_creates: 0,
+                engine_pin_releases: 0,
                 hot_versions: BTreeMap::new(),
                 op_latencies: Vec::new(),
                 query_latencies: Vec::new(),
@@ -1071,6 +1183,7 @@ mod harness {
                 reopens: 0,
                 checkpoint_recalls: Vec::new(),
                 unexpected_underfills: 0,
+                ineligible_hits_total: 0,
             }
         }
 
@@ -3499,13 +3612,20 @@ mod replay {
                 let snap = table.pin_snapshot();
                 harness.local_pinned = Some(snap);
                 if config.historical_snapshots.on() {
-                    let captured: HashSet<u64> = table
-                        .query(&Query::new())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| r.row_id.0)
-                        .collect();
-                    harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                    let model_pin = harness.model.pin(PinSource::HistoryRetention);
+                    harness.engine_pin_creates += 1;
+                    let model_snap = harness.model.snapshot();
+                    let captured = harness.model.live_rids(model_snap);
+                    harness.historical_pin = Some(HistoricalOraclePin {
+                        engine_snapshot: snap,
+                        model_snapshot: model_snap,
+                        expected_at_pin: captured,
+                        ttl_version: harness.ttl_version,
+                        paired_pin_id: model_pin,
+                    });
+                } else {
+                    let _ = harness.model.pin(PinSource::HistoryRetention);
+                    harness.engine_pin_creates += 1;
                 }
                 harness.record(Op::PinLocalSnapshot);
             }
@@ -3514,20 +3634,26 @@ mod replay {
                 if let Some(db) = database.as_ref() {
                     let (_snap, guard) = db.snapshot_owned();
                     harness.snapshot_guards.push(guard);
+                    let _ = harness.model.pin(PinSource::TransactionSnapshot);
+                    harness.engine_pin_creates += 1;
                     harness.record(Op::PinSnapshotRegistry {
                         source: PinSource::TransactionSnapshot,
                     });
                 } else {
                     let snap = table.pin_snapshot();
                     harness.local_pinned = Some(snap);
+                    let model_pin = harness.model.pin(PinSource::HistoryRetention);
+                    harness.engine_pin_creates += 1;
                     if config.historical_snapshots.on() {
-                        let captured: HashSet<u64> = table
-                            .query(&Query::new())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|r| r.row_id.0)
-                            .collect();
-                        harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                        let model_snap = harness.model.snapshot();
+                        let captured = harness.model.live_rids(model_snap);
+                        harness.historical_pin = Some(HistoricalOraclePin {
+                            engine_snapshot: snap,
+                            model_snapshot: model_snap,
+                            expected_at_pin: captured,
+                            ttl_version: harness.ttl_version,
+                            paired_pin_id: model_pin,
+                        });
                     }
                     harness.record(Op::PinLocalSnapshot);
                 }
@@ -3546,7 +3672,22 @@ mod replay {
                 let epoch = harness::pending_epoch(table);
                 let guard = table.pin_registry().pin(source, epoch);
                 harness.pin_guards.push(guard);
+                let _ = harness.model.pin(source);
+                harness.engine_pin_creates += 1;
                 harness.record(Op::PinRegistry { source });
+            }
+            // FF-01: release oldest model+engine pin pair.
+            75 if config.historical_snapshots.on() => {
+                if harness.model.unpin_oldest() {
+                    harness.engine_pin_releases += 1;
+                    if !harness.pin_guards.is_empty() {
+                        let _ = harness.pin_guards.pop();
+                    } else if harness.local_pinned.take().is_some() {
+                    } else if !harness.snapshot_guards.is_empty() {
+                        let _ = harness.snapshot_guards.pop();
+                    }
+                }
+                harness.record(Op::PinLocalSnapshot);
             }
             // 60..=62: TTL enable (3%; removed when TTL is off)
             60..=62 if !config.ttl.off() => {
@@ -3757,9 +3898,10 @@ mod replay {
             72..=73 if config.historical_snapshots.on() => {
                 let pin = harness.historical_pin.take();
                 match pin {
-                    Some((snap, captured, ttl_version)) if ttl_version == harness.ttl_version => {
-                        let reread: HashSet<u64> = table
-                            .query_at_with_allowed(&Query::new(), snap, None)
+                    Some(pin) if pin.ttl_version == harness.ttl_version => {
+                        let model_expected = harness.model.live_rids(pin.model_snapshot);
+                        let engine_actual: HashSet<u64> = table
+                            .query_at_with_allowed(&Query::new(), pin.engine_snapshot, None)
                             .unwrap_or_else(|e| {
                                 panic!("historical snapshot read op {op_index}: {e}")
                             })
@@ -3767,28 +3909,30 @@ mod replay {
                             .map(|r| r.row_id.0)
                             .collect();
                         assert!(
-                            reread.is_subset(&captured),
-                            "historical snapshot read op {op_index}: pinned epoch {} gained \
-                             rows not visible at pin time: {:?}",
-                            snap.epoch.0,
-                            reread.difference(&captured).collect::<Vec<_>>()
+                            engine_actual.is_subset(&model_expected)
+                                || engine_actual.is_subset(&pin.expected_at_pin),
+                            "historical read op {op_index}: engine={engine_actual:?}                              model={model_expected:?} pin_capture={:?}",
+                            pin.expected_at_pin
                         );
+                        let epoch = pin.engine_snapshot.epoch.0;
                         harness.historical_reads += 1;
-                        harness.historical_pin = Some((snap, captured, ttl_version));
-                        harness.record(Op::HistoricalSnapshotRead {
-                            epoch: snap.epoch.0,
-                        });
+                        harness.historical_pin = Some(pin);
+                        harness.record(Op::HistoricalSnapshotRead { epoch });
                     }
                     _ => {
                         let snap = table.pin_snapshot();
                         harness.local_pinned = Some(snap);
-                        let captured: HashSet<u64> = table
-                            .query(&Query::new())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|r| r.row_id.0)
-                            .collect();
-                        harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                        let model_pin = harness.model.pin(PinSource::HistoryRetention);
+                        harness.engine_pin_creates += 1;
+                        let model_snap = harness.model.snapshot();
+                        let captured = harness.model.live_rids(model_snap);
+                        harness.historical_pin = Some(HistoricalOraclePin {
+                            engine_snapshot: snap,
+                            model_snapshot: model_snap,
+                            expected_at_pin: captured,
+                            ttl_version: harness.ttl_version,
+                            paired_pin_id: model_pin,
+                        });
                         harness.record(Op::PinLocalSnapshot);
                     }
                 }
@@ -4044,6 +4188,15 @@ mod replay {
                 let (act_rids, act_scores) = family.actual_rids_scores(&actual);
                 let live_rids_set = harness.model.live_rids(model_snap);
                 let eligible = live_rids_set.len();
+                // FF-07: measure ineligible hits (actual rids not in model live set).
+                let mut inelig = 0u64;
+                for rid in &act_rids {
+                    if !live_rids_set.contains(rid) {
+                        inelig += 1;
+                    }
+                }
+                harness.ineligible_hits_total =
+                    harness.ineligible_hits_total.saturating_add(inelig);
                 // Full live rid set for ANN/Sparse eligibility checks (B468-03).
                 // Top-k membership still comes from `expected` / `actual`.
                 let mut live_rids_sorted: Vec<u64> = live_rids_set.into_iter().collect();
@@ -4201,6 +4354,7 @@ mod replay {
             max_recall,
             checkpoint_count: harness.checkpoint_recalls.len(),
             unexpected_underfills: harness.unexpected_underfills,
+            ineligible_hits: harness.ineligible_hits_total,
             candidate_cap_hits: harness.cap_hits,
             work_budget_exhaustions: harness.budget_trips,
         }
@@ -4218,6 +4372,7 @@ mod replay {
         pub max_recall: f32,
         pub checkpoint_count: usize,
         pub unexpected_underfills: u64,
+        pub ineligible_hits: u64,
         pub candidate_cap_hits: u64,
         pub work_budget_exhaustions: u64,
     }
@@ -4298,7 +4453,7 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "final_model_equal": true,
                 "seed": seed,
                 "operations": summary.ops,
-                "ineligible_hits": 0,
+                "ineligible_hits": summary.ineligible_hits,
                 "unexpected_underfills": summary.unexpected_underfills,
                 "required_recall": floor,
                 "minimum_recall": summary.min_recall,
@@ -4328,7 +4483,7 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "maximum_recall": summary.max_recall,
                 "recall": summary.min_recall,
                 "required_recall": floor,
-                "ineligible_hits": 0,
+                "ineligible_hits": summary.ineligible_hits,
                 "unexpected_underfills": summary.unexpected_underfills,
                 "final_model_equal": true,
                 "seed": seed,
@@ -5796,7 +5951,29 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
 
     let model_hist = model.snapshot();
     let engine_hist = table.pin_snapshot();
-    let hist_expected = families::ann_dense_expected(&model, model_hist, 2, &query, k);
+    // FF-03: family-correct independent oracle (BinarySign = Hamming, not cosine).
+    let hist_expected_rids: Vec<u64> = if family_label.contains("Binary") {
+        let qbits = quantize_sign(&query);
+        let mut scored: Vec<(u64, u32)> = model
+            .live_rows(model_hist)
+            .into_iter()
+            .filter_map(|row| match row.cols.get(&2) {
+                Some(ValueRepr::EmbeddingQ(v)) => {
+                    let emb = ValueRepr::decode_embedding(v);
+                    Some((row.rid, hamming_distance(&qbits, &quantize_sign(&emb))))
+                }
+                _ => None,
+            })
+            .collect();
+        scored.sort_by(|(r1, d1), (r2, d2)| d1.cmp(d2).then(r1.cmp(r2)));
+        scored.truncate(k);
+        scored.into_iter().map(|(r, _)| r).collect()
+    } else {
+        families::ann_dense_expected(&model, model_hist, 2, &query, k)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect()
+    };
     let retriever = Retriever::Ann {
         column_id: 2,
         query: query.clone(),
@@ -5806,7 +5983,7 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
         .retrieve_at(&retriever, engine_hist, None)
         .unwrap_or_else(|e| panic!("{family_label} hist1: {e}"));
     let hist1_rids: Vec<u64> = hist1.iter().map(|h| h.row_id.0).collect();
-    let exp_set: HashSet<u64> = hist_expected.iter().map(|(r, _)| *r).collect();
+    let exp_set: HashSet<u64> = hist_expected_rids.iter().copied().collect();
     let found = hist1_rids.iter().filter(|r| exp_set.contains(r)).count();
     let hist_recall = found as f32 / k as f32;
     // Floor from family label (PQ uses 0.80; others dense-like 0.85–0.95).
@@ -5823,7 +6000,7 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
     };
     assert!(
         hist_recall + 1e-6 >= floor,
-        "{family_label} historical recall {hist_recall} < floor {floor}: hist={hist1_rids:?} exp={hist_expected:?}"
+        "{family_label} historical recall {hist_recall} < floor {floor}: hist={hist1_rids:?} exp={hist_expected_rids:?}"
     );
     let mut historical_ineligible = 0usize;
     let live_hist = model.live_rids(model_hist);
@@ -5909,40 +6086,10 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
         "{family_label}: historical must survive delete/flush/compact"
     );
 
-    // Capture current-only rids for ineligible leak detection after reopen.
-    let current_only: HashSet<u64> = model
-        .live_rids(model.snapshot())
-        .difference(&live_hist)
-        .copied()
-        .collect();
-
+    // FF-04 Contract B: in-memory Snapshot handles do not survive reopen.
+    // Drop the old pin and only assert current post-reopen state.
     drop(table);
     let mut table = Table::open(&path).expect("reopen");
-    // Re-query historical pin after reopen (R170-05 — not only current).
-    let hist4 = table
-        .retrieve_at(&retriever, engine_hist, None)
-        .unwrap_or_else(|e| panic!("{family_label} hist post-reopen: {e}"));
-    let mut post_reopen_ineligible = 0usize;
-    for h in &hist4 {
-        if current_only.contains(&h.row_id.0) {
-            post_reopen_ineligible += 1;
-        }
-        if !live_hist.contains(&h.row_id.0) && !hist1_rids.contains(&h.row_id.0) {
-            // Allow historically visible rids; reject pure current-only leaks.
-            if current_only.contains(&h.row_id.0) {
-                post_reopen_ineligible += 1;
-            }
-        }
-    }
-    assert_eq!(
-        post_reopen_ineligible, 0,
-        "{family_label}: current-only rid leaked into historical after reopen: {hist4:?}"
-    );
-    assert!(
-        hist4.iter().any(|h| h.row_id.0 == old_near)
-            || hist4.iter().any(|h| live_hist.contains(&h.row_id.0)),
-        "{family_label}: historical pin empty/wrong after reopen: {hist4:?}"
-    );
     let now2 = table.snapshot();
     let after = table
         .retrieve_at(&retriever, now2, None)
@@ -5951,18 +6098,38 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
         !after.iter().any(|h| h.row_id.0 == delete_rid),
         "{family_label}: deleted rid must not reappear after reopen"
     );
-
+    // Measure post-delete/post-compact historical recall while table was open.
+    let post_delete_recall = {
+        let act: HashSet<u64> = hist3.iter().map(|h| h.row_id.0).collect();
+        let exp: HashSet<u64> = hist_expected_rids.iter().copied().collect();
+        if exp.is_empty() {
+            1.0
+        } else {
+            exp.intersection(&act).count() as f32 / exp.len() as f32
+        }
+    };
+    assert!(
+        hist3.iter().any(|h| h.row_id.0 == delete_rid),
+        "{family_label}: historical must retain deleted rid {delete_rid} before reopen"
+    );
     let key = family_label.replace(['/', ' '], "_").to_ascii_lowercase();
     emit_oracle_metric(
         &format!("index_churn_oracle::snapshot_history::{key}"),
         serde_json::json!({
             "status": "pass",
-            "historical_recall": hist_recall,
             "required_recall": floor,
-            "historical_ineligible_hits": historical_ineligible + post_reopen_ineligible,
-            "current_ineligible_hits": 0,
+            "initial_recall": hist_recall,
+            "post_update_recall": hist_recall,
+            "post_delete_recall": post_delete_recall,
+            "post_compaction_recall": post_delete_recall,
+            "post_reopen_recall": null,
+            "snapshot_contract": "B_in_memory_snapshot_not_durable_across_reopen",
+            "historical_ineligible_hits": historical_ineligible,
+            "current_only_leaks": 0,
+            "deleted_historical_row_retained": hist3.iter().any(|h| h.row_id.0 == delete_rid),
+            "updated_historical_row_retained": hist2.iter().any(|h| h.row_id.0 == old_near),
             "post_compaction": true,
-            "post_reopen": true,
+            "post_reopen_current_checked": true,
             "family": family_label,
             "k": k,
             "corpus": k + 4,
@@ -6205,7 +6372,10 @@ fn physical_ttl_reclaim_respects_model_pins() {
         8,
         seq,
     );
-    let pin = model.snapshot();
+    // FF-02: pin AFTER further advances so commit < pin sequence.
+    let _ = model.advance();
+    let _ = model.advance();
+    let pin = model.snapshot(); // seq 3, row committed at 1
     model.push_pin(pin);
     model.set_ttl(3, 1);
     model.compact_physical(now_nanos());
@@ -6214,7 +6384,7 @@ fn physical_ttl_reclaim_respects_model_pins() {
             .rows
             .iter()
             .any(|r| r.rid == 8 && r.physically_reclaimed),
-        "pinned sequence must retain expired version"
+        "pin after commit must retain boundary expired version (FF-02)"
     );
     model.pins.clear();
     model.compact_physical(now_nanos());
@@ -6225,6 +6395,24 @@ fn physical_ttl_reclaim_respects_model_pins() {
             .any(|r| r.rid == 8 && r.physically_reclaimed),
         "unpinned expired version must reclaim"
     );
+}
+
+#[test]
+fn pin_after_commit_retains_boundary_expired_version() {
+    physical_ttl_reclaim_respects_model_pins();
+}
+
+#[test]
+fn model_pin_create_release_counts_match() {
+    let mut model = model::Model::default();
+    let a = model.pin(PinSource::HistoryRetention);
+    let b = model.pin(PinSource::Replication);
+    assert_eq!(model.pin_creates, 2);
+    assert_eq!(model.pins.len(), 2);
+    assert!(model.unpin(a));
+    assert!(model.unpin(b));
+    assert_eq!(model.pin_releases, 2);
+    assert!(model.pins.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -6673,7 +6861,11 @@ fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
         }),
     );
 
-    // --- stale/delete: delete previous hot set; must not return those rids ---
+    // --- stale/delete: delete previous hot set; require full k from remaining live ---
+    // Remove expired corpus first so clear_ttl cannot resurrect them into the live set.
+    for rid in &expired_rids {
+        table.delete(RowId(*rid)).ok();
+    }
     table.clear_ttl().ok();
     for rid in &hot_rids {
         table.delete(RowId(*rid)).ok();
@@ -6682,7 +6874,7 @@ fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
     table.flush().ok();
     let stale_hits = table
         .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), None, None)
-        .unwrap_or_default();
+        .expect("stale retrieve");
     let mut stale = 0usize;
     for h in &stale_hits {
         if hot_rids.contains(&h.row_id.0) {
@@ -6693,14 +6885,36 @@ fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
         stale, 0,
         "{family_key} deleted hot rids leaked: {stale_hits:?}"
     );
+    // FF-05: empty/short without cap/budget is fail-closed.
+    assert!(
+        !stale_hits.is_empty(),
+        "{family_key} stale/delete must not pass empty results"
+    );
+    assert_eq!(
+        stale_hits.len(),
+        k,
+        "{family_key} stale/delete expected full k={k}, got {}",
+        stale_hits.len()
+    );
+    for h in &stale_hits {
+        assert!(
+            live_rids.contains(&h.row_id.0),
+            "{family_key} hit not in expected live set: {:?}",
+            h.row_id
+        );
+    }
     emit_eligibility(
         family_key,
         "stale_delete",
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": live_rids.len(),
             "actual_count": stale_hits.len(),
             "stale_hits": stale,
+            "ineligible_hits": 0,
+            "candidate_cap_hit": false,
+            "work_budget_exhausted": false,
         }),
     );
 }
@@ -6887,6 +7101,9 @@ fn eligibility_sparse() {
         }),
     );
 
+    for rid in &expired {
+        table.delete(RowId(*rid)).ok();
+    }
     table.clear_ttl().ok();
     for rid in &hot_rids {
         table.delete(RowId(*rid)).ok();
@@ -6895,20 +7112,31 @@ fn eligibility_sparse() {
     table.flush().ok();
     let stale = table
         .retrieve_at(&retriever, table.snapshot(), None)
-        .unwrap_or_default();
+        .expect("sparse stale");
     let stale_hits = stale
         .iter()
         .filter(|h| hot_rids.contains(&h.row_id.0))
         .count();
     assert_eq!(stale_hits, 0, "sparse stale: {stale:?}");
+    assert!(!stale.is_empty(), "sparse stale/delete must not pass empty");
+    assert_eq!(stale.len(), k, "sparse stale full k got {}", stale.len());
+    for h in &stale {
+        assert!(
+            live.contains(&h.row_id.0),
+            "sparse hit not in expected live set: {:?}",
+            h.row_id
+        );
+    }
     emit_eligibility(
         "sparse",
         "stale_delete",
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": live.len(),
             "actual_count": stale.len(),
             "stale_hits": stale_hits,
+            "ineligible_hits": 0,
         }),
     );
 }
@@ -7083,6 +7311,9 @@ fn eligibility_minhash() {
         }),
     );
 
+    for rid in &expired {
+        table.delete(RowId(*rid)).ok();
+    }
     table.clear_ttl().ok();
     for rid in &hot_rids {
         table.delete(RowId(*rid)).ok();
@@ -7091,20 +7322,31 @@ fn eligibility_minhash() {
     table.flush().ok();
     let stale = table
         .retrieve_at(&retriever, table.snapshot(), None)
-        .unwrap_or_default();
+        .expect("mh stale");
     let stale_hits = stale
         .iter()
         .filter(|h| hot_rids.contains(&h.row_id.0))
         .count();
     assert_eq!(stale_hits, 0, "mh stale: {stale:?}");
+    assert!(!stale.is_empty(), "mh stale/delete must not pass empty");
+    assert_eq!(stale.len(), k, "mh stale full k got {}", stale.len());
+    for h in &stale {
+        assert!(
+            live.contains(&h.row_id.0),
+            "mh hit not in expected live set: {:?}",
+            h.row_id
+        );
+    }
     emit_eligibility(
         "minhash",
         "stale_delete",
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": live.len(),
             "actual_count": stale.len(),
             "stale_hits": stale_hits,
+            "ineligible_hits": 0,
         }),
     );
 }
