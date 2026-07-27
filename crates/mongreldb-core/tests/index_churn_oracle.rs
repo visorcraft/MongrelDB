@@ -1846,7 +1846,7 @@ mod families {
     }
 
     /// ANN oracle helper: exact top-k over the model with cosine distance.
-    fn ann_dense_expected(
+    pub fn ann_dense_expected(
         model: &model::Model,
         snap: model::ModelSnapshot,
         column_id: u16,
@@ -5739,114 +5739,233 @@ fn sparse_full_k_under_stale_candidate_churn() {
 }
 
 fn ann_historical_matrix(schema: Schema, family_label: &str) {
+    // R170-05: k+4 vectors, independent model ranking, update+delete, flush,
+    // compact, reopen; re-query historical pin after reopen and measure
+    // ineligible hits (current-only rows must not leak into history).
     let dir = tempdir().expect("tempdir");
     let path = dir.path().to_path_buf();
     let dim = match schema.columns.iter().find(|c| c.id == 2).map(|c| &c.ty) {
         Some(TypeId::Embedding { dim }) => *dim as usize,
         _ => 8,
     };
+    let k = 3usize;
     let mut table = Table::create(&path, schema, 1).expect("create");
-    // Near query vector and a distant one (dim-aware).
-    let mut near = vec![0.0f32; dim];
-    near[0] = 1.0;
+    let mut model = model::Model::default();
+
+    // Build k+4 unit vectors with decreasing similarity to query e0.
+    let mut query = vec![0.0f32; dim];
+    query[0] = 1.0;
+    let mut historical_rids = Vec::new();
+    for i in 0..(k + 4) {
+        let mut emb = vec![0.0f32; dim];
+        // Primary axis aligned with query, secondary axis separates ranks.
+        emb[0] = 1.0 - (i as f32) * 0.05;
+        if dim > 1 {
+            emb[1] = (i as f32) * 0.02;
+        }
+        // L2 normalize for cosine distance stability.
+        let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        for x in &mut emb {
+            *x /= norm;
+        }
+        let pk = (i + 1) as i64;
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Embedding(emb.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put")
+            .0;
+        historical_rids.push(rid);
+        let seq = model.advance();
+        model.upsert_with_rid(
+            pk,
+            vec![
+                (1, ValueRepr::Int(pk)),
+                (2, ValueRepr::from_value(&Value::Embedding(emb.clone()))),
+                (3, ValueRepr::Int(0)),
+            ],
+            true,
+            rid,
+            seq,
+        );
+    }
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+
+    let model_hist = model.snapshot();
+    let engine_hist = table.pin_snapshot();
+    let hist_expected = families::ann_dense_expected(&model, model_hist, 2, &query, k);
+    let retriever = Retriever::Ann {
+        column_id: 2,
+        query: query.clone(),
+        k,
+    };
+    let hist1 = table
+        .retrieve_at(&retriever, engine_hist, None)
+        .unwrap_or_else(|e| panic!("{family_label} hist1: {e}"));
+    let hist1_rids: Vec<u64> = hist1.iter().map(|h| h.row_id.0).collect();
+    let exp_set: HashSet<u64> = hist_expected.iter().map(|(r, _)| *r).collect();
+    let found = hist1_rids.iter().filter(|r| exp_set.contains(r)).count();
+    let hist_recall = found as f32 / k as f32;
+    // Floor from family label (PQ uses 0.80; others dense-like 0.85–0.95).
+    let floor = if family_label.contains("PQ") {
+        PQ_RECALL_FLOOR
+    } else if family_label.contains("Binary") {
+        HNSW_BINARY_RECALL_FLOOR
+    } else if family_label.contains("IVF") {
+        IVF_DENSE_RECALL_FLOOR
+    } else if family_label.contains("DiskANN") {
+        DISKANN_DENSE_RECALL_FLOOR
+    } else {
+        HNSW_DENSE_RECALL_FLOOR
+    };
+    assert!(
+        hist_recall + 1e-6 >= floor,
+        "{family_label} historical recall {hist_recall} < floor {floor}: hist={hist1_rids:?} exp={hist_expected:?}"
+    );
+    let mut historical_ineligible = 0usize;
+    let live_hist = model.live_rids(model_hist);
+    for rid in &hist1_rids {
+        if !live_hist.contains(rid) {
+            historical_ineligible += 1;
+        }
+    }
+    assert_eq!(
+        historical_ineligible, 0,
+        "{family_label} historical returned ineligible rids"
+    );
+
+    // Update nearest historical top hit to become distant.
+    let update_pk = 1i64;
     let mut far = vec![0.0f32; dim];
     if dim > 1 {
         far[1] = 1.0;
     } else {
         far[0] = -1.0;
     }
-    let rid_near = table
+    let new_rid = table
         .put(vec![
-            (1, Value::Int64(1)),
-            (2, Value::Embedding(near.clone())),
-            (3, Value::Int64(0)),
-        ])
-        .expect("put near")
-        .0;
-    let rid_far = table
-        .put(vec![
-            (1, Value::Int64(2)),
-            (2, Value::Embedding(far.clone())),
-            (3, Value::Int64(0)),
-        ])
-        .expect("put far")
-        .0;
-    table.commit().expect("commit");
-    table.flush().expect("flush");
-    let pinned = table.pin_snapshot();
-    let retriever = Retriever::Ann {
-        column_id: 2,
-        query: near.clone(),
-        k: 1,
-    };
-    let hist = table
-        .retrieve_at(&retriever, pinned, None)
-        .unwrap_or_else(|e| panic!("{family_label} hist: {e}"));
-    assert_eq!(
-        hist[0].row_id.0, rid_near,
-        "{family_label}: historical nearest must be near vector"
-    );
-
-    // Update near row to far vector.
-    let _ = table
-        .put(vec![
-            (1, Value::Int64(1)),
+            (1, Value::Int64(update_pk)),
             (2, Value::Embedding(far.clone())),
             (3, Value::Int64(1)),
         ])
-        .expect("update");
+        .expect("update")
+        .0;
+    let seq = model.advance();
+    model.upsert_with_rid(
+        update_pk,
+        vec![
+            (1, ValueRepr::Int(update_pk)),
+            (2, ValueRepr::from_value(&Value::Embedding(far.clone()))),
+            (3, ValueRepr::Int(1)),
+        ],
+        true,
+        new_rid,
+        seq,
+    );
     table.commit().expect("commit2");
-    let current = table.snapshot();
-    let now = table
-        .retrieve_at(&retriever, current, None)
+
+    let model_now = model.snapshot();
+    let engine_now = table.snapshot();
+    let now_hits = table
+        .retrieve_at(&retriever, engine_now, None)
         .unwrap_or_else(|e| panic!("{family_label} now: {e}"));
-    // After update, pk=1 is far; nearest to `near` query may be rid_far
-    // (still far) or the updated pk=1 — either way historical pin must keep
-    // the old near rid visible.
     let hist2 = table
-        .retrieve_at(&retriever, pinned, None)
+        .retrieve_at(&retriever, engine_hist, None)
         .unwrap_or_else(|e| panic!("{family_label} hist2: {e}"));
+    let old_near = historical_rids[0];
     assert!(
-        hist2.iter().any(|h| h.row_id.0 == rid_near),
-        "{family_label}: historical pin must still surface old near rid; got {hist2:?}; current={now:?}"
+        hist2.iter().any(|h| h.row_id.0 == old_near),
+        "{family_label}: historical pin must keep pre-update near rid {old_near}; got {hist2:?}"
+    );
+    // Current must reflect update (old_near no longer live in model).
+    assert!(
+        !model.live_rids(model_now).contains(&old_near),
+        "model current must drop superseded rid"
+    );
+    assert!(
+        !now_hits.iter().any(|h| h.row_id.0 == old_near),
+        "{family_label}: current must not return superseded historical rid"
     );
 
-    // Delete the far live row and re-check historical.
-    table
-        .delete(mongreldb_core::rowid::RowId(rid_far))
-        .expect("delete far");
+    // Delete another historical top candidate.
+    let delete_rid = historical_rids[1];
+    table.delete(RowId(delete_rid)).expect("delete");
+    let seq = model.advance();
+    // model delete by pk=2
+    model.delete(2, seq);
     table.commit().expect("commit3");
     table.flush().expect("flush2");
     let _ = table.compact();
+    model.compact_physical(now_nanos());
+
     let hist3 = table
-        .retrieve_at(&retriever, pinned, None)
+        .retrieve_at(&retriever, engine_hist, None)
         .unwrap_or_else(|e| panic!("{family_label} hist3: {e}"));
     assert!(
-        hist3.iter().any(|h| h.row_id.0 == rid_near),
+        hist3.iter().any(|h| h.row_id.0 == old_near),
         "{family_label}: historical must survive delete/flush/compact"
     );
 
+    // Capture current-only rids for ineligible leak detection after reopen.
+    let current_only: HashSet<u64> = model
+        .live_rids(model.snapshot())
+        .difference(&live_hist)
+        .copied()
+        .collect();
+
     drop(table);
     let mut table = Table::open(&path).expect("reopen");
-    let now = table.snapshot();
-    let after = table
-        .retrieve_at(&retriever, now, None)
-        .unwrap_or_else(|e| panic!("{family_label} reopen: {e}"));
-    // rid_far deleted; should not appear.
+    // Re-query historical pin after reopen (R170-05 — not only current).
+    let hist4 = table
+        .retrieve_at(&retriever, engine_hist, None)
+        .unwrap_or_else(|e| panic!("{family_label} hist post-reopen: {e}"));
+    let mut post_reopen_ineligible = 0usize;
+    for h in &hist4 {
+        if current_only.contains(&h.row_id.0) {
+            post_reopen_ineligible += 1;
+        }
+        if !live_hist.contains(&h.row_id.0) && !hist1_rids.contains(&h.row_id.0) {
+            // Allow historically visible rids; reject pure current-only leaks.
+            if current_only.contains(&h.row_id.0) {
+                post_reopen_ineligible += 1;
+            }
+        }
+    }
+    assert_eq!(
+        post_reopen_ineligible, 0,
+        "{family_label}: current-only rid leaked into historical after reopen: {hist4:?}"
+    );
     assert!(
-        !after.iter().any(|h| h.row_id.0 == rid_far),
+        hist4.iter().any(|h| h.row_id.0 == old_near)
+            || hist4.iter().any(|h| live_hist.contains(&h.row_id.0)),
+        "{family_label}: historical pin empty/wrong after reopen: {hist4:?}"
+    );
+    let now2 = table.snapshot();
+    let after = table
+        .retrieve_at(&retriever, now2, None)
+        .unwrap_or_else(|e| panic!("{family_label} reopen current: {e}"));
+    assert!(
+        !after.iter().any(|h| h.row_id.0 == delete_rid),
         "{family_label}: deleted rid must not reappear after reopen"
     );
+
     let key = family_label.replace(['/', ' '], "_").to_ascii_lowercase();
     emit_oracle_metric(
         &format!("index_churn_oracle::snapshot_history::{key}"),
         serde_json::json!({
             "status": "pass",
-            "historical_ineligible_hits": 0,
+            "historical_recall": hist_recall,
+            "required_recall": floor,
+            "historical_ineligible_hits": historical_ineligible + post_reopen_ineligible,
             "current_ineligible_hits": 0,
             "post_compaction": true,
             "post_reopen": true,
             "family": family_label,
+            "k": k,
+            "corpus": k + 4,
         }),
         "verdict",
     );
@@ -6108,314 +6227,922 @@ fn physical_ttl_reclaim_respects_model_pins() {
     );
 }
 
-/// Ranked eligibility matrix (R170-04): hard-filter, auth, TTL, stale/delete
-/// for Sparse + one ANN backend each path is covered; full matrix via
-/// `ranked_eligibility_matrix` helper.
-fn ranked_eligibility_for_sparse() {
-    let dir = tempdir().expect("tempdir");
-    let mut table = Table::create(dir.path(), SparseFamily::schema(), 1).expect("create");
-    // Higher-score "cold" terms and lower-score "hot" — filter must drop cold.
-    // Sparse score = dot product with query [(1,1),(2,1)].
-    let cold = pack_sparse_bytes(&[(1u32, 10.0), (2u32, 10.0)]);
-    let hot = pack_sparse_bytes(&[(1u32, 1.0), (2u32, 1.0)]);
-    let mut hot_rids = Vec::new();
-    for pk in 1i64..=5 {
-        let rid = table
-            .put(vec![
-                (1, Value::Int64(pk)),
-                (2, Value::Bytes(hot.clone())),
-                (3, Value::Int64(0)),
-            ])
-            .expect("hot");
-        hot_rids.push(rid.0);
-    }
-    for pk in 100i64..=104 {
-        let _ = table
-            .put(vec![
-                (1, Value::Int64(pk)),
-                (2, Value::Bytes(cold.clone())),
-                (3, Value::Int64(0)),
-            ])
-            .expect("cold");
-    }
-    table.commit().expect("commit");
-    table.flush().expect("flush");
-    // Authorization: allow only hot rids.
-    let allowed: HashSet<RowId> = hot_rids.iter().map(|r| RowId(*r)).collect();
-    let retriever = Retriever::Sparse {
-        column_id: 2,
-        query: vec![(1u32, 1.0), (2u32, 1.0)],
-        k: 5,
-    };
-    let hits = table
-        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
-        .expect("auth retrieve");
-    assert_eq!(hits.len(), 5, "auth must return full k from allowed set");
-    for h in &hits {
-        assert!(
-            allowed.contains(&h.row_id),
-            "unauthorized leak: {:?}",
-            h.row_id
-        );
-    }
-    emit_oracle_metric(
-        "index_churn_oracle::eligibility::sparse::authorization",
-        serde_json::json!({
-            "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits.len(),
-            "ineligible_hits": 0,
-            "unauthorized_hits": 0,
-        }),
-        "verdict",
-    );
+// ---------------------------------------------------------------------------
+// R170-04 ranked eligibility matrix — real Bitmap hard-filter, auth, TTL,
+// and stale/delete proofs for every ranked family. No fabricated pass emits.
+// ---------------------------------------------------------------------------
 
-    // Stale/delete: delete all hot scorers; cold remain but are unauthorized.
-    for rid in &hot_rids {
-        table.delete(RowId(*rid)).expect("del");
+fn schema_ann_with_tag(quantization: AnnQuantization, algorithm: AnnAlgorithm, dim: u32) -> Schema {
+    let mut opts = AnnOptions {
+        algorithm,
+        quantization,
+        ..AnnOptions::default()
+    };
+    if algorithm == AnnAlgorithm::Ivf {
+        opts.ivf = Some(mongreldb_core::schema::IvfOptions {
+            nlist: 8,
+            nprobe: 8,
+            ..Default::default()
+        });
     }
-    table.commit().expect("c2");
-    table.flush().expect("f2");
-    let hits2 = table
-        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
-        .expect("stale");
-    assert!(
-        hits2
-            .iter()
-            .all(|h| !hot_rids.contains(&h.row_id.0) || false),
-        "deleted hot rids must not appear"
-    );
-    // After delete, allowed set is all deleted — expect empty or no hot leaks.
-    for h in &hits2 {
-        assert!(
-            !hot_rids.contains(&h.row_id.0),
-            "stale hot rid leaked: {:?}",
-            h.row_id
-        );
+    if algorithm == AnnAlgorithm::DiskAnn {
+        opts.diskann = Some(Default::default());
     }
+    if matches!(quantization, AnnQuantization::Product { .. }) {
+        opts.product = Some(mongreldb_core::schema::ProductQuantizerOptions {
+            rerank_factor: 64,
+            ..Default::default()
+        });
+        opts.m = 24;
+        opts.ef_construction = 128;
+        opts.ef_search = 128;
+    }
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "tag".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "nonce".into(),
+                ty: TypeId::TimestampNanos,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "ann".into(),
+                column_id: 2,
+                kind: IndexKind::Ann,
+                predicate: None,
+                options: IndexOptions {
+                    ann: Some(opts),
+                    ..IndexOptions::default()
+                },
+            },
+            IndexDef {
+                name: "tag_bm".into(),
+                column_id: 3,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+        ],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
+fn schema_sparse_with_tag() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "terms".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "tag".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "nonce".into(),
+                ty: TypeId::TimestampNanos,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "terms_sparse".into(),
+                column_id: 2,
+                kind: IndexKind::Sparse,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+            IndexDef {
+                name: "tag_bm".into(),
+                column_id: 3,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+        ],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
+fn schema_minhash_with_tag() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "members".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "tag".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "nonce".into(),
+                ty: TypeId::TimestampNanos,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "members_mh".into(),
+                column_id: 2,
+                kind: IndexKind::MinHash,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+            IndexDef {
+                name: "tag_bm".into(),
+                column_id: 3,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+        ],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
+fn emit_eligibility(family_key: &str, kind: &str, metric: serde_json::Value) {
     emit_oracle_metric(
-        "index_churn_oracle::eligibility::sparse::stale_delete",
-        serde_json::json!({
-            "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits2.len(),
-            "stale_hits": 0,
-        }),
+        &format!("index_churn_oracle::eligibility::{family_key}::{kind}"),
+        metric,
         "verdict",
     );
 }
 
-fn ranked_eligibility_for_ann(schema: Schema, family_key: &str) {
+fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
     let dir = tempdir().expect("tempdir");
-    let dim = match schema.columns.iter().find(|c| c.id == 2).map(|c| &c.ty) {
-        Some(TypeId::Embedding { dim }) => *dim as usize,
-        _ => 8,
-    };
     let mut table = Table::create(dir.path(), schema, 1).expect("create");
-    let mut near = vec![0.0f32; dim];
-    near[0] = 1.0;
-    let mut far = vec![0.0f32; dim];
-    if dim > 1 {
-        far[1] = 1.0;
-    } else {
-        far[0] = -1.0;
-    }
-    // Live near rows + better-scoring (nearer) rows that we will make ineligible via auth.
-    let mut allowed_rids = Vec::new();
-    for pk in 1i64..=5 {
-        let mut v = near.clone();
-        v[0] = 0.9;
+    let k = 4usize;
+    let mut query = vec![0.0f32; dim];
+    query[0] = 1.0;
+    let hot = b"hot".to_vec();
+    let cold = b"cold".to_vec();
+
+    // --- hard_filter: better-scoring COLD rows + worse HOT rows ---
+    let mut hot_rids = Vec::new();
+    for i in 0..k {
+        let mut emb = vec![0.0f32; dim];
+        emb[0] = 0.85 - (i as f32) * 0.02; // worse than cold
+        if dim > 1 {
+            emb[1] = 0.1;
+        }
+        let n = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        for x in &mut emb {
+            *x /= n;
+        }
         let rid = table
             .put(vec![
-                (1, Value::Int64(pk)),
-                (2, Value::Embedding(v)),
-                (3, Value::Int64(0)),
+                (1, Value::Int64(100 + i as i64)),
+                (2, Value::Embedding(emb)),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
             ])
-            .expect("put allowed");
-        allowed_rids.push(rid.0);
+            .expect("hot")
+            .0;
+        hot_rids.push(rid);
     }
-    let mut disallowed_better = Vec::new();
-    for pk in 100i64..=104 {
+    let mut cold_rids = Vec::new();
+    for i in 0..k {
+        let mut emb = vec![0.0f32; dim];
+        emb[0] = 0.99 - (i as f32) * 0.01; // better than hot
+        let n = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        for x in &mut emb {
+            *x /= n;
+        }
         let rid = table
             .put(vec![
-                (1, Value::Int64(pk)),
-                (2, Value::Embedding(near.clone())),
-                (3, Value::Int64(0)),
+                (1, Value::Int64(200 + i as i64)),
+                (2, Value::Embedding(emb)),
+                (3, Value::Bytes(cold.clone())),
+                (4, Value::Int64(now_nanos())),
             ])
-            .expect("put disallowed better");
-        disallowed_better.push(rid.0);
+            .expect("cold")
+            .0;
+        cold_rids.push(rid);
     }
-    table.commit().expect("commit");
-    table.flush().expect("flush");
-    let allowed: HashSet<RowId> = allowed_rids.iter().map(|r| RowId(*r)).collect();
-    let retriever = Retriever::Ann {
-        column_id: 2,
-        query: near.clone(),
-        k: 5,
+    table.commit().expect("c1");
+    table.flush().expect("f1");
+
+    let req = SearchRequest {
+        must: vec![Condition::BitmapEq {
+            column_id: 3,
+            value: hot.clone(),
+        }],
+        retrievers: vec![NamedRetriever {
+            name: "dense".into(),
+            weight: 1.0,
+            retriever: Retriever::Ann {
+                column_id: 2,
+                query: query.clone(),
+                k,
+            },
+        }],
+        fusion: Fusion::ReciprocalRank { constant: 60 },
+        rerank: None,
+        limit: k,
+        projection: None,
     };
-    let hits = table
-        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
-        .unwrap_or_else(|e| panic!("{family_key} auth: {e}"));
+    let hits = table.search(&req).expect("hard_filter search");
+    let mut ineligible = 0usize;
     for h in &hits {
+        if cold_rids.contains(&h.row_id.0) {
+            ineligible += 1;
+        }
         assert!(
-            allowed.contains(&h.row_id),
-            "{family_key} unauthorized leak {:?}",
+            hot_rids.contains(&h.row_id.0),
+            "{family_key} hard_filter returned non-hot {:?}",
             h.row_id
         );
+    }
+    assert_eq!(
+        ineligible, 0,
+        "{family_key} cold better-scoring rows leaked"
+    );
+    assert_eq!(
+        hits.len(),
+        k,
+        "{family_key} hard_filter expected full k={k}, got {}",
+        hits.len()
+    );
+    emit_eligibility(
+        family_key,
+        "hard_filter",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": hits.len(),
+            "ineligible_hits": ineligible,
+            "cold_better_present": true,
+        }),
+    );
+
+    // --- authorization: disallowed half scores better ---
+    let allowed: HashSet<RowId> = hot_rids.iter().map(|r| RowId(*r)).collect();
+    let retriever = Retriever::Ann {
+        column_id: 2,
+        query: query.clone(),
+        k,
+    };
+    let auth_hits = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .expect("auth");
+    let mut unauthorized = 0usize;
+    for h in &auth_hits {
+        if !allowed.contains(&h.row_id) {
+            unauthorized += 1;
+        }
         assert!(
-            !disallowed_better.contains(&h.row_id.0),
-            "{family_key} better-scoring disallowed row leaked"
+            !cold_rids.contains(&h.row_id.0),
+            "{family_key} better disallowed cold leaked under auth"
         );
     }
-    emit_oracle_metric(
-        &format!("index_churn_oracle::eligibility::{family_key}::authorization"),
+    assert_eq!(unauthorized, 0);
+    assert_eq!(auth_hits.len(), k, "{family_key} auth full k");
+    emit_eligibility(
+        family_key,
+        "authorization",
         serde_json::json!({
             "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits.len(),
-            "unauthorized_hits": 0,
+            "requested_k": k,
+            "actual_count": auth_hits.len(),
+            "unauthorized_hits": unauthorized,
             "ineligible_hits": 0,
         }),
-        "verdict",
     );
 
-    // TTL: set tiny TTL then require no expired hits among results.
-    table.set_ttl("nonce", 1).expect("ttl");
-    // Nonce=0 is ancient → expired.
-    let hits_ttl = table
+    // --- TTL: expired best scorers + live worse ---
+    // Remove prior cold rows so they cannot dominate the TTL top-k.
+    for rid in &cold_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    // 1s TTL: timestamp=1 is always expired; now_nanos live rows remain.
+    const TTL_NANOS: u64 = 1_000_000_000;
+    table.set_ttl("nonce", TTL_NANOS).expect("ttl");
+    let mut expired_rids = Vec::new();
+    for i in 0..k {
+        let mut emb = vec![0.0f32; dim];
+        emb[0] = 1.0; // best scores — must still be excluded when expired
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(300 + i as i64)),
+                (2, Value::Embedding(emb)),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(1)),
+            ])
+            .expect("expired")
+            .0;
+        expired_rids.push(rid);
+    }
+    let mut live_rids = Vec::new();
+    for i in 0..k {
+        let mut emb = vec![0.0f32; dim];
+        emb[0] = 0.7 - (i as f32) * 0.01;
+        if dim > 1 {
+            emb[1] = 0.3;
+        }
+        let n = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        for x in &mut emb {
+            *x /= n;
+        }
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(400 + i as i64)),
+                (2, Value::Embedding(emb)),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("live")
+            .0;
+        live_rids.push(rid);
+    }
+    table.commit().expect("c_ttl");
+    table.flush().expect("f_ttl");
+    let ttl_hits = table
         .retrieve_at(&retriever, table.snapshot(), None)
-        .unwrap_or_else(|e| panic!("{family_key} ttl: {e}"));
-    // All inserted with nonce 0 + 1ns ttl are expired; engine may return empty.
-    emit_oracle_metric(
-        &format!("index_churn_oracle::eligibility::{family_key}::ttl"),
+        .expect("ttl retrieve");
+    let mut expired_hits = 0usize;
+    for h in &ttl_hits {
+        if expired_rids.contains(&h.row_id.0) {
+            expired_hits += 1;
+        }
+    }
+    assert_eq!(
+        expired_hits, 0,
+        "{family_key} expired best scorers must not appear: {ttl_hits:?}"
+    );
+    assert!(
+        ttl_hits.iter().all(|h| !expired_rids.contains(&h.row_id.0)),
+        "{family_key} only non-expired allowed: {ttl_hits:?}"
+    );
+    assert!(
+        ttl_hits
+            .iter()
+            .any(|h| live_rids.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
+        "{family_key} TTL query must return non-expired corpus rows; got {ttl_hits:?}"
+    );
+    assert!(
+        ttl_hits.len() >= k,
+        "{family_key} expected full k live under TTL, got {}",
+        ttl_hits.len()
+    );
+    emit_eligibility(
+        family_key,
+        "ttl",
         serde_json::json!({
             "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits_ttl.len(),
-            "expired_hits": 0,
+            "requested_k": k,
+            "actual_count": ttl_hits.len(),
+            "expired_hits": expired_hits,
+            "live_present": true,
         }),
-        "verdict",
     );
 
-    // Stale delete of allowed set
+    // --- stale/delete: delete previous hot set; must not return those rids ---
     table.clear_ttl().ok();
-    for rid in &allowed_rids {
+    for rid in &hot_rids {
         table.delete(RowId(*rid)).ok();
     }
     table.commit().ok();
     table.flush().ok();
-    let hits_stale = table
-        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+    let stale_hits = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), None, None)
         .unwrap_or_default();
-    for h in &hits_stale {
+    let mut stale = 0usize;
+    for h in &stale_hits {
+        if hot_rids.contains(&h.row_id.0) {
+            stale += 1;
+        }
+    }
+    assert_eq!(
+        stale, 0,
+        "{family_key} deleted hot rids leaked: {stale_hits:?}"
+    );
+    emit_eligibility(
+        family_key,
+        "stale_delete",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": stale_hits.len(),
+            "stale_hits": stale,
+        }),
+    );
+}
+
+fn eligibility_sparse() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), schema_sparse_with_tag(), 1).expect("create");
+    let k = 4usize;
+    let hot = b"hot".to_vec();
+    let cold = b"cold".to_vec();
+    // Query [(1,1),(2,1)]; cold has higher weights (better score) than hot.
+    let cold_terms = pack_sparse_bytes(&[(1u32, 10.0), (2u32, 10.0)]);
+    let hot_terms = pack_sparse_bytes(&[(1u32, 1.0), (2u32, 1.0)]);
+    let mut hot_rids = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(10 + i as i64)),
+                (2, Value::Bytes(hot_terms.clone())),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("hot")
+            .0;
+        hot_rids.push(rid);
+    }
+    let mut cold_rids = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(100 + i as i64)),
+                (2, Value::Bytes(cold_terms.clone())),
+                (3, Value::Bytes(cold.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("cold")
+            .0;
+        cold_rids.push(rid);
+    }
+    table.commit().expect("c");
+    table.flush().expect("f");
+
+    let q = vec![(1u32, 1.0f32), (2u32, 1.0f32)];
+    let req = SearchRequest {
+        must: vec![Condition::BitmapEq {
+            column_id: 3,
+            value: hot.clone(),
+        }],
+        retrievers: vec![NamedRetriever {
+            name: "sp".into(),
+            weight: 1.0,
+            retriever: Retriever::Sparse {
+                column_id: 2,
+                query: q.clone(),
+                k,
+            },
+        }],
+        fusion: Fusion::ReciprocalRank { constant: 60 },
+        rerank: None,
+        limit: k,
+        projection: None,
+    };
+    let hits = table.search(&req).expect("sparse hard_filter");
+    let mut ineligible = 0usize;
+    for h in &hits {
+        if cold_rids.contains(&h.row_id.0) {
+            ineligible += 1;
+        }
         assert!(
-            !allowed_rids.contains(&h.row_id.0),
-            "{family_key} stale deleted rid leaked"
+            hot_rids.contains(&h.row_id.0),
+            "sparse non-hot {:?}",
+            h.row_id
         );
     }
-    emit_oracle_metric(
-        &format!("index_churn_oracle::eligibility::{family_key}::stale_delete"),
+    assert_eq!(ineligible, 0);
+    assert_eq!(hits.len(), k);
+    emit_eligibility(
+        "sparse",
+        "hard_filter",
         serde_json::json!({
             "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits_stale.len(),
-            "stale_hits": 0,
+            "requested_k": k,
+            "actual_count": hits.len(),
+            "ineligible_hits": ineligible,
+            "cold_better_present": true,
         }),
-        "verdict",
     );
 
-    // Hard-filter proxy: only allowed set via auth already proves filter path;
-    // emit hard_filter record for contract completeness (bitmap-less schemas).
-    emit_oracle_metric(
-        &format!("index_churn_oracle::eligibility::{family_key}::hard_filter"),
+    let allowed: HashSet<RowId> = hot_rids.iter().map(|r| RowId(*r)).collect();
+    let retriever = Retriever::Sparse {
+        column_id: 2,
+        query: q.clone(),
+        k,
+    };
+    let auth = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .expect("sparse auth");
+    for h in &auth {
+        assert!(allowed.contains(&h.row_id));
+        assert!(!cold_rids.contains(&h.row_id.0));
+    }
+    assert_eq!(auth.len(), k);
+    emit_eligibility(
+        "sparse",
+        "authorization",
         serde_json::json!({
             "status": "pass",
-            "requested_k": 5,
-            "actual_count": hits.len(),
+            "requested_k": k,
+            "actual_count": auth.len(),
+            "unauthorized_hits": 0,
             "ineligible_hits": 0,
-            "note": "auth-allowed set stands in for bitmap hard-filter on schemas without tag column",
         }),
-        "verdict",
+    );
+
+    // Drop better-scoring cold rows so TTL top-k is decided among hot/expired/live.
+    for rid in &cold_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    const TTL_NANOS: u64 = 1_000_000_000;
+    table.set_ttl("nonce", TTL_NANOS).expect("ttl");
+    let mut expired = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(300 + i as i64)),
+                (
+                    2,
+                    Value::Bytes(pack_sparse_bytes(&[(1u32, 20.0), (2u32, 20.0)])),
+                ),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(1)),
+            ])
+            .expect("exp")
+            .0;
+        expired.push(rid);
+    }
+    let mut live = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(400 + i as i64)),
+                (2, Value::Bytes(hot_terms.clone())),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("live")
+            .0;
+        live.push(rid);
+    }
+    table.commit().ok();
+    table.flush().ok();
+    let ttl_hits = table
+        .retrieve_at(&retriever, table.snapshot(), None)
+        .expect("sparse ttl");
+    let expired_hits = ttl_hits
+        .iter()
+        .filter(|h| expired.contains(&h.row_id.0))
+        .count();
+    assert_eq!(expired_hits, 0, "sparse expired best leaked: {ttl_hits:?}");
+    // Live corpus = original hot (still unexpired) + newly inserted live rows.
+    let non_expired_ok = ttl_hits.iter().all(|h| !expired.contains(&h.row_id.0));
+    assert!(non_expired_ok);
+    assert!(
+        ttl_hits.len() >= k,
+        "sparse TTL full k from live corpus, got {}",
+        ttl_hits.len()
+    );
+    assert!(
+        ttl_hits
+            .iter()
+            .any(|h| live.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
+        "sparse TTL must return non-expired rows: {ttl_hits:?}"
+    );
+    emit_eligibility(
+        "sparse",
+        "ttl",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": ttl_hits.len(),
+            "expired_hits": expired_hits,
+            "live_present": true,
+        }),
+    );
+
+    table.clear_ttl().ok();
+    for rid in &hot_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    table.flush().ok();
+    let stale = table
+        .retrieve_at(&retriever, table.snapshot(), None)
+        .unwrap_or_default();
+    let stale_hits = stale
+        .iter()
+        .filter(|h| hot_rids.contains(&h.row_id.0))
+        .count();
+    assert_eq!(stale_hits, 0, "sparse stale: {stale:?}");
+    emit_eligibility(
+        "sparse",
+        "stale_delete",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": stale.len(),
+            "stale_hits": stale_hits,
+        }),
+    );
+}
+
+fn eligibility_minhash() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), schema_minhash_with_tag(), 1).expect("create");
+    let k = 4usize;
+    let hot = b"hot".to_vec();
+    let cold = b"cold".to_vec();
+    // Query set a,b,c,d — hot rows near-duplicate; cold also near but better overlap
+    // for score, filtered out by bitmap.
+    let mut hot_rids = Vec::new();
+    for i in 0..k {
+        let members = ["a", "b", "c", "d", "x"];
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(10 + i as i64)),
+                (2, minhash_members(&members)),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("hot")
+            .0;
+        hot_rids.push(rid);
+    }
+    let mut cold_rids = Vec::new();
+    for i in 0..k {
+        // Exact match to query set → better Jaccard than hot (hot has noise x).
+        let members = ["a", "b", "c", "d"];
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(100 + i as i64)),
+                (2, minhash_members(&members)),
+                (3, Value::Bytes(cold.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("cold")
+            .0;
+        cold_rids.push(rid);
+    }
+    table.commit().ok();
+    table.flush().ok();
+
+    let members = MinHashFamily::query_set_members();
+    let req = SearchRequest {
+        must: vec![Condition::BitmapEq {
+            column_id: 3,
+            value: hot.clone(),
+        }],
+        retrievers: vec![NamedRetriever {
+            name: "mh".into(),
+            weight: 1.0,
+            retriever: Retriever::MinHash {
+                column_id: 2,
+                members: members.clone(),
+                k,
+            },
+        }],
+        fusion: Fusion::ReciprocalRank { constant: 60 },
+        rerank: None,
+        limit: k,
+        projection: None,
+    };
+    let hits = table.search(&req).expect("mh hard_filter");
+    let mut ineligible = 0usize;
+    for h in &hits {
+        if cold_rids.contains(&h.row_id.0) {
+            ineligible += 1;
+        }
+        assert!(hot_rids.contains(&h.row_id.0), "mh non-hot {:?}", h.row_id);
+    }
+    assert_eq!(ineligible, 0);
+    assert_eq!(hits.len(), k);
+    emit_eligibility(
+        "minhash",
+        "hard_filter",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": hits.len(),
+            "ineligible_hits": ineligible,
+            "cold_better_present": true,
+        }),
+    );
+
+    let allowed: HashSet<RowId> = hot_rids.iter().map(|r| RowId(*r)).collect();
+    let retriever = Retriever::MinHash {
+        column_id: 2,
+        members: members.clone(),
+        k,
+    };
+    let auth = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .expect("mh auth");
+    for h in &auth {
+        assert!(allowed.contains(&h.row_id));
+        assert!(!cold_rids.contains(&h.row_id.0));
+    }
+    assert_eq!(auth.len(), k);
+    emit_eligibility(
+        "minhash",
+        "authorization",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": auth.len(),
+            "unauthorized_hits": 0,
+            "ineligible_hits": 0,
+        }),
+    );
+
+    for rid in &cold_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    const TTL_NANOS: u64 = 1_000_000_000;
+    table.set_ttl("nonce", TTL_NANOS).expect("ttl");
+    let mut expired = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(300 + i as i64)),
+                (2, minhash_members(&["a", "b", "c", "d"])),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(1)),
+            ])
+            .expect("exp")
+            .0;
+        expired.push(rid);
+    }
+    let mut live = Vec::new();
+    for i in 0..k {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(400 + i as i64)),
+                (2, minhash_members(&["a", "b", "c", "x"])),
+                (3, Value::Bytes(hot.clone())),
+                (4, Value::Int64(now_nanos())),
+            ])
+            .expect("live")
+            .0;
+        live.push(rid);
+    }
+    table.commit().ok();
+    table.flush().ok();
+    let ttl_hits = table
+        .retrieve_at(&retriever, table.snapshot(), None)
+        .expect("mh ttl");
+    let expired_hits = ttl_hits
+        .iter()
+        .filter(|h| expired.contains(&h.row_id.0))
+        .count();
+    assert_eq!(expired_hits, 0, "mh expired leaked: {ttl_hits:?}");
+    assert!(ttl_hits.iter().all(|h| !expired.contains(&h.row_id.0)));
+    assert!(
+        ttl_hits
+            .iter()
+            .any(|h| live.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
+        "mh TTL must return non-expired rows: {ttl_hits:?}"
+    );
+    assert!(ttl_hits.len() >= k, "mh TTL full k got {}", ttl_hits.len());
+    emit_eligibility(
+        "minhash",
+        "ttl",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": ttl_hits.len(),
+            "expired_hits": expired_hits,
+            "live_present": true,
+        }),
+    );
+
+    table.clear_ttl().ok();
+    for rid in &hot_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    table.flush().ok();
+    let stale = table
+        .retrieve_at(&retriever, table.snapshot(), None)
+        .unwrap_or_default();
+    let stale_hits = stale
+        .iter()
+        .filter(|h| hot_rids.contains(&h.row_id.0))
+        .count();
+    assert_eq!(stale_hits, 0, "mh stale: {stale:?}");
+    emit_eligibility(
+        "minhash",
+        "stale_delete",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": k,
+            "actual_count": stale.len(),
+            "stale_hits": stale_hits,
+        }),
     );
 }
 
 #[test]
 fn ranked_eligibility_matrix_all_families() {
-    ranked_eligibility_for_sparse();
-    emit_oracle_metric(
-        "index_churn_oracle::eligibility::sparse::hard_filter",
-        serde_json::json!({"status":"pass","requested_k":5,"actual_count":5,"ineligible_hits":0}),
-        "verdict",
-    );
-    emit_oracle_metric(
-        "index_churn_oracle::eligibility::sparse::ttl",
-        serde_json::json!({"status":"pass","requested_k":5,"actual_count":0,"expired_hits":0}),
-        "verdict",
-    );
-    ranked_eligibility_for_ann(
-        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Hnsw),
+    eligibility_sparse();
+    eligibility_minhash();
+    eligibility_ann(
+        schema_ann_with_tag(AnnQuantization::Dense, AnnAlgorithm::Hnsw, 8),
         "ann_hnsw_dense",
+        8,
     );
-    ranked_eligibility_for_ann(
-        families::ann_dense_schema(AnnQuantization::BinarySign, AnnAlgorithm::Hnsw),
+    eligibility_ann(
+        schema_ann_with_tag(AnnQuantization::BinarySign, AnnAlgorithm::Hnsw, 8),
         "ann_hnsw_binary_sign",
+        8,
     );
-    ranked_eligibility_for_ann(families::pq_schema(), "ann_product_quantization");
-    ranked_eligibility_for_ann(
-        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::DiskAnn),
+    eligibility_ann(
+        schema_ann_with_tag(
+            AnnQuantization::Product {
+                num_subvectors: 4,
+                bits: 8,
+            },
+            AnnAlgorithm::Hnsw,
+            16,
+        ),
+        "ann_product_quantization",
+        16,
+    );
+    eligibility_ann(
+        schema_ann_with_tag(AnnQuantization::Dense, AnnAlgorithm::DiskAnn, 8),
         "ann_diskann_dense",
+        8,
     );
-    ranked_eligibility_for_ann(
-        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Ivf),
+    eligibility_ann(
+        schema_ann_with_tag(AnnQuantization::Dense, AnnAlgorithm::Ivf, 8),
         "ann_ivf_dense",
+        8,
     );
-    // MinHash authorization: only allow a subset of members.
-    {
-        let dir = tempdir().expect("td");
-        let mut table = Table::create(dir.path(), MinHashFamily::schema(), 1).expect("c");
-        let mut allowed = HashSet::new();
-        let mut rng = Lcg::new(42);
-        for pk in 1i64..=8 {
-            let set = MinHashFamily::make_set(&mut rng);
-            let rid = table
-                .put(vec![
-                    (1, Value::Int64(pk)),
-                    (2, minhash_members(&set)),
-                    (3, Value::Int64(0)),
-                ])
-                .expect("p")
-                .0;
-            if pk <= 4 {
-                allowed.insert(RowId(rid));
-            }
-        }
-        table.commit().ok();
-        table.flush().ok();
-        let members = MinHashFamily::query_set_members();
-        let retriever = Retriever::MinHash {
-            column_id: 2,
-            members,
-            k: 4,
-        };
-        let hits = table
-            .retrieve_at_with_allowed_and_context(
-                &retriever,
-                table.snapshot(),
-                Some(&allowed),
-                None,
-            )
-            .expect("mh");
-        for h in &hits {
-            assert!(allowed.contains(&h.row_id), "minhash unauthorized leak");
-        }
-        for kind in ["authorization", "hard_filter", "ttl", "stale_delete"] {
-            emit_oracle_metric(
-                &format!("index_churn_oracle::eligibility::minhash::{kind}"),
-                serde_json::json!({"status":"pass","requested_k":4,"actual_count":hits.len(),"ineligible_hits":0}),
-                "verdict",
-            );
-        }
-    }
 }
-
-// Patch historical ANN to emit R170-05 evidence records.
