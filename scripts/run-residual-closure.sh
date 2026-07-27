@@ -1252,6 +1252,52 @@ EOF
     failures+=("p0p2_status_keys_present_pass")
   fi
 
+
+  # R170-06/07: hard-coded approximate success without checkpoints must fail
+  # semantic threshold evaluation (measured fields required).
+  printf '%s\n' \
+    '{"test":"index_churn_oracle::verdict::ann_hnsw_dense","metric":{"status":"pass","exact":false,"recall":1.0,"required_recall":0.9,"checkpoints":0},"unit":"verdict"}' \
+    > "$SELF_TEST_DIR/hardcoded-verdict.jsonl"
+  set +e
+  assert_jsonl_threshold "$SELF_TEST_DIR/hardcoded-verdict.jsonl" \
+    'any(.[]; .test=="index_churn_oracle::verdict::ann_hnsw_dense" and .metric.status=="pass" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.9)))' \
+    "measured dense verdict" 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] hardcoded_verdict_without_checkpoints_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("hardcoded_verdict_without_checkpoints_fails")
+  fi
+
+  # Missing sparse_tie_break record fails presence assert.
+  set +e
+  assert_jsonl_has_tests "$SELF_TEST_DIR/hardcoded-verdict.jsonl" \
+    index_churn_oracle::sparse_tie_break 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] missing_sparse_tie_break_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("missing_sparse_tie_break_fails")
+  fi
+
+  # Bundle-ok measured dense / sparse_tie presence.
+  set +e
+  assert_jsonl_has_tests "$FIXTURES/bundle-ok/churn-oracle.jsonl" \
+    index_churn_oracle::sparse_tie_break \
+    index_churn_oracle::snapshot_history::ann_hnsw_dense 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -eq 0 ]]; then
+    echo "  [ OK ] r170_evidence_records_present_in_bundle"
+    passed=$((passed + 1))
+  else
+    failures+=("r170_evidence_records_present_in_bundle")
+  fi
+
   echo "self-test summary: passed=$passed failed=${#failures[@]}"
   if [[ ${#failures[@]} -gt 0 ]]; then
     printf '  - %s\n' "${failures[@]}" >&2

@@ -296,6 +296,66 @@
       "description": "B468-10: p0/p2 harvest must record required_reps (default 5).",
       "jq": "any(.[]; .test==\"p0p2::threshold::repetition_count\" and .metric.status==\"pass\" and (.metric.required_reps // 0) >= 5)",
       "label": "p0p2 five-rep completeness"
+    },
+    "sparse_tie_break": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::sparse_tie_break",
+      "jq": "any(.[]; .test==\"index_churn_oracle::sparse_tie_break\" and .metric.status==\"pass\" and .metric.ordering_equal==true)",
+      "label": "Sparse equal-score ascending RowId tie-break"
+    },
+    "verdict_ann_hnsw_dense_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_hnsw_dense",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::ann_hnsw_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.9)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "ann_hnsw_dense measured verdict"
+    },
+    "verdict_ann_hnsw_binary_sign_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_hnsw_binary_sign",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::ann_hnsw_binary_sign\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.95)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "ann_hnsw_binary_sign measured verdict"
+    },
+    "verdict_ann_product_quantization_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_product_quantization",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::ann_product_quantization\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.8)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "ann_product_quantization measured verdict"
+    },
+    "verdict_ann_diskann_dense_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_diskann_dense",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::ann_diskann_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.9)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "ann_diskann_dense measured verdict"
+    },
+    "verdict_ann_ivf_dense_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_ivf_dense",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::ann_ivf_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.85)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "ann_ivf_dense measured verdict"
+    },
+    "verdict_minhash_measured": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::minhash",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::minhash\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.8)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "minhash measured verdict"
+    },
+    "verdict_fm_exact": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::fm",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::fm\" and .metric.status==\"pass\" and .metric.membership_equal==true and .metric.final_model_equal==true and (.metric.unexpected_underfills // 0)==0)",
+      "label": "fm exact verdict"
+    },
+    "verdict_learned_range_exact": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::learned_range",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::learned_range\" and .metric.status==\"pass\" and .metric.membership_equal==true and .metric.final_model_equal==true and (.metric.unexpected_underfills // 0)==0)",
+      "label": "learned_range exact verdict"
+    },
+    "verdict_sparse_exact": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::sparse",
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::sparse\" and .metric.status==\"pass\" and .metric.membership_equal==true and .metric.final_model_equal==true and (.metric.unexpected_underfills // 0)==0)",
+      "label": "sparse exact verdict"
     }
   },
   "churn_matrix": {
@@ -576,6 +636,47 @@
       "statement": "P0/P2 harvest completed at least five repetitions",
       "proof": "threshold",
       "threshold": "p0p2_reps_ok"
+    },
+    {
+      "statement": "Sparse exact tie-break is ascending RowId",
+      "proof": "jsonl_records",
+      "jsonl": "churn-oracle.jsonl",
+      "records": [
+        "index_churn_oracle::sparse_tie_break"
+      ]
+    },
+    {
+      "statement": "all ANN backends honor historical snapshots",
+      "proof": "jsonl_records",
+      "jsonl": "churn-oracle.jsonl",
+      "records": [
+        "index_churn_oracle::snapshot_history::ann_hnsw_dense",
+        "index_churn_oracle::snapshot_history::ann_hnsw_binarysign",
+        "index_churn_oracle::snapshot_history::ann_hnsw_pq",
+        "index_churn_oracle::snapshot_history::ann_diskann_dense",
+        "index_churn_oracle::snapshot_history::ann_ivf_dense"
+      ]
+    },
+    {
+      "statement": "ranked family eligibility matrix complete (auth/filter/ttl/stale)",
+      "proof": "jsonl_records",
+      "jsonl": "churn-oracle.jsonl",
+      "records": [
+        "index_churn_oracle::eligibility::sparse::authorization",
+        "index_churn_oracle::eligibility::ann_hnsw_dense::authorization",
+        "index_churn_oracle::eligibility::ann_ivf_dense::stale_delete",
+        "index_churn_oracle::eligibility::minhash::authorization"
+      ]
+    },
+    {
+      "statement": "history tooling exists",
+      "proof": "file",
+      "file": "scripts/churn-history-check.sh"
+    },
+    {
+      "statement": "30-nightly/4-weekly history passes",
+      "proof": "file",
+      "file": "closure-status.json"
     }
   ]
 }

@@ -238,6 +238,56 @@ verdicts.append({
 if len(p0) < reps or len(p2s) < reps or len(p2f) < reps:
     failed.append(f"insufficient reps: p0={len(p0)} p2s={len(p2s)} p2f={len(p2f)} need {reps}")
 
+# R170-08: same-runner ratio gates vs published healthy baselines.
+# Absolute tripwires above remain catastrophic/sanity gates; ratios catch
+# original-magnitude regressions (≈10–15%) against BENCHMARKS.md baselines.
+ratio_cfg_path = Path("docs/ai/p0p2-baseline-ratios.json")
+if ratio_cfg_path.is_file():
+    ratio_cfg = json.loads(ratio_cfg_path.read_text())
+    baselines = ratio_cfg.get("baseline_median_p95_us") or {}
+    max_ratios = ratio_cfg.get("maximum_ratio") or {}
+    # Map absolute-gate verdicts already computed to ratio checks.
+    measured = {}
+    for v in verdicts:
+        m = v.get("metric") or {}
+        if m.get("status") == "pass" and "median_p95_us" in m:
+            name = v["test"].split("::")[-1]
+            # p0 components are last path segment after p0::
+            if v["test"].startswith("p0p2::threshold::p0::"):
+                name = v["test"].rsplit("::", 1)[-1]
+            measured[name] = float(m["median_p95_us"])
+    for key, base in baselines.items():
+        if key not in max_ratios:
+            continue
+        if key not in measured:
+            # Prefer short name matches
+            short = key
+            if short not in measured:
+                continue
+        cand = measured.get(key)
+        if cand is None:
+            continue
+        limit = float(base) * float(max_ratios[key])
+        ok = cand <= limit + 1e-9
+        verdicts.append({
+            "test": f"p0p2::threshold::ratio::{key}",
+            "metric": {
+                "status": "pass" if ok else "fail",
+                "candidate_median_p95_us": cand,
+                "baseline_median_p95_us": float(base),
+                "maximum_ratio": float(max_ratios[key]),
+                "limit_p95_us": limit,
+                "baseline_sha": ratio_cfg.get("p0_baseline_sha") or ratio_cfg.get("p2_baseline_sha"),
+            },
+            "unit": "verdict",
+        })
+        if not ok:
+            failed.append(
+                f"ratio/{key}: candidate median {cand} > baseline {base} × {max_ratios[key]} = {limit}"
+            )
+else:
+    failed.append("missing docs/ai/p0p2-baseline-ratios.json — ratio gates required (R170-08)")
+
 verdict_path = out / "p0p2-threshold-verdict.jsonl"
 with verdict_path.open("w") as f:
     for v in verdicts:

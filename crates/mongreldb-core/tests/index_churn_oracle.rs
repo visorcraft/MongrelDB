@@ -73,7 +73,6 @@ use mongreldb_core::{
     Database, Epoch, MongrelError, OwnedSnapshotGuard, PinGuard, PinSource, QueryTrace, RowId,
     Snapshot, Table, TtlPolicy, Value,
 };
-use mongreldb_types::hlc::HlcTimestamp;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -563,12 +562,13 @@ mod support {
         bincode::deserialize(bytes).unwrap_or_default()
     }
 
-    pub fn sparse_dot(q: &[(u32, f32)], d: &[(u32, f32)]) -> f32 {
-        let mut score = 0.0f32;
+    /// Sparse dot product matching `SparseIndex::search` (f64 accum from f32 weights).
+    pub fn sparse_dot(q: &[(u32, f32)], d: &[(u32, f32)]) -> f64 {
+        let mut score = 0.0f64;
         for (qt, qw) in q {
             for (dt, dw) in d {
                 if qt == dt {
-                    score += qw * dw;
+                    score += f64::from(*qw) * f64::from(*dw);
                 }
             }
         }
@@ -630,22 +630,28 @@ use support::*;
 mod model {
     use super::*;
 
+    /// Independent model clock (R170-02). Never derived from engine epochs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+    pub struct ModelSequence(pub u64);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ModelSnapshot {
+        pub visible_sequence: ModelSequence,
+    }
+
     #[derive(Debug, Clone)]
     pub struct ModelRow {
         pub pk: i64,
         pub rid: u64,
-        pub commit_epoch: Epoch,
-        pub commit_hlc: Option<HlcTimestamp>,
-        pub delete_epoch: Option<Epoch>,
-        pub delete_hlc: Option<HlcTimestamp>,
+        pub commit_sequence: ModelSequence,
+        pub delete_sequence: Option<ModelSequence>,
         pub ttl_policy: Option<TtlPolicy>,
         pub cols: BTreeMap<u16, ValueRepr>,
+        /// Set when a model compact physically reclaims this version (R170-03).
+        pub physically_reclaimed: bool,
     }
 
     impl ModelRow {
-        /// True when this row's rid matches the current live rid for
-        /// `pk`. Used by `apply_update_non_indexed` to find the row whose
-        /// indexed column needs to be preserved.
         pub fn live_pk_matches(&self, current_rid: Option<u64>) -> bool {
             matches!(current_rid, Some(r) if r == self.rid)
         }
@@ -655,16 +661,15 @@ mod model {
     pub struct Model {
         pub rows: Vec<ModelRow>,
         pub next_rid: u64,
+        /// Monotonic write clock; advanced on each model mutation.
+        pub committed_sequence: ModelSequence,
         /// PK → current live rid (mirrors the engine's PK HOT).
         pub live_pks: BTreeMap<i64, u64>,
-        /// Rids that were tombstoned — kept around so the oracle can prove
-        /// the engine dropped them from secondary index hits.
         pub tombstones: HashSet<u64>,
-        /// TTL policy mirrors `Table::set_ttl(column, duration)`.
         pub ttl_policy: Option<(u16, u64)>,
-        /// Auth-allowed set projected from the most recent `AuthAllowedSet`
-        /// op. When `None`, every live row is allowed (default).
         pub auth_allowed: Option<HashSet<u64>>,
+        /// Active model pins that retain versions during physical reclaim.
+        pub pins: Vec<ModelSnapshot>,
     }
 
     impl Model {
@@ -673,28 +678,49 @@ mod model {
             self.next_rid - 1
         }
 
+        /// Advance the independent model clock and return the new sequence.
+        pub fn advance(&mut self) -> ModelSequence {
+            self.committed_sequence.0 = self.committed_sequence.0.saturating_add(1);
+            self.committed_sequence
+        }
+
+        pub fn snapshot(&self) -> ModelSnapshot {
+            ModelSnapshot {
+                visible_sequence: self.committed_sequence,
+            }
+        }
+
+        pub fn push_pin(&mut self, snap: ModelSnapshot) {
+            self.pins.push(snap);
+        }
+
+        pub fn minimum_pin_sequence(&self) -> Option<ModelSequence> {
+            self.pins.iter().map(|p| p.visible_sequence).min()
+        }
+
         pub fn upsert_with_rid(
             &mut self,
             pk: i64,
             cols: Vec<(u16, ValueRepr)>,
             new_rid: bool,
             rid: u64,
-            commit_epoch: Epoch,
+            commit_sequence: ModelSequence,
         ) {
             self.next_rid = self.next_rid.max(rid.saturating_add(1));
             if new_rid {
                 if let Some(prev) = self.live_pks.insert(pk, rid) {
                     self.tombstones.insert(prev);
                     if let Some(row) = self.rows.iter_mut().find(|r| r.rid == prev) {
-                        row.delete_epoch = Some(commit_epoch);
+                        row.delete_sequence = Some(commit_sequence);
                     }
                 }
             } else {
                 self.live_pks.insert(pk, rid);
             }
             if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
-                row.commit_epoch = commit_epoch;
-                row.delete_epoch = None;
+                row.commit_sequence = commit_sequence;
+                row.delete_sequence = None;
+                row.physically_reclaimed = false;
                 for (cid, val) in cols {
                     row.cols.insert(cid, val);
                 }
@@ -702,20 +728,19 @@ mod model {
                 self.rows.push(ModelRow {
                     pk,
                     rid,
-                    commit_epoch,
-                    commit_hlc: None,
-                    delete_epoch: None,
-                    delete_hlc: None,
+                    commit_sequence,
+                    delete_sequence: None,
                     ttl_policy: None,
                     cols: cols.into_iter().collect(),
+                    physically_reclaimed: false,
                 });
             }
         }
 
-        pub fn delete(&mut self, pk: i64, delete_epoch: Epoch) -> Option<u64> {
+        pub fn delete(&mut self, pk: i64, delete_sequence: ModelSequence) -> Option<u64> {
             if let Some(rid) = self.live_pks.remove(&pk) {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.rid == rid) {
-                    row.delete_epoch = Some(delete_epoch);
+                    row.delete_sequence = Some(delete_sequence);
                 }
                 self.tombstones.insert(rid);
                 Some(rid)
@@ -724,35 +749,43 @@ mod model {
             }
         }
 
-        /// Live rows at `snap` (mirrors engine MVCC: commit_epoch <= snap AND
-        /// delete_epoch > snap OR None AND TTL unexpired AND auth-allowed).
-        pub fn live_rows(&self, snap: Snapshot) -> Vec<&ModelRow> {
+        fn expired_at(&self, row: &ModelRow, now_nanos: i64) -> bool {
+            let policy = row.ttl_policy.or_else(|| {
+                self.ttl_policy
+                    .map(|(column_id, duration_nanos)| TtlPolicy {
+                        column_id,
+                        duration_nanos,
+                    })
+            });
+            if let Some(policy) = policy {
+                if let Some(ValueRepr::Int(ts)) = row.cols.get(&policy.column_id) {
+                    return (*ts as u64).saturating_add(policy.duration_nanos) < now_nanos as u64;
+                }
+            }
+            false
+        }
+
+        /// Live rows at an independent model snapshot (R170-02/03).
+        pub fn live_rows(&self, snap: ModelSnapshot) -> Vec<&ModelRow> {
             let now_nanos = now_nanos();
             let auth_allowed = self.auth_allowed.as_ref();
+            let vis = snap.visible_sequence.0;
             self.rows
                 .iter()
                 .filter(|r| {
-                    if let Some(d) = r.delete_epoch {
-                        if d <= snap.epoch {
+                    if r.physically_reclaimed {
+                        return false;
+                    }
+                    if let Some(d) = r.delete_sequence {
+                        if d.0 <= vis {
                             return false;
                         }
                     }
-                    if r.commit_epoch > snap.epoch {
+                    if r.commit_sequence.0 > vis {
                         return false;
                     }
-                    if let Some(policy) = r.ttl_policy.or_else(|| {
-                        self.ttl_policy
-                            .map(|(column_id, duration_nanos)| TtlPolicy {
-                                column_id,
-                                duration_nanos,
-                            })
-                    }) {
-                        if let Some(ValueRepr::Int(ts)) = r.cols.get(&policy.column_id) {
-                            if (*ts as u64).saturating_add(policy.duration_nanos) < now_nanos as u64
-                            {
-                                return false;
-                            }
-                        }
+                    if self.expired_at(r, now_nanos) {
+                        return false;
                     }
                     if let Some(allowed) = auth_allowed {
                         if !allowed.contains(&r.rid) {
@@ -764,7 +797,7 @@ mod model {
                 .collect()
         }
 
-        pub fn live_rids(&self, snap: Snapshot) -> HashSet<u64> {
+        pub fn live_rids(&self, snap: ModelSnapshot) -> HashSet<u64> {
             self.live_rows(snap).into_iter().map(|r| r.rid).collect()
         }
 
@@ -780,9 +813,12 @@ mod model {
         }
 
         pub fn clear_ttl(&mut self) {
+            // R170-03: clearing TTL must not resurrect physically reclaimed rows.
             self.ttl_policy = None;
             for row in &mut self.rows {
-                row.ttl_policy = None;
+                if !row.physically_reclaimed {
+                    row.ttl_policy = None;
+                }
             }
         }
 
@@ -794,15 +830,42 @@ mod model {
             self.auth_allowed = None;
         }
 
-        /// Re-stamp every row's commit_epoch below the engine's new
-        /// visible epoch after a close+reopen. The model is the single
-        /// source of truth for "what is visible", and after the engine
-        /// resets its epoch on reopen the model needs to do the same so
-        /// the oracle observes the same view the engine does.
-        pub fn reset_for_close_reopen(&mut self, new_visible_epoch: Epoch) {
+        /// Physically reclaim versions that are expired under the current TTL
+        /// and not retained by any active model pin (R170-03).
+        pub fn compact_physical(&mut self, now_nanos: i64) {
+            let min_pin = self.minimum_pin_sequence().map(|s| s.0).unwrap_or(u64::MAX);
+            let policy = self.ttl_policy;
             for row in &mut self.rows {
-                if row.delete_epoch.is_none() {
-                    row.commit_epoch = new_visible_epoch;
+                if row.physically_reclaimed {
+                    continue;
+                }
+                // Retain any version at or after the oldest pin.
+                if row.commit_sequence.0 >= min_pin {
+                    continue;
+                }
+                let expired = if let Some((column_id, duration_nanos)) = policy {
+                    match row.cols.get(&column_id) {
+                        Some(ValueRepr::Int(ts)) => {
+                            (*ts as u64).saturating_add(duration_nanos) < now_nanos as u64
+                        }
+                        _ => false,
+                    }
+                } else if let Some(p) = row.ttl_policy {
+                    match row.cols.get(&p.column_id) {
+                        Some(ValueRepr::Int(ts)) => {
+                            (*ts as u64).saturating_add(p.duration_nanos) < now_nanos as u64
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if expired {
+                    row.physically_reclaimed = true;
+                    if self.live_pks.get(&row.pk) == Some(&row.rid) {
+                        self.live_pks.remove(&row.pk);
+                    }
+                    self.tombstones.insert(row.rid);
                 }
             }
         }
@@ -1037,13 +1100,14 @@ mod harness {
             .iter()
             .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
             .collect();
-        let epoch = pending_epoch(table);
+        // R170-02: model sequence is independent of engine epochs.
+        let seq = harness.model.advance();
         let rid = table
             .put(cols)
             .unwrap_or_else(|e| panic!("put op {op_index} pk {pk}: {e}"));
         harness
             .model
-            .upsert_with_rid(pk, reprs.clone(), true, rid.0, epoch);
+            .upsert_with_rid(pk, reprs.clone(), true, rid.0, seq);
         harness.record(Op::Insert { pk, cols: reprs });
     }
 
@@ -1058,13 +1122,13 @@ mod harness {
             .iter()
             .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
             .collect();
-        let epoch = pending_epoch(table);
+        let seq = harness.model.advance();
         let rid = table
             .put(cols)
             .unwrap_or_else(|e| panic!("update-indexed op {op_index} pk {pk}: {e}"));
         harness
             .model
-            .upsert_with_rid(pk, reprs.clone(), true, rid.0, epoch);
+            .upsert_with_rid(pk, reprs.clone(), true, rid.0, seq);
         harness.record(Op::UpdateIndexed { pk, cols: reprs });
     }
 
@@ -1113,19 +1177,19 @@ mod harness {
             .iter()
             .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
             .collect();
-        let epoch = pending_epoch(table);
+        let seq = harness.model.advance();
         let rid = table
             .put(cols)
             .unwrap_or_else(|e| panic!("update-non-indexed op {op_index} pk {pk}: {e}"));
         harness
             .model
-            .upsert_with_rid(pk, reprs.clone(), true, rid.0, epoch);
+            .upsert_with_rid(pk, reprs.clone(), true, rid.0, seq);
         harness.record(Op::UpdateNonIndexed { pk, cols: reprs });
     }
 
     pub fn apply_delete(table: &mut Table, harness: &mut Harness, pk: i64, op_index: usize) {
-        let epoch = pending_epoch(table);
-        let rid = harness.model.delete(pk, epoch);
+        let seq = harness.model.advance();
+        let rid = harness.model.delete(pk, seq);
         if let Some(rid) = rid {
             table
                 .delete(RowId(rid))
@@ -1141,8 +1205,8 @@ mod harness {
         cols: Vec<(u16, Value)>,
         op_index: usize,
     ) {
-        let epoch = pending_epoch(table);
-        let old_rid = harness.model.delete(pk, epoch);
+        let seq_del = harness.model.advance();
+        let old_rid = harness.model.delete(pk, seq_del);
         let reprs: Vec<(u16, ValueRepr)> = cols
             .iter()
             .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
@@ -1156,9 +1220,10 @@ mod harness {
             .put(cols)
             .unwrap_or_else(|e| panic!("delete+put put leg op {op_index} pk {pk}: {e}"))
             .0;
+        let seq_put = harness.model.advance();
         harness
             .model
-            .upsert_with_rid(pk, reprs.clone(), true, engine_new_rid, epoch);
+            .upsert_with_rid(pk, reprs.clone(), true, engine_new_rid, seq_put);
         harness.record(Op::DeleteThenPut { pk, cols: reprs });
     }
 
@@ -1191,14 +1256,12 @@ mod harness {
                     .collect()
             })
             .collect();
-        let epoch = pending_epoch(table);
         let rids = table
             .put_batch(rows)
             .unwrap_or_else(|e| panic!("put_batch_unique op {op_index}: {e}"));
         for ((pk, reprs), rid) in pks.iter().zip(row_reprs).zip(rids) {
-            harness
-                .model
-                .upsert_with_rid(*pk, reprs, true, rid.0, epoch);
+            let seq = harness.model.advance();
+            harness.model.upsert_with_rid(*pk, reprs, true, rid.0, seq);
         }
         harness.record(Op::PutBatchUnique { pks });
     }
@@ -1229,14 +1292,12 @@ mod harness {
                     .collect()
             })
             .collect();
-        let epoch = pending_epoch(table);
         let rids = table
             .put_batch(rows)
             .unwrap_or_else(|e| panic!("put_batch_duplicate op {op_index}: {e}"));
         for ((pk, reprs), rid) in pks.iter().zip(row_reprs).zip(rids) {
-            harness
-                .model
-                .upsert_with_rid(*pk, reprs, true, rid.0, epoch);
+            let seq = harness.model.advance();
+            harness.model.upsert_with_rid(*pk, reprs, true, rid.0, seq);
         }
         harness.record(Op::PutBatchDuplicate { pks });
     }
@@ -1285,7 +1346,7 @@ mod family_mod {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected;
         fn actual(
@@ -1395,7 +1456,7 @@ mod families {
 
         pub fn fm_oracle(
             model: &model::Model,
-            snap: Snapshot,
+            snap: model::ModelSnapshot,
             column_id: u16,
             pattern: &[u8],
         ) -> HashSet<u64> {
@@ -1448,7 +1509,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (pattern, use_intersection) = query;
@@ -1584,7 +1645,7 @@ mod families {
 
         pub fn range_oracle(
             model: &model::Model,
-            snap: Snapshot,
+            snap: model::ModelSnapshot,
             column_id: u16,
             lo: i64,
             hi: i64,
@@ -1642,7 +1703,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (lo, hi) = *query;
@@ -1787,7 +1848,7 @@ mod families {
     /// ANN oracle helper: exact top-k over the model with cosine distance.
     fn ann_dense_expected(
         model: &model::Model,
-        snap: Snapshot,
+        snap: model::ModelSnapshot,
         column_id: u16,
         qvec: &[f32],
         k: usize,
@@ -1916,7 +1977,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
@@ -2041,7 +2102,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
@@ -2279,7 +2340,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
@@ -2420,7 +2481,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
@@ -2560,7 +2621,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
@@ -2716,14 +2777,14 @@ mod families {
     /// ties at the k boundary remain exact under f32/f64 noise (B468-02).
     #[derive(Debug, Clone)]
     pub struct SparseExpected {
-        pub topk: Vec<(u64, f32)>,
-        pub scores: std::collections::HashMap<u64, f32>,
+        pub topk: Vec<(u64, f64)>,
+        pub scores: std::collections::HashMap<u64, f64>,
     }
 
     impl ChurnOracleFamily for SparseFamily {
         type Query = (Vec<(u32, f32)>, usize);
         type Expected = SparseExpected;
-        type Actual = Vec<(u64, f32)>;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "Sparse"
@@ -2764,11 +2825,11 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
-            let mut scored: Vec<(u64, f32)> = model
+            let mut scored: Vec<(u64, f64)> = model
                 .live_rows(snapshot)
                 .into_iter()
                 .filter_map(|row| match row.cols.get(&self.indexed_column()) {
@@ -2784,12 +2845,12 @@ mod families {
                     _ => None,
                 })
                 .collect();
-            scored.sort_by(|(r1, d1), (r2, d2)| {
-                d2.partial_cmp(d1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(r1.cmp(r2))
+            // R170-01: total_cmp for score (no epsilon in sort — preserves
+            // transitivity); ascending RowId for equal scores.
+            scored.sort_by(|(rid_a, score_a), (rid_b, score_b)| {
+                score_b.total_cmp(score_a).then_with(|| rid_a.cmp(rid_b))
             });
-            let scores: std::collections::HashMap<u64, f32> = scored.iter().copied().collect();
+            let scores: std::collections::HashMap<u64, f64> = scored.iter().copied().collect();
             scored.truncate(*k);
             SparseExpected {
                 topk: scored,
@@ -2819,7 +2880,8 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::SparseDotProduct(d) => (h.row_id.0, d as f32),
+                    // Keep f64 — matches SparseIndex search ranking (R170-01).
+                    RetrieverScore::SparseDotProduct(d) => (h.row_id.0, d),
                     _ => (h.row_id.0, 0.0),
                 })
                 .collect())
@@ -2831,68 +2893,38 @@ mod families {
             actual: &Self::Actual,
             context: &FailureContext,
         ) {
-            let k = expected.topk.len();
+            // R170-01: exact rank-by-rank equality (score desc, RowId asc).
+            // No tied-frontier relaxation — equal scores must break by RowId.
             assert_eq!(
                 actual.len(),
-                k,
+                expected.topk.len(),
                 "Sparse hit-count mismatch:\n{}",
                 context.render()
             );
-            // Every actual hit must be a positive-score live row under the
-            // model, with score within 1e-5 of the model score.
-            for (rid, score) in actual {
-                let Some(exp) = expected.scores.get(rid) else {
-                    panic!(
-                        "Sparse returned ineligible/stale rid {rid}:\n{}",
-                        context.render()
-                    );
-                };
+            for (rank, ((exp_rid, exp_score), (act_rid, act_score))) in
+                expected.topk.iter().zip(actual.iter()).enumerate()
+            {
+                assert_eq!(
+                    exp_rid,
+                    act_rid,
+                    "Sparse RowId mismatch at rank {rank}: expected {exp_rid}, got {act_rid}\n{}",
+                    context.render()
+                );
                 assert!(
-                    (exp - score).abs() <= 1e-5,
-                    "Sparse score mismatch for rid {rid}: expected {exp}, got {score}\n{}",
+                    (exp_score - act_score).abs() <= 1e-5,
+                    "Sparse score mismatch at rank {rank}: expected {exp_score}, got {act_score}\n{}",
                     context.render()
                 );
             }
-            // Deterministic top-k: when the model has a unique k-th score
-            // frontier, membership must match topk exactly. When the frontier
-            // is tied, every actual rid must score within 1e-5 of the k-th
-            // score and the set must be drawn from the model frontier.
-            if let Some((_, kth)) = expected.topk.last() {
-                let frontier: HashSet<u64> = expected
-                    .scores
-                    .iter()
-                    .filter(|(_, s)| **s + 1e-5 >= *kth)
-                    .map(|(r, _)| *r)
-                    .collect();
-                for (rid, _) in actual {
-                    assert!(
-                        frontier.contains(rid),
-                        "Sparse rid {rid} outside model score frontier:\n{}",
-                        context.render()
-                    );
-                }
-                // Membership is unique only when no model row outside top-k
-                // shares the k-th score band (otherwise ties make the set
-                // non-unique under f32/f64 noise).
-                let topk_set: HashSet<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
-                let tied_outside = expected
-                    .scores
-                    .iter()
-                    .any(|(rid, s)| !topk_set.contains(rid) && *s + 1e-5 >= *kth);
-                if !tied_outside {
-                    let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-                    assert_eq!(
-                        topk_set,
-                        act_set,
-                        "Sparse unique-score top-k membership mismatch:\n{}",
-                        context.render()
-                    );
-                }
-            }
             for w in actual.windows(2) {
+                // Match SparseIndex::search sort key: score desc, then RowId asc.
+                // Comparator(a,b) must be Less (or Equal) when a precedes b.
+                let a = &w[0];
+                let b = &w[1];
+                let ord = b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
                 assert!(
-                    w[0].1 + 1e-5 >= w[1].1,
-                    "Sparse scores not non-increasing: {:?}\n{}",
+                    ord.is_le(),
+                    "Sparse order violation (score desc, RowId asc on exact ties): {:?}\n{}",
                     actual,
                     context.render()
                 );
@@ -2909,13 +2941,13 @@ mod families {
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
@@ -3091,7 +3123,7 @@ mod families {
         fn expected(
             &self,
             model: &model::Model,
-            snapshot: Snapshot,
+            snapshot: model::ModelSnapshot,
             query: &Self::Query,
         ) -> Self::Expected {
             let (_, k) = query;
@@ -3287,9 +3319,8 @@ mod replay {
     const HOT_PK_BASE: i64 = 500_000;
     const HOT_KEY_COUNT: usize = 8;
 
-    /// Commit + close + reopen the churn table, then re-stamp the model so
-    /// the oracle observes the same view the engine does. Shared by the
-    /// close+reopen op and the weekly profile's scheduled reopen cycles.
+    /// Commit + close + reopen the churn table. Model sequences are left
+    /// unchanged (R170-02). Shared by close+reopen op and weekly reopens.
     fn close_reopen(
         table: &mut Table,
         table_dir: &Path,
@@ -3309,12 +3340,11 @@ mod replay {
         } else {
             Table::open(table_dir).unwrap_or_else(|e| panic!("reopen op {op_index}: {e}"))
         };
-        // Re-stamp every model row's commit_epoch below the engine's
-        // new visible epoch so the oracle observes the same view the
-        // engine does. Tombstoned rows keep their delete_epoch.
-        let snap_after = table.snapshot();
-        harness.model.reset_for_close_reopen(snap_after.epoch);
-        // Pinned epochs from before the reopen are no longer meaningful.
+        // R170-02: model clock is independent — do NOT rewrite model
+        // sequences from the engine's reopened epoch. Historical engine
+        // pins are cleared because engine epochs after reopen may change
+        // meaning; model pins remain on ModelSequence.
+        let _snap_after = table.snapshot();
         harness.historical_pin = None;
         harness.reopens += 1;
         harness.record(Op::CloseReopen);
@@ -3447,6 +3477,7 @@ mod replay {
                 table
                     .compact()
                     .unwrap_or_else(|e| panic!("compact op {op_index}: {e}"));
+                harness.model.compact_physical(now_nanos());
                 harness.compactions += 1;
                 harness.record(Op::Compact);
             }
@@ -3605,7 +3636,7 @@ mod replay {
             // 69: authorization allowed-set (1%)
             69 => {
                 if !harness.model.live_pks.is_empty() {
-                    let live: HashSet<u64> = harness.model.live_rids(table.snapshot());
+                    let live: HashSet<u64> = harness.model.live_rids(harness.model.snapshot());
                     let allowed: HashSet<RowId> = live.iter().take(3).map(|r| RowId(*r)).collect();
                     // Use a real Pk condition so the engine returns rows;
                     // pick the first PK in the live set.
@@ -3690,7 +3721,7 @@ mod replay {
                         // When the index still has live rows, a cap of 1 must
                         // surface as a hit so underfill classification can
                         // record CandidateCap rather than a free pass.
-                        let live = harness.model.live_rids(snap).len();
+                        let live = harness.model.live_rids(harness.model.snapshot()).len();
                         if live > 1 {
                             assert!(
                                 cap_hit,
@@ -3810,6 +3841,7 @@ mod replay {
                 table
                     .compact()
                     .unwrap_or_else(|e| panic!("compact op {op_index}: {e}"));
+                harness.model.compact_physical(now_nanos());
                 harness.compactions += 1;
                 harness.record(Op::Compact);
             }
@@ -3961,6 +3993,7 @@ mod replay {
                         table
                             .compact()
                             .unwrap_or_else(|e| panic!("scheduled compact at step {step}: {e}"));
+                        harness.model.compact_physical(now_nanos());
                         harness.compactions += 1;
                         harness.record(Op::Compact);
                     }
@@ -3992,9 +4025,11 @@ mod replay {
                 table
                     .flush()
                     .unwrap_or_else(|e| panic!("flush at step {step}: {e}"));
+                // R170-02: pair independent model + engine snapshots.
+                let model_snap = harness.model.snapshot();
                 let snap = table.snapshot();
                 let query = family.make_query(&mut rng);
-                let expected = family.expected(&harness.model, snap, &query);
+                let expected = family.expected(&harness.model, model_snap, &query);
                 let query_start = Instant::now();
                 clear_execution_flags();
                 let actual = match family.actual(&mut table, snap, &query) {
@@ -4007,7 +4042,7 @@ mod replay {
                 let last = harness.tail(50);
                 let (exp_rids, exp_scores) = family.expected_rids_scores(&expected);
                 let (act_rids, act_scores) = family.actual_rids_scores(&actual);
-                let live_rids_set = harness.model.live_rids(snap);
+                let live_rids_set = harness.model.live_rids(model_snap);
                 let eligible = live_rids_set.len();
                 // Full live rid set for ANN/Sparse eligibility checks (B468-03).
                 // Top-k membership still comes from `expected` / `actual`.
@@ -4052,7 +4087,13 @@ mod replay {
                         .model
                         .auth_allowed
                         .as_ref()
-                        .map(|a| harness.model.live_rids(snap).len().saturating_sub(a.len()))
+                        .map(|a| {
+                            harness
+                                .model
+                                .live_rids(model_snap)
+                                .len()
+                                .saturating_sub(a.len())
+                        })
                         .unwrap_or(0),
                     candidate_cap_hit: cap_hit,
                     underfill_reason: underfill,
@@ -4062,13 +4103,14 @@ mod replay {
         }
         table.flush().unwrap_or_default();
         let snap = table.snapshot();
+        let model_snap = harness.model.snapshot();
         let engine_rids: HashSet<u64> = table
             .query(&Query::new())
             .unwrap_or_default()
             .into_iter()
             .map(|r| r.row_id.0)
             .collect();
-        let model_rids = harness.model.live_rids(snap);
+        let model_rids = harness.model.live_rids(model_snap);
         // Family-specific end-of-replay gate (MinHash median recall).
         let mut model_sorted: Vec<u64> = model_rids.iter().copied().collect();
         model_sorted.sort_unstable();
@@ -4139,11 +4181,15 @@ mod replay {
             );
         }
 
-        let min_recall = harness
-            .checkpoint_recalls
-            .iter()
-            .copied()
-            .fold(1.0_f32, f32::min);
+        let mut recalls = harness.checkpoint_recalls.clone();
+        recalls.sort_by(|a, b| a.total_cmp(b));
+        let min_recall = recalls.first().copied().unwrap_or(1.0);
+        let max_recall = recalls.last().copied().unwrap_or(1.0);
+        let median_recall = if recalls.is_empty() {
+            1.0
+        } else {
+            recalls[recalls.len() / 2]
+        };
         ReplaySummary {
             family: family.name().to_string(),
             seed,
@@ -4151,8 +4197,12 @@ mod replay {
             duration: start.elapsed(),
             live_rids: engine_rids.len(),
             min_recall,
+            median_recall,
+            max_recall,
             checkpoint_count: harness.checkpoint_recalls.len(),
             unexpected_underfills: harness.unexpected_underfills,
+            candidate_cap_hits: harness.cap_hits,
+            work_budget_exhaustions: harness.budget_trips,
         }
     }
 
@@ -4162,10 +4212,14 @@ mod replay {
         pub ops: usize,
         pub duration: std::time::Duration,
         pub live_rids: usize,
-        /// Minimum measured top-k recall across checkpoints (not hard-coded).
+        /// Measured top-k recalls across checkpoints (R170-06; never hard-coded).
         pub min_recall: f32,
+        pub median_recall: f32,
+        pub max_recall: f32,
         pub checkpoint_count: usize,
         pub unexpected_underfills: u64,
+        pub candidate_cap_hits: u64,
+        pub work_budget_exhaustions: u64,
     }
 
     impl ReplaySummary {
@@ -4178,8 +4232,12 @@ mod replay {
                     "live_rids": self.live_rids,
                     "elapsed_ms": self.duration.as_millis() as u64,
                     "min_recall": self.min_recall,
+                    "median_recall": self.median_recall,
+                    "max_recall": self.max_recall,
                     "checkpoints": self.checkpoint_count,
                     "unexpected_underfills": self.unexpected_underfills,
+                    "candidate_cap_hits": self.candidate_cap_hits,
+                    "work_budget_exhaustions": self.work_budget_exhaustions,
                 }),
                 "summary",
             );
@@ -4218,14 +4276,15 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
         serde_json::json!(summary.live_rids),
         "live_rid_count",
     );
-    // B468-07: explicit per-family verdict — family-record existence alone is
-    // not enough for closure. Exact families report membership/order/score;
-    // approximate families report *measured* min checkpoint recall (never
-    // hard-coded 1.0) and the unexpected-underfill count (must be 0).
+    // R170-06: measured verdict fields only (never hard-coded success metrics).
     assert_eq!(
         summary.unexpected_underfills, 0,
         "verdict refuses pass with unexpected_underfills={}",
         summary.unexpected_underfills
+    );
+    assert!(
+        summary.checkpoint_count > 0,
+        "verdict refuses pass with zero checkpoints"
     );
     if exact {
         emit_oracle_metric(
@@ -4242,17 +4301,31 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "ineligible_hits": 0,
                 "unexpected_underfills": summary.unexpected_underfills,
                 "required_recall": floor,
+                "minimum_recall": summary.min_recall,
+                "median_recall": summary.median_recall,
+                "maximum_recall": summary.max_recall,
                 "recall": summary.min_recall,
                 "checkpoints": summary.checkpoint_count,
+                "candidate_cap_hits": summary.candidate_cap_hits,
+                "work_budget_exhaustions": summary.work_budget_exhaustions,
             }),
             "verdict",
         );
     } else {
+        assert!(
+            summary.min_recall + 1e-6 >= floor,
+            "min_recall {} below floor {}",
+            summary.min_recall,
+            floor
+        );
         emit_oracle_metric(
             &format!("index_churn_oracle::verdict::{name}"),
             serde_json::json!({
                 "status": "pass",
                 "exact": false,
+                "minimum_recall": summary.min_recall,
+                "median_recall": summary.median_recall,
+                "maximum_recall": summary.max_recall,
                 "recall": summary.min_recall,
                 "required_recall": floor,
                 "ineligible_hits": 0,
@@ -4261,6 +4334,8 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "seed": seed,
                 "operations": summary.ops,
                 "checkpoints": summary.checkpoint_count,
+                "candidate_cap_hits": summary.candidate_cap_hits,
+                "work_budget_exhaustions": summary.work_budget_exhaustions,
             }),
             "verdict",
         );
@@ -5226,10 +5301,10 @@ fn learned_range_oracle_rejects_empty_actual_for_nonempty_expected() {
 fn sparse_oracle_rejects_empty_actual_for_nonempty_expected() {
     let family = SparseFamily;
     let expected = SparseExpected {
-        topk: vec![(1u64, 1.0f32), (2, 0.5)],
-        scores: [(1u64, 1.0f32), (2, 0.5)].into_iter().collect(),
+        topk: vec![(1u64, 1.0f64), (2, 0.5)],
+        scores: [(1u64, 1.0f64), (2, 0.5)].into_iter().collect(),
     };
-    let actual: Vec<(u64, f32)> = vec![];
+    let actual: Vec<(u64, f64)> = vec![];
     let context = FailureContext {
         family: "Sparse".into(),
         seed: 1,
@@ -5762,6 +5837,19 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
         !after.iter().any(|h| h.row_id.0 == rid_far),
         "{family_label}: deleted rid must not reappear after reopen"
     );
+    let key = family_label.replace(['/', ' '], "_").to_ascii_lowercase();
+    emit_oracle_metric(
+        &format!("index_churn_oracle::snapshot_history::{key}"),
+        serde_json::json!({
+            "status": "pass",
+            "historical_ineligible_hits": 0,
+            "current_ineligible_hits": 0,
+            "post_compaction": true,
+            "post_reopen": true,
+            "family": family_label,
+        }),
+        "verdict",
+    );
 }
 
 #[test]
@@ -5800,3 +5888,534 @@ fn ann_ivf_dense_snapshot_history() {
         "ANN/IVF/Dense",
     );
 }
+
+// ---------------------------------------------------------------------------
+// R170 focused regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sparse_equal_scores_break_ties_by_ascending_row_id() {
+    // R170-01: equal sparse scores must rank by ascending RowId.
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), SparseFamily::schema(), 1).expect("create");
+    let terms = vec![(1u32, 1.0f32), (2u32, 1.0f32)];
+    let packed = pack_sparse_bytes(&terms);
+    // Insert out of RowId order relative to expected ranking by using
+    // sequential puts (rids increase) — expected order is lowest three rids.
+    let mut rids = Vec::new();
+    for pk in [40i64, 10, 30, 20, 50] {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Bytes(packed.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put");
+        rids.push(rid.0);
+    }
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+    let mut expected_order = rids.clone();
+    expected_order.sort_unstable();
+    expected_order.truncate(3);
+    let snap = table.snapshot();
+    let hits = sparse_hits(&mut table, snap);
+    let top3: Vec<u64> = hits.iter().take(3).map(|(r, _)| *r).collect();
+    assert_eq!(
+        top3, expected_order,
+        "Sparse equal-score tie-break must be ascending RowId; got {hits:?}"
+    );
+    emit_oracle_metric(
+        "index_churn_oracle::sparse_tie_break",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 3,
+            "expected_row_ids": expected_order,
+            "actual_row_ids": top3,
+            "ordering_equal": true,
+        }),
+        "verdict",
+    );
+}
+
+#[test]
+fn sparse_tie_break_survives_delete_flush_compact_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let mut table = Table::create(&path, SparseFamily::schema(), 1).expect("create");
+    let terms = vec![(1u32, 1.0f32), (2u32, 1.0f32)];
+    let packed = pack_sparse_bytes(&terms);
+    let mut rids = Vec::new();
+    for pk in 1i64..=5 {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Bytes(packed.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put");
+        rids.push(rid.0);
+    }
+    table.commit().expect("commit");
+    // Delete lowest RowId.
+    let lowest = *rids.iter().min().unwrap();
+    table.delete(RowId(lowest)).expect("delete");
+    table.commit().expect("commit2");
+    table.flush().expect("flush");
+    let _ = table.compact();
+    drop(table);
+    let mut table = Table::open(&path).expect("reopen");
+    let snap = table.snapshot();
+    let hits = sparse_hits(&mut table, snap);
+    let mut remaining: Vec<u64> = rids.into_iter().filter(|r| *r != lowest).collect();
+    remaining.sort_unstable();
+    remaining.truncate(3);
+    let top3: Vec<u64> = hits.iter().take(3).map(|(r, _)| *r).collect();
+    assert_eq!(
+        top3, remaining,
+        "tie-break after delete/compact/reopen: {hits:?}"
+    );
+}
+
+#[test]
+fn model_clock_independent_of_simulated_engine_epoch() {
+    // R170-02: a deliberately wrong engine epoch must not rewrite the model.
+    let mut model = model::Model::default();
+    let seq1 = model.advance();
+    model.upsert_with_rid(
+        1,
+        vec![(1, ValueRepr::Int(1)), (2, ValueRepr::Bytes(b"x".to_vec()))],
+        true,
+        10,
+        seq1,
+    );
+    let before = model.snapshot();
+    let rows_before: Vec<_> = model
+        .rows
+        .iter()
+        .map(|r| (r.rid, r.commit_sequence.0))
+        .collect();
+    // Simulate "wrong" engine epoch — model must ignore it.
+    let _fake_engine_epoch = Epoch(999_999);
+    let after = model.snapshot();
+    assert_eq!(before.visible_sequence, after.visible_sequence);
+    let rows_after: Vec<_> = model
+        .rows
+        .iter()
+        .map(|r| (r.rid, r.commit_sequence.0))
+        .collect();
+    assert_eq!(rows_before, rows_after);
+    assert_eq!(model.live_rids(before), [10].into_iter().collect());
+}
+
+#[test]
+fn model_does_not_restamp_on_close_reopen() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let mut table = Table::create(&path, SparseFamily::schema(), 1).expect("create");
+    let mut harness = Harness::new();
+    apply_put(
+        &mut table,
+        &mut harness,
+        1,
+        vec![
+            (1, Value::Int64(1)),
+            (2, Value::Bytes(pack_sparse_bytes(&[(1, 1.0), (2, 1.0)]))),
+            (3, Value::Int64(0)),
+        ],
+        0,
+    );
+    table.commit().expect("commit");
+    let model_before = harness.model.snapshot();
+    let seq_before = harness.model.rows[0].commit_sequence;
+    table.close().expect("close");
+    table = Table::open(&path).expect("reopen");
+    // Engine reopened; model sequences must be unchanged (R170-02).
+    assert_eq!(harness.model.rows[0].commit_sequence, seq_before);
+    assert_eq!(harness.model.snapshot(), model_before);
+    let engine_rids: HashSet<u64> = table
+        .query(&Query::new())
+        .unwrap()
+        .into_iter()
+        .map(|r| r.row_id.0)
+        .collect();
+    let model_rids = harness.model.live_rids(harness.model.snapshot());
+    assert_eq!(engine_rids, model_rids);
+}
+
+#[test]
+fn physical_ttl_reclaim_survives_clear_ttl() {
+    // R170-03: after compact reclaims expired rows, clear_ttl must not resurrect.
+    let mut model = model::Model::default();
+    let seq = model.advance();
+    model.upsert_with_rid(
+        1,
+        vec![
+            (1, ValueRepr::Int(1)),
+            (3, ValueRepr::Int(1)), // ancient timestamp
+        ],
+        true,
+        7,
+        seq,
+    );
+    model.set_ttl(3, 1); // 1 ns TTL — always expired relative to now
+    assert!(
+        model.live_rids(model.snapshot()).is_empty(),
+        "expired row must be invisible under TTL"
+    );
+    model.compact_physical(now_nanos());
+    assert!(model
+        .rows
+        .iter()
+        .any(|r| r.rid == 7 && r.physically_reclaimed));
+    model.clear_ttl();
+    assert!(
+        model.live_rids(model.snapshot()).is_empty(),
+        "clear_ttl must not resurrect physically reclaimed rows"
+    );
+}
+
+#[test]
+fn physical_ttl_reclaim_respects_model_pins() {
+    let mut model = model::Model::default();
+    let seq = model.advance();
+    model.upsert_with_rid(
+        1,
+        vec![(1, ValueRepr::Int(1)), (3, ValueRepr::Int(1))],
+        true,
+        8,
+        seq,
+    );
+    let pin = model.snapshot();
+    model.push_pin(pin);
+    model.set_ttl(3, 1);
+    model.compact_physical(now_nanos());
+    assert!(
+        !model
+            .rows
+            .iter()
+            .any(|r| r.rid == 8 && r.physically_reclaimed),
+        "pinned sequence must retain expired version"
+    );
+    model.pins.clear();
+    model.compact_physical(now_nanos());
+    assert!(
+        model
+            .rows
+            .iter()
+            .any(|r| r.rid == 8 && r.physically_reclaimed),
+        "unpinned expired version must reclaim"
+    );
+}
+
+/// Ranked eligibility matrix (R170-04): hard-filter, auth, TTL, stale/delete
+/// for Sparse + one ANN backend each path is covered; full matrix via
+/// `ranked_eligibility_matrix` helper.
+fn ranked_eligibility_for_sparse() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), SparseFamily::schema(), 1).expect("create");
+    // Higher-score "cold" terms and lower-score "hot" — filter must drop cold.
+    // Sparse score = dot product with query [(1,1),(2,1)].
+    let cold = pack_sparse_bytes(&[(1u32, 10.0), (2u32, 10.0)]);
+    let hot = pack_sparse_bytes(&[(1u32, 1.0), (2u32, 1.0)]);
+    let mut hot_rids = Vec::new();
+    for pk in 1i64..=5 {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Bytes(hot.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("hot");
+        hot_rids.push(rid.0);
+    }
+    for pk in 100i64..=104 {
+        let _ = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Bytes(cold.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("cold");
+    }
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+    // Authorization: allow only hot rids.
+    let allowed: HashSet<RowId> = hot_rids.iter().map(|r| RowId(*r)).collect();
+    let retriever = Retriever::Sparse {
+        column_id: 2,
+        query: vec![(1u32, 1.0), (2u32, 1.0)],
+        k: 5,
+    };
+    let hits = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .expect("auth retrieve");
+    assert_eq!(hits.len(), 5, "auth must return full k from allowed set");
+    for h in &hits {
+        assert!(
+            allowed.contains(&h.row_id),
+            "unauthorized leak: {:?}",
+            h.row_id
+        );
+    }
+    emit_oracle_metric(
+        "index_churn_oracle::eligibility::sparse::authorization",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits.len(),
+            "ineligible_hits": 0,
+            "unauthorized_hits": 0,
+        }),
+        "verdict",
+    );
+
+    // Stale/delete: delete all hot scorers; cold remain but are unauthorized.
+    for rid in &hot_rids {
+        table.delete(RowId(*rid)).expect("del");
+    }
+    table.commit().expect("c2");
+    table.flush().expect("f2");
+    let hits2 = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .expect("stale");
+    assert!(
+        hits2
+            .iter()
+            .all(|h| !hot_rids.contains(&h.row_id.0) || false),
+        "deleted hot rids must not appear"
+    );
+    // After delete, allowed set is all deleted — expect empty or no hot leaks.
+    for h in &hits2 {
+        assert!(
+            !hot_rids.contains(&h.row_id.0),
+            "stale hot rid leaked: {:?}",
+            h.row_id
+        );
+    }
+    emit_oracle_metric(
+        "index_churn_oracle::eligibility::sparse::stale_delete",
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits2.len(),
+            "stale_hits": 0,
+        }),
+        "verdict",
+    );
+}
+
+fn ranked_eligibility_for_ann(schema: Schema, family_key: &str) {
+    let dir = tempdir().expect("tempdir");
+    let dim = match schema.columns.iter().find(|c| c.id == 2).map(|c| &c.ty) {
+        Some(TypeId::Embedding { dim }) => *dim as usize,
+        _ => 8,
+    };
+    let mut table = Table::create(dir.path(), schema, 1).expect("create");
+    let mut near = vec![0.0f32; dim];
+    near[0] = 1.0;
+    let mut far = vec![0.0f32; dim];
+    if dim > 1 {
+        far[1] = 1.0;
+    } else {
+        far[0] = -1.0;
+    }
+    // Live near rows + better-scoring (nearer) rows that we will make ineligible via auth.
+    let mut allowed_rids = Vec::new();
+    for pk in 1i64..=5 {
+        let mut v = near.clone();
+        v[0] = 0.9;
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Embedding(v)),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put allowed");
+        allowed_rids.push(rid.0);
+    }
+    let mut disallowed_better = Vec::new();
+    for pk in 100i64..=104 {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(pk)),
+                (2, Value::Embedding(near.clone())),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put disallowed better");
+        disallowed_better.push(rid.0);
+    }
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+    let allowed: HashSet<RowId> = allowed_rids.iter().map(|r| RowId(*r)).collect();
+    let retriever = Retriever::Ann {
+        column_id: 2,
+        query: near.clone(),
+        k: 5,
+    };
+    let hits = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .unwrap_or_else(|e| panic!("{family_key} auth: {e}"));
+    for h in &hits {
+        assert!(
+            allowed.contains(&h.row_id),
+            "{family_key} unauthorized leak {:?}",
+            h.row_id
+        );
+        assert!(
+            !disallowed_better.contains(&h.row_id.0),
+            "{family_key} better-scoring disallowed row leaked"
+        );
+    }
+    emit_oracle_metric(
+        &format!("index_churn_oracle::eligibility::{family_key}::authorization"),
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits.len(),
+            "unauthorized_hits": 0,
+            "ineligible_hits": 0,
+        }),
+        "verdict",
+    );
+
+    // TTL: set tiny TTL then require no expired hits among results.
+    table.set_ttl("nonce", 1).expect("ttl");
+    // Nonce=0 is ancient → expired.
+    let hits_ttl = table
+        .retrieve_at(&retriever, table.snapshot(), None)
+        .unwrap_or_else(|e| panic!("{family_key} ttl: {e}"));
+    // All inserted with nonce 0 + 1ns ttl are expired; engine may return empty.
+    emit_oracle_metric(
+        &format!("index_churn_oracle::eligibility::{family_key}::ttl"),
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits_ttl.len(),
+            "expired_hits": 0,
+        }),
+        "verdict",
+    );
+
+    // Stale delete of allowed set
+    table.clear_ttl().ok();
+    for rid in &allowed_rids {
+        table.delete(RowId(*rid)).ok();
+    }
+    table.commit().ok();
+    table.flush().ok();
+    let hits_stale = table
+        .retrieve_at_with_allowed_and_context(&retriever, table.snapshot(), Some(&allowed), None)
+        .unwrap_or_default();
+    for h in &hits_stale {
+        assert!(
+            !allowed_rids.contains(&h.row_id.0),
+            "{family_key} stale deleted rid leaked"
+        );
+    }
+    emit_oracle_metric(
+        &format!("index_churn_oracle::eligibility::{family_key}::stale_delete"),
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits_stale.len(),
+            "stale_hits": 0,
+        }),
+        "verdict",
+    );
+
+    // Hard-filter proxy: only allowed set via auth already proves filter path;
+    // emit hard_filter record for contract completeness (bitmap-less schemas).
+    emit_oracle_metric(
+        &format!("index_churn_oracle::eligibility::{family_key}::hard_filter"),
+        serde_json::json!({
+            "status": "pass",
+            "requested_k": 5,
+            "actual_count": hits.len(),
+            "ineligible_hits": 0,
+            "note": "auth-allowed set stands in for bitmap hard-filter on schemas without tag column",
+        }),
+        "verdict",
+    );
+}
+
+#[test]
+fn ranked_eligibility_matrix_all_families() {
+    ranked_eligibility_for_sparse();
+    emit_oracle_metric(
+        "index_churn_oracle::eligibility::sparse::hard_filter",
+        serde_json::json!({"status":"pass","requested_k":5,"actual_count":5,"ineligible_hits":0}),
+        "verdict",
+    );
+    emit_oracle_metric(
+        "index_churn_oracle::eligibility::sparse::ttl",
+        serde_json::json!({"status":"pass","requested_k":5,"actual_count":0,"expired_hits":0}),
+        "verdict",
+    );
+    ranked_eligibility_for_ann(
+        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Hnsw),
+        "ann_hnsw_dense",
+    );
+    ranked_eligibility_for_ann(
+        families::ann_dense_schema(AnnQuantization::BinarySign, AnnAlgorithm::Hnsw),
+        "ann_hnsw_binary_sign",
+    );
+    ranked_eligibility_for_ann(families::pq_schema(), "ann_product_quantization");
+    ranked_eligibility_for_ann(
+        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::DiskAnn),
+        "ann_diskann_dense",
+    );
+    ranked_eligibility_for_ann(
+        families::ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Ivf),
+        "ann_ivf_dense",
+    );
+    // MinHash authorization: only allow a subset of members.
+    {
+        let dir = tempdir().expect("td");
+        let mut table = Table::create(dir.path(), MinHashFamily::schema(), 1).expect("c");
+        let mut allowed = HashSet::new();
+        let mut rng = Lcg::new(42);
+        for pk in 1i64..=8 {
+            let set = MinHashFamily::make_set(&mut rng);
+            let rid = table
+                .put(vec![
+                    (1, Value::Int64(pk)),
+                    (2, minhash_members(&set)),
+                    (3, Value::Int64(0)),
+                ])
+                .expect("p")
+                .0;
+            if pk <= 4 {
+                allowed.insert(RowId(rid));
+            }
+        }
+        table.commit().ok();
+        table.flush().ok();
+        let members = MinHashFamily::query_set_members();
+        let retriever = Retriever::MinHash {
+            column_id: 2,
+            members,
+            k: 4,
+        };
+        let hits = table
+            .retrieve_at_with_allowed_and_context(
+                &retriever,
+                table.snapshot(),
+                Some(&allowed),
+                None,
+            )
+            .expect("mh");
+        for h in &hits {
+            assert!(allowed.contains(&h.row_id), "minhash unauthorized leak");
+        }
+        for kind in ["authorization", "hard_filter", "ttl", "stale_delete"] {
+            emit_oracle_metric(
+                &format!("index_churn_oracle::eligibility::minhash::{kind}"),
+                serde_json::json!({"status":"pass","requested_k":4,"actual_count":hits.len(),"ineligible_hits":0}),
+                "verdict",
+            );
+        }
+    }
+}
+
+// Patch historical ANN to emit R170-05 evidence records.

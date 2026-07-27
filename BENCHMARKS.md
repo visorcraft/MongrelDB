@@ -462,3 +462,20 @@ tripwires (fail closed). Each row carries the git SHA envelope plus `rep`.
 Current train label: workspace version at capture time; cite the SHA recorded
 in `commit.txt` of the residual-closure artifact bundle rather than a dirty
 working tree.
+
+
+## R170 evidence status (honest)
+
+- **Measured oracle verdicts**: per-family `index_churn_oracle::verdict::*` records carry
+  `minimum_recall` / `median_recall` / `maximum_recall` / `checkpoints` from the
+  live replay (never hard-coded 1.0 for approximate families).
+- **P0/P2 gates**: absolute tripwires remain catastrophic/sanity gates.
+  Same-runner **ratio** gates in `docs/ai/p0p2-baseline-ratios.json` compare
+  multi-rep candidate medians against published healthy baselines (≈1.10–1.15×).
+- **30-nightly / 4-weekly history**: tooling (`scripts/churn-history-check.sh` +
+  scheduled workflows) is present; calendar accumulation remains **ACCUMULATING**
+  until consecutive scheduled successes exist. Do not treat tooling presence as
+  completed long-duration proof.
+- **Exact-SHA residual-closure workflow**: required for final closure; local
+  self-test + oracle gates are the development bar when the full multi-hour
+  workflow is not dispatched in this environment.
