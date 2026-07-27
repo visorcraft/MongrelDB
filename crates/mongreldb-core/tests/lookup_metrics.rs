@@ -481,6 +481,11 @@ fn primary_key_mismatch_returns_scanned_row_or_empty_not_mapped() {
         1,
         "exactly one fallback must be recorded",
     );
+    emit_metric!(
+        "lookup_metrics::primary_key_mismatch_returns_scanned_row_or_empty_not_mapped",
+        1u64,
+        "count"
+    );
 }
 
 /// Issue 2 — StaleRowId. Map the PK to a superseded old row id; the latest
@@ -526,6 +531,11 @@ fn stale_row_id_maps_to_superseded_but_scanner_returns_current() {
         rids.contains(&current.0),
         "current rid {current:?} must be returned by the scanner, got {rids:?}",
     );
+    emit_metric!(
+        "lookup_metrics::stale_row_id_maps_to_superseded_but_scanner_returns_current",
+        1u64,
+        "count"
+    );
 }
 
 /// Issue 2 — MissingMapping. Drop the current HOT entry; the row still
@@ -565,6 +575,11 @@ fn missing_mapping_fallback_finds_live_row_in_runs() {
             - before.hot_fallback_reasons[REASON_MISSING_MAPPING],
         1,
         "MissingMapping must increment exactly once",
+    );
+    emit_metric!(
+        "lookup_metrics::missing_mapping_fallback_finds_live_row_in_runs",
+        1u64,
+        "count"
     );
 }
 
@@ -608,6 +623,11 @@ fn tombstone_with_replacement_returns_replacement() {
     assert!(
         !rids.contains(&original.0),
         "tombstoned rid={original:?} must not be returned",
+    );
+    emit_metric!(
+        "lookup_metrics::tombstone_with_replacement_returns_replacement",
+        1u64,
+        "count"
     );
 }
 
@@ -686,6 +706,11 @@ fn ttl_expired_returns_no_row_with_ttl_expired_reason() {
             - before.hot_fallback_reasons[REASON_TOMBSTONE],
         0,
         "TTL expiry must not be folded into the generic Tombstone counter",
+    );
+    emit_metric!(
+        "lookup_metrics::ttl_expired_returns_no_row_with_ttl_expired_reason",
+        1u64,
+        "count"
     );
 }
 

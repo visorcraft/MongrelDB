@@ -28,7 +28,8 @@
 #   §13.7  The complete-miss gate reads the JSON metric
 #          point_lookup_directory::complete_miss_opens_zero_readers and
 #          requires metric == 0; it never greps cargo's human output.
-#   §13.8  COMPLETE_MISS_OK / P95_RATIO_OK set overall_status=1 when false,
+#   §13.8  COMPLETE_MISS_OK / P95_RATIO_OK / P0P2_THRESHOLDS_OK / P0P2_REPS_OK
+#          set overall_status=1 when false (evaluated before status/checklist),
 #          and the artifact gate rejects .thresholds.complete_miss_ok /
 #          .thresholds.point_lookup_p95_ratio_ok when not true.
 #   §13.9  The p95 comparison selects target_runs == 1 versus
@@ -526,7 +527,9 @@ validate_closure_status() {
   local thresholds_verdict
   thresholds_verdict="$(jq -r '
       if ((.thresholds.complete_miss_ok == 1 or .thresholds.complete_miss_ok == true)
-          and (.thresholds.point_lookup_p95_ratio_ok == 1 or .thresholds.point_lookup_p95_ratio_ok == true))
+          and (.thresholds.point_lookup_p95_ratio_ok == 1 or .thresholds.point_lookup_p95_ratio_ok == true)
+          and (.thresholds.p0p2_thresholds_ok == 1 or .thresholds.p0p2_thresholds_ok == true)
+          and (.thresholds.p0p2_reps_ok == 1 or .thresholds.p0p2_reps_ok == true))
       then "ok" else "fail" end
     ' "$status_file")"
   if [[ "$thresholds_verdict" != "ok" ]]; then
@@ -1137,6 +1140,118 @@ EOF
     failures+=("future_sha_sidecar_fails")
   fi
 
+
+  # B468-07: family-record existence alone is insufficient — a fixture with
+  # family rows but no verdict:: rows must fail the non-Bitmap checklist claim.
+  printf '%s\n' \
+    '{"test":"index_churn_oracle::family::fm","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::learned_range","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::ann_hnsw_dense","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::ann_hnsw_binary_sign","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::ann_product_quantization","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::ann_diskann_dense","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::ann_ivf_dense","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::sparse","metric":1,"unit":"live_rid_count"}' \
+    '{"test":"index_churn_oracle::family::minhash","metric":1,"unit":"live_rid_count"}' \
+    > "$SELF_TEST_DIR/churn-family-only-proxy.jsonl"
+  set +e
+  assert_jsonl_has_tests "$SELF_TEST_DIR/churn-family-only-proxy.jsonl" \
+    index_churn_oracle::verdict::fm \
+    index_churn_oracle::verdict::ann_hnsw_dense 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] family_record_without_verdict_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("family_record_without_verdict_fails")
+  fi
+  # Compliant fixture with verdicts must pass the same check.
+  set +e
+  assert_jsonl_has_tests "$FIXTURES/churn-families-complete.jsonl" \
+    index_churn_oracle::verdict::fm \
+    index_churn_oracle::verdict::ann_hnsw_dense \
+    index_churn_oracle::verdict::sparse 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -eq 0 ]]; then
+    echo "  [ OK ] verdict_records_present_pass"
+    passed=$((passed + 1))
+  else
+    failures+=("verdict_records_present_pass")
+  fi
+
+  # B468-10: P0/P2 threshold verdict with status=fail must fail closed.
+  set +e
+  assert_jsonl_threshold "$FIXTURES/p0p2-threshold-fail.jsonl" \
+    'all(.[]; .metric.status == "pass")' \
+    "p0p2 multi-rep thresholds pass" 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] p0p2_threshold_status_fail_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_threshold_status_fail_fails")
+  fi
+
+  # B468-10: required_reps < 5 must fail the five-rep completeness gate.
+  set +e
+  assert_jsonl_threshold "$FIXTURES/p0p2-reps-below-5.jsonl" \
+    'any(.[]; .test=="p0p2::threshold::repetition_count" and .metric.status=="pass" and (.metric.required_reps // 0) >= 5)' \
+    "p0p2 five-rep completeness" 2>/dev/null
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] p0p2_reps_below_5_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_reps_below_5_fails")
+  fi
+
+  # B468-10: bundle-ok pass verdicts satisfy both gates.
+  set +e
+  assert_jsonl_threshold "$FIXTURES/bundle-ok/p0p2-threshold-verdict.jsonl" \
+    'all(.[]; .metric.status == "pass")' \
+    "p0p2 multi-rep thresholds pass" 2>/dev/null
+  t_ok=$?
+  assert_jsonl_threshold "$FIXTURES/bundle-ok/p0p2-threshold-verdict.jsonl" \
+    'any(.[]; .test=="p0p2::threshold::repetition_count" and .metric.status=="pass" and (.metric.required_reps // 0) >= 5)' \
+    "p0p2 five-rep completeness" 2>/dev/null
+  r_ok=$?
+  set -e
+  if [[ "$t_ok" -eq 0 && "$r_ok" -eq 0 ]]; then
+    echo "  [ OK ] p0p2_pass_fixture_passes"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_pass_fixture_passes")
+  fi
+
+  # B468-10: closure-status with p0p2_thresholds_ok=0 must fail even when
+  # suites are green and overall claims pass (feeds overall_status/gate).
+  set +e
+  validate_closure_status "$FIXTURES/closure-status-p0p2-false.json" >/dev/null 2>&1
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] p0p2_threshold_false_status_fails"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_threshold_false_status_fails")
+  fi
+
+  # B468-10: complete bundle-ok status (with p0p2 keys true) must validate.
+  set +e
+  validate_closure_status "$FIXTURES/bundle-ok/closure-status.json" >/dev/null 2>&1
+  outcome=$?
+  set -e
+  if [[ "$outcome" -eq 0 ]]; then
+    echo "  [ OK ] p0p2_status_keys_present_pass"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_status_keys_present_pass")
+  fi
+
   echo "self-test summary: passed=$passed failed=${#failures[@]}"
   if [[ ${#failures[@]} -gt 0 ]]; then
     printf '  - %s\n' "${failures[@]}" >&2
@@ -1387,9 +1502,14 @@ jq -n \
   }' >> "$SUITES_JSONL"
 
 # --------------------------------------------------------------------------
-# Cross-suite thresholds (§13.7–§13.9). Both feed overall_status (§13.8).
+# Cross-suite thresholds (§13.7–§13.9 + B468-10). ALL feed overall_status
+# (§13.8) BEFORE closure-status.json and closure-checklist.md are written.
 # --------------------------------------------------------------------------
 COMPLETE_MISS_OK=0
+P95_RATIO_OK=0
+P0P2_THRESHOLDS_OK=0
+P0P2_REPS_OK=0
+
 complete_miss_verdict="$(check_complete_miss "$OUT" || true)"
 if [[ "$complete_miss_verdict" == "pass" ]]; then
   COMPLETE_MISS_OK=1
@@ -1397,7 +1517,6 @@ else
   echo "  [FAIL] complete-miss gate: $complete_miss_verdict" >&2
 fi
 
-P95_RATIO_OK=0
 p95_verdict="$(check_p95_ratio "$OUT" || true)"
 if [[ "$p95_verdict" == "pass" ]]; then
   P95_RATIO_OK=1
@@ -1414,16 +1533,55 @@ if ! jq -e . >/dev/null 2>&1 <<<"$POINT_LOOKUP_MAX_P95_RATIO_USED"; then
   exit 1
 fi
 
-# §13.8: top-level thresholds affect the overall verdict.
+# B468-10: exact-SHA P0/P2 harvest + multi-rep threshold eval (same phase as
+# complete_miss / p95 — never after checklist/status write).
+echo "[*] Exact-SHA P0/P2 harvest (B468-10)"
+if [[ ! -s "$OUT/p0-results.jsonl" \
+   || ! -s "$OUT/p2-standalone-results.jsonl" \
+   || ! -s "$OUT/p2-full-feature-results.jsonl" \
+   || ! -s "$OUT/p0p2-threshold-verdict.jsonl" ]]; then
+  if [[ "${RESIDUAL_CLOSURE_SKIP_P0P2:-0}" == "1" ]]; then
+    echo "RESIDUAL_CLOSURE_SKIP_P0P2=1 but P0/P2 JSONL missing — fail closed" >&2
+    exit 1
+  fi
+  bash "$REPO_ROOT/scripts/run-p0-p2-measurements.sh" "$OUT" \
+    || { echo "P0/P2 harvest failed — fail closed" >&2; exit 1; }
+fi
+if [[ -s "$OUT/p0p2-threshold-verdict.jsonl" ]]; then
+  if assert_jsonl_threshold "$OUT/p0p2-threshold-verdict.jsonl" \
+      'all(.[]; .metric.status == "pass")' \
+      "p0p2 multi-rep thresholds pass"; then
+    P0P2_THRESHOLDS_OK=1
+  else
+    echo "  [FAIL] p0p2 multi-rep thresholds" >&2
+  fi
+  if assert_jsonl_threshold "$OUT/p0p2-threshold-verdict.jsonl" \
+      'any(.[]; .test=="p0p2::threshold::repetition_count" and .metric.status=="pass" and (.metric.required_reps // 0) >= 5)' \
+      "p0p2 five-rep completeness"; then
+    P0P2_REPS_OK=1
+  else
+    echo "  [FAIL] p0p2 five-rep completeness" >&2
+  fi
+else
+  echo "  [FAIL] p0p2-threshold-verdict.jsonl missing" >&2
+fi
+
+# §13.8: every top-level threshold affects the overall verdict.
 if [[ "$COMPLETE_MISS_OK" -ne 1 ]]; then
   overall_status=1
 fi
 if [[ "$P95_RATIO_OK" -ne 1 ]]; then
   overall_status=1
 fi
+if [[ "$P0P2_THRESHOLDS_OK" -ne 1 ]]; then
+  overall_status=1
+fi
+if [[ "$P0P2_REPS_OK" -ne 1 ]]; then
+  overall_status=1
+fi
 
 # --------------------------------------------------------------------------
-# closure-status.json. The exact p95 threshold used is recorded (§13.9).
+# closure-status.json. Records every top-level threshold including B468-10.
 # --------------------------------------------------------------------------
 COMPLETED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -1437,6 +1595,8 @@ jq -s \
   --argjson p95_ratio_ok "$P95_RATIO_OK" \
   --argjson p95_ratio_max "$POINT_LOOKUP_MAX_P95_RATIO_USED" \
   --argjson p95_ratio_observed "$P95_RATIO_OBSERVED" \
+  --argjson p0p2_thresholds_ok "$P0P2_THRESHOLDS_OK" \
+  --argjson p0p2_reps_ok "$P0P2_REPS_OK" \
   --argjson overall_status "$overall_status" \
   '
   {
@@ -1451,7 +1611,9 @@ jq -s \
       complete_miss_ok: $complete_miss_ok,
       point_lookup_256_to_1_p95_ratio: $p95_ratio_max,
       point_lookup_p95_ratio_observed: $p95_ratio_observed,
-      point_lookup_p95_ratio_ok: $p95_ratio_ok
+      point_lookup_p95_ratio_ok: $p95_ratio_ok,
+      p0p2_thresholds_ok: $p0p2_thresholds_ok,
+      p0p2_reps_ok: $p0p2_reps_ok
     },
     overall: (if $overall_status == 0 then "pass" else "fail" end)
   }
@@ -1507,6 +1669,12 @@ checklist_row_mark() {
           ;;
         point_lookup_p95_ratio_ok)
           if [[ "$P95_RATIO_OK" -eq 1 ]]; then echo x; else echo ' '; fi
+          ;;
+        p0p2_all_verdicts_pass)
+          if [[ "${P0P2_THRESHOLDS_OK:-0}" -eq 1 ]]; then echo x; else echo ' '; fi
+          ;;
+        p0p2_reps_ok)
+          if [[ "${P0P2_REPS_OK:-0}" -eq 1 ]]; then echo x; else echo ' '; fi
           ;;
         *)
           echo ' '
@@ -1612,7 +1780,8 @@ checklist_row_proof_detail() {
   echo
   echo "- Status manifest \`closure-status.json\` carries \`overall: pass\` only when"
   echo "  every suite \`exit_code == 0\` AND \`thresholds.complete_miss_ok\` AND"
-  echo "  \`thresholds.point_lookup_p95_ratio_ok\` are all true. The workflow"
+  echo "  \`thresholds.point_lookup_p95_ratio_ok\` AND \`thresholds.p0p2_thresholds_ok\`"
+  echo "  AND \`thresholds.p0p2_reps_ok\` are all true. The workflow"
   echo "  \`final-aggregate\` job requires \`overall == \"pass\"\` before publishing."
   echo "- Exact-SHA verification: \`verify-exact-sha\` job downloads this"
   echo "  artifact bundle, reads \`commit.txt\`, and rejects the bundle if its"

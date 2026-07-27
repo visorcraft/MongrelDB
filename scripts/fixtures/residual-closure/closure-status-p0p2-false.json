@@ -15,11 +15,11 @@
   ],
   "thresholds": {
     "complete_miss_reader_opens": 0,
-    "complete_miss_ok": 0,
+    "complete_miss_ok": 1,
     "point_lookup_256_to_1_p95_ratio": 1.4,
     "point_lookup_p95_ratio_observed": 1.2,
     "point_lookup_p95_ratio_ok": 1,
-    "p0p2_thresholds_ok": 1,
+    "p0p2_thresholds_ok": 0,
     "p0p2_reps_ok": 1
   },
   "overall": "pass"

@@ -1,0 +1,8 @@
+{"test":"p0p2::threshold::p0::put_steady_state_on_reused_table","metric":{"status":"pass","median_p95_us":5.5,"max_p95_us":100.0,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p0::first_put_after_create","metric":{"status":"pass","median_p95_us":18000,"max_p95_us":500000,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p0::commit_fsync","metric":{"status":"pass","median_p95_us":6500,"max_p95_us":50000,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p0::table_create_only","metric":{"status":"pass","median_p95_us":12000,"max_p95_us":500000,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p2_standalone_warm_point_query","metric":{"status":"pass","median_p95_us":1.52,"max_p95_us":50.0,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p2_standalone_loopback_point_query","metric":{"status":"pass","median_p95_us":183.0,"max_p95_us":250000.0,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::p2_full_feature_loopback","metric":{"status":"pass","median_p95_us":143.0,"max_p95_us":250000.0,"reps":5},"unit":"verdict"}
+{"test":"p0p2::threshold::repetition_count","metric":{"status":"pass","p0_records":5,"p2_standalone_records":10,"p2_full_feature_records":5,"required_reps":5},"unit":"verdict"}

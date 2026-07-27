@@ -1,11 +1,17 @@
 {
   "version": 1,
-  "description": "Residual-closure evidence contract (spec §13.3). The single source of truth read by both scripts/run-residual-closure.sh and the final artifact gate. Every required artifact must actually be created by the pipeline (§13.4): suites with proof=cargo_exit require a non-empty log + cargo exit 0 + parsed failed count 0; suites with proof=jsonl additionally require the exact emitted records listed in required_records. No nonexistent JSONL may be required and no missing JSON may be synthesized.",
+  "description": "Residual-closure evidence contract (spec \u00a713.3). The single source of truth read by both scripts/run-residual-closure.sh and the final artifact gate. Every required artifact must actually be created by the pipeline (\u00a713.4): suites with proof=cargo_exit require a non-empty log + cargo exit 0 + parsed failed count 0; suites with proof=jsonl additionally require the exact emitted records listed in required_records. No nonexistent JSONL may be required and no missing JSON may be synthesized.",
   "suites": [
     {
       "name": "point_lookup_directory",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--test", "point_lookup_directory", "--all-features"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "point_lookup_directory",
+        "--all-features"
+      ],
       "jsonl": "point-lookup-directory.jsonl",
       "required_records": [
         "point_lookup_directory::complete_miss_opens_zero_readers"
@@ -14,12 +20,24 @@
     {
       "name": "run_lookup_unit",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--lib", "run_lookup::tests", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--lib",
+        "run_lookup::tests",
+        "--all-features"
+      ]
     },
     {
       "name": "rem001_multi_run_hlc_authority",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--lib", "rem001_multi_run_hlc_authority", "--all-features"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--lib",
+        "rem001_multi_run_hlc_authority",
+        "--all-features"
+      ],
       "required_log_tests": [
         "multi_run_rows_for_rids_uses_hlc_winner_when_epoch_is_inverted",
         "multi_run_projected_column_uses_hlc_winner_when_epoch_is_inverted",
@@ -34,13 +52,27 @@
     {
       "name": "sorted_run_hlc_visibility",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--test", "sorted_run_hlc_visibility", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "sorted_run_hlc_visibility",
+        "--all-features"
+      ]
     },
     {
       "name": "point_lookup_runs",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--release", "--test", "point_lookup_runs"],
-      "test_args": ["--include-ignored"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--release",
+        "--test",
+        "point_lookup_runs"
+      ],
+      "test_args": [
+        "--include-ignored"
+      ],
       "jsonl": "point-lookup-runs.jsonl",
       "required_records": [
         "point_lookup_scaling_with_immutable_run_count",
@@ -56,17 +88,35 @@
     {
       "name": "result_cache_async_persistence",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--test", "result_cache_async_persistence", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "result_cache_async_persistence",
+        "--all-features"
+      ]
     },
     {
       "name": "result_cache_production",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--test", "result_cache_production", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "result_cache_production",
+        "--all-features"
+      ]
     },
     {
       "name": "controlled_scan_streaming",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--test", "controlled_scan_streaming", "--all-features"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "controlled_scan_streaming",
+        "--all-features"
+      ],
       "jsonl": "controlled-scan.jsonl",
       "required_records": [
         "controlled_scan::one_million_row_memtable_yields_ascending_strict_order",
@@ -78,8 +128,16 @@
     {
       "name": "controlled_scan_streaming_release",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--release", "--test", "controlled_scan_streaming"],
-      "test_args": ["--include-ignored"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--release",
+        "--test",
+        "controlled_scan_streaming"
+      ],
+      "test_args": [
+        "--include-ignored"
+      ],
       "jsonl": "controlled-scan-release.jsonl",
       "required_records": [
         "controlled_scan::one_million_row_memtable_yields_ascending_strict_order",
@@ -91,12 +149,24 @@
     {
       "name": "hnsw_connectivity",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--test", "hnsw_connectivity", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "hnsw_connectivity",
+        "--all-features"
+      ]
     },
     {
       "name": "index_churn_oracle",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--test", "index_churn_oracle", "--all-features"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "index_churn_oracle",
+        "--all-features"
+      ],
       "jsonl": "churn-oracle.jsonl",
       "required_records": [
         "index_churn_oracle::family::fm",
@@ -108,34 +178,75 @@
         "index_churn_oracle::family::ann_ivf_dense",
         "index_churn_oracle::family::sparse",
         "index_churn_oracle::family::minhash",
-        "index_churn_oracle::seed_determinism"
-      ]
+        "index_churn_oracle::seed_determinism",
+        "index_churn_oracle::sparse_snapshot_history",
+        "index_churn_oracle::verdict::fm",
+        "index_churn_oracle::verdict::learned_range",
+        "index_churn_oracle::verdict::ann_hnsw_dense",
+        "index_churn_oracle::verdict::ann_hnsw_binary_sign",
+        "index_churn_oracle::verdict::ann_product_quantization",
+        "index_churn_oracle::verdict::ann_diskann_dense",
+        "index_churn_oracle::verdict::ann_ivf_dense",
+        "index_churn_oracle::verdict::sparse",
+        "index_churn_oracle::verdict::minhash"
+      ],
+      "required_thresholds": []
     },
     {
       "name": "lookup_metrics",
       "proof": "jsonl",
-      "command": ["-p", "mongreldb-core", "--test", "lookup_metrics", "--all-features"],
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--test",
+        "lookup_metrics",
+        "--all-features"
+      ],
       "jsonl": "lookup-metrics.jsonl",
       "required_records": [
         "lookup_metrics::healthy_pk_lookup_records_zero_fallback",
         "lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback",
-        "lookup_metrics::snapshot_to_metrics_is_consistent"
+        "lookup_metrics::snapshot_to_metrics_is_consistent",
+        "lookup_metrics::primary_key_mismatch_returns_scanned_row_or_empty_not_mapped",
+        "lookup_metrics::stale_row_id_maps_to_superseded_but_scanner_returns_current",
+        "lookup_metrics::tombstone_with_replacement_returns_replacement",
+        "lookup_metrics::ttl_expired_returns_no_row_with_ttl_expired_reason",
+        "lookup_metrics::historical_snapshot_records_historical_fallback_reason",
+        "lookup_metrics::missing_mapping_fallback_finds_live_row_in_runs"
       ]
     },
     {
       "name": "hot_metrics_export",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-server", "--test", "hot_metrics_export", "--all-features"]
+      "command": [
+        "-p",
+        "mongreldb-server",
+        "--test",
+        "hot_metrics_export",
+        "--all-features"
+      ]
     },
     {
       "name": "full_core_tests",
       "proof": "cargo_exit",
-      "command": ["-p", "mongreldb-core", "--tests", "--all-features", "--lib"]
+      "command": [
+        "-p",
+        "mongreldb-core",
+        "--tests",
+        "--all-features",
+        "--lib"
+      ]
     },
     {
       "name": "full_workspace_tests",
       "proof": "cargo_exit",
-      "command": ["--workspace", "--all-features", "--exclude", "mongreldb-perf", "--tests"]
+      "command": [
+        "--workspace",
+        "--all-features",
+        "--exclude",
+        "mongreldb-perf",
+        "--tests"
+      ]
     }
   ],
   "thresholds": {
@@ -144,7 +255,7 @@
       "record": "point_lookup_directory::complete_miss_opens_zero_readers",
       "expect": 0,
       "status_key": "complete_miss_ok",
-      "description": "Opened-reader delta for a complete directory miss must be exactly 0 (spec §13.7), read from the JSON emission, never from a grep of cargo output."
+      "description": "Opened-reader delta for a complete directory miss must be exactly 0 (spec \u00a713.7), read from the JSON emission, never from a grep of cargo output."
     },
     "point_lookup_p95_ratio": {
       "jsonl": "point-lookup-runs.jsonl",
@@ -155,32 +266,103 @@
       "default_max_ratio": 1.4,
       "status_key": "point_lookup_p95_ratio_ok",
       "label_key": "point_lookup_256_to_1_p95_ratio",
-      "description": "p95(256 runs) / p95(1 run) must be <= the threshold (spec §13.9). Fails closed when either sample is absent; no jq // defaults may mask missing data. The exact threshold used is recorded in closure-status.json."
+      "description": "p95(256 runs) / p95(1 run) must be <= the threshold (spec \u00a713.9). Fails closed when either sample is absent; no jq // defaults may mask missing data. The exact threshold used is recorded in closure-status.json."
+    },
+    "ann_hnsw_dense_verdict": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::ann_hnsw_dense",
+      "status_key": "ann_hnsw_dense_verdict_ok",
+      "description": "ANN HNSW Dense verdict must pass with recall >= required_recall and ineligible_hits == 0 (B468-07).",
+      "jq": "(.[] | select(.test==\"index_churn_oracle::verdict::ann_hnsw_dense\") | .metric | (.status == \"pass\" and .ineligible_hits == 0 and (.recall // 1) >= .required_recall))"
+    },
+    "exact_family_verdicts": {
+      "jsonl": "churn-oracle.jsonl",
+      "record": "index_churn_oracle::verdict::fm",
+      "status_key": "exact_family_verdicts_ok",
+      "description": "Exact family verdicts must report membership/ordering/score equality (B468-07).",
+      "jq": "all(.[] | select(.test|startswith(\"index_churn_oracle::verdict::\")); (.metric.status == \"pass\"))"
+    },
+    "p0p2_all_verdicts_pass": {
+      "jsonl": "p0p2-threshold-verdict.jsonl",
+      "status_key": "p0p2_thresholds_ok",
+      "description": "B468-10: every multi-rep P0/P2 threshold verdict must have status=pass (5-rep medians).",
+      "jq": "all(.[]; .metric.status == \"pass\")",
+      "label": "p0p2 multi-rep thresholds pass"
+    },
+    "p0p2_repetition_count": {
+      "jsonl": "p0p2-threshold-verdict.jsonl",
+      "record": "p0p2::threshold::repetition_count",
+      "status_key": "p0p2_reps_ok",
+      "description": "B468-10: p0/p2 harvest must record required_reps (default 5).",
+      "jq": "any(.[]; .test==\"p0p2::threshold::repetition_count\" and .metric.status==\"pass\" and (.metric.required_reps // 0) >= 5)",
+      "label": "p0p2 five-rep completeness"
     }
   },
   "churn_matrix": {
-    "seeds": [1, 2, 3, 4, 5, 6, 7, 8],
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
     "operations_env": "MONGRELDB_ORACLE_OPERATIONS",
     "seed_env": "MONGRELDB_ORACLE_SEED",
     "default_operations": 500,
     "matrix_file": "churn-oracle-matrix.jsonl",
     "seed_log_pattern": "churn-oracle-seed-<seed>.log",
-    "command": ["-p", "mongreldb-core", "--test", "index_churn_oracle", "--all-features"],
+    "command": [
+      "-p",
+      "mongreldb-core",
+      "--test",
+      "index_churn_oracle",
+      "--all-features"
+    ],
     "families": [
-      {"record": "index_churn_oracle::family::fm", "name": "FM"},
-      {"record": "index_churn_oracle::family::learned_range", "name": "LearnedRange"},
-      {"record": "index_churn_oracle::family::ann_hnsw_dense", "name": "AnnHnswDense"},
-      {"record": "index_churn_oracle::family::ann_hnsw_binary_sign", "name": "AnnHnswBinarySign"},
-      {"record": "index_churn_oracle::family::ann_product_quantization", "name": "AnnPQ"},
-      {"record": "index_churn_oracle::family::ann_diskann_dense", "name": "DiskANN"},
-      {"record": "index_churn_oracle::family::ann_ivf_dense", "name": "IVF"},
-      {"record": "index_churn_oracle::family::sparse", "name": "Sparse"},
-      {"record": "index_churn_oracle::family::minhash", "name": "MinHash"}
+      {
+        "record": "index_churn_oracle::family::fm",
+        "name": "FM"
+      },
+      {
+        "record": "index_churn_oracle::family::learned_range",
+        "name": "LearnedRange"
+      },
+      {
+        "record": "index_churn_oracle::family::ann_hnsw_dense",
+        "name": "AnnHnswDense"
+      },
+      {
+        "record": "index_churn_oracle::family::ann_hnsw_binary_sign",
+        "name": "AnnHnswBinarySign"
+      },
+      {
+        "record": "index_churn_oracle::family::ann_product_quantization",
+        "name": "AnnPQ"
+      },
+      {
+        "record": "index_churn_oracle::family::ann_diskann_dense",
+        "name": "DiskANN"
+      },
+      {
+        "record": "index_churn_oracle::family::ann_ivf_dense",
+        "name": "IVF"
+      },
+      {
+        "record": "index_churn_oracle::family::sparse",
+        "name": "Sparse"
+      },
+      {
+        "record": "index_churn_oracle::family::minhash",
+        "name": "MinHash"
+      }
     ],
     "extra_required_records": [
       "index_churn_oracle::seed_determinism"
     ],
-    "description": "One summary object per seed (spec §13.10): {seed, status, families_seen}. A seed fails when its exit code is nonzero, any required family is absent, any family metric says failure (metric == false, ok == false, or status == \"fail\"), or a harvested line is malformed JSON."
+    "description": "One summary object per seed (spec \u00a713.10): {seed, status, families_seen}. A seed fails when its exit code is nonzero, any required family is absent, any family metric says failure (metric == false, ok == false, or status == \"fail\"), or a harvested line is malformed JSON."
   },
   "core_artifacts": [
     "commit.txt",
@@ -189,7 +371,11 @@
     "closure-status.json",
     "closure-checklist.md",
     "churn-oracle-matrix.jsonl",
-    "hot-metrics-sample.txt"
+    "hot-metrics-sample.txt",
+    "p0-results.jsonl",
+    "p2-standalone-results.jsonl",
+    "p2-full-feature-results.jsonl",
+    "p0p2-threshold-verdict.jsonl"
   ],
   "checklist": [
     {
@@ -211,13 +397,19 @@
       "statement": "HOT mismatch never returns the mismatched row",
       "proof": "jsonl_records",
       "jsonl": "lookup-metrics.jsonl",
-      "records": ["lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback"]
+      "records": [
+        "lookup_metrics::primary_key_mismatch_returns_scanned_row_or_empty_not_mapped"
+      ]
     },
     {
       "statement": "HOT failures execute the real fallback",
       "proof": "jsonl_records",
       "jsonl": "lookup-metrics.jsonl",
-      "records": ["lookup_metrics::healthy_pk_lookup_records_zero_fallback"]
+      "records": [
+        "lookup_metrics::stale_row_id_maps_to_superseded_but_scanner_returns_current",
+        "lookup_metrics::tombstone_with_replacement_returns_replacement",
+        "lookup_metrics::missing_mapping_fallback_finds_live_row_in_runs"
+      ]
     },
     {
       "statement": "HNSW nodes remain reachable",
@@ -229,21 +421,27 @@
       "proof": "jsonl_records",
       "jsonl": "churn-oracle.jsonl",
       "records": [
-        "index_churn_oracle::family::fm",
-        "index_churn_oracle::family::learned_range",
-        "index_churn_oracle::family::ann_hnsw_dense",
-        "index_churn_oracle::family::ann_hnsw_binary_sign",
-        "index_churn_oracle::family::ann_product_quantization",
-        "index_churn_oracle::family::ann_diskann_dense",
-        "index_churn_oracle::family::ann_ivf_dense",
-        "index_churn_oracle::family::sparse",
-        "index_churn_oracle::family::minhash"
+        "index_churn_oracle::verdict::fm",
+        "index_churn_oracle::verdict::learned_range",
+        "index_churn_oracle::verdict::ann_hnsw_dense",
+        "index_churn_oracle::verdict::ann_hnsw_binary_sign",
+        "index_churn_oracle::verdict::ann_product_quantization",
+        "index_churn_oracle::verdict::ann_diskann_dense",
+        "index_churn_oracle::verdict::ann_ivf_dense",
+        "index_churn_oracle::verdict::sparse",
+        "index_churn_oracle::verdict::minhash"
       ]
     },
     {
       "statement": "no stale/deleted/expired/unauthorized row is returned",
-      "proof": "suite_exit",
-      "suite": "point_lookup_directory"
+      "proof": "jsonl_records",
+      "jsonl": "churn-oracle.jsonl",
+      "records": [
+        "index_churn_oracle::verdict::ann_hnsw_dense",
+        "index_churn_oracle::verdict::sparse",
+        "index_churn_oracle::verdict::minhash",
+        "index_churn_oracle::sparse_snapshot_history"
+      ]
     },
     {
       "statement": "complete directory miss opens zero run readers",
@@ -274,31 +472,41 @@
       "statement": "memtable scan yields ascending strict order",
       "proof": "jsonl_records",
       "jsonl": "controlled-scan.jsonl",
-      "records": ["controlled_scan::one_million_row_memtable_yields_ascending_strict_order"]
+      "records": [
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order"
+      ]
     },
     {
       "statement": "mutable run yields ascending strict order",
       "proof": "jsonl_records",
       "jsonl": "controlled-scan.jsonl",
-      "records": ["controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order"]
+      "records": [
+        "controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order"
+      ]
     },
     {
       "statement": "dense single-row history streams",
       "proof": "jsonl_records",
       "jsonl": "controlled-scan.jsonl",
-      "records": ["controlled_scan::dense_single_row_history_streams"]
+      "records": [
+        "controlled_scan::dense_single_row_history_streams"
+      ]
     },
     {
       "statement": "memtable cursor does not precollect every version",
       "proof": "jsonl_records",
       "jsonl": "controlled-scan.jsonl",
-      "records": ["controlled_scan::memtable_cursor_does_not_precollect_every_version"]
+      "records": [
+        "controlled_scan::memtable_cursor_does_not_precollect_every_version"
+      ]
     },
     {
       "statement": "HOT reason sum equals fallback total",
       "proof": "jsonl_records",
       "jsonl": "lookup-metrics.jsonl",
-      "records": ["lookup_metrics::snapshot_to_metrics_is_consistent"]
+      "records": [
+        "lookup_metrics::snapshot_to_metrics_is_consistent"
+      ]
     },
     {
       "statement": "metrics are exported",
@@ -338,6 +546,36 @@
       "statement": "final checklist exists",
       "proof": "file",
       "file": "closure-checklist.md"
+    },
+    {
+      "statement": "churn history tooling and schema exist (30 nightly / 4 weekly accumulation is operational residual)",
+      "proof": "file",
+      "file": "scripts/churn-history-check.sh"
+    },
+    {
+      "statement": "exact-SHA P0/P2 five-rep harvest artifacts are present",
+      "proof": "file",
+      "file": "p0-results.jsonl"
+    },
+    {
+      "statement": "P2 standalone five-rep results present",
+      "proof": "file",
+      "file": "p2-standalone-results.jsonl"
+    },
+    {
+      "statement": "P2 full-feature five-rep results present",
+      "proof": "file",
+      "file": "p2-full-feature-results.jsonl"
+    },
+    {
+      "statement": "P0/P2 multi-rep machine thresholds all pass",
+      "proof": "threshold",
+      "threshold": "p0p2_all_verdicts_pass"
+    },
+    {
+      "statement": "P0/P2 harvest completed at least five repetitions",
+      "proof": "threshold",
+      "threshold": "p0p2_reps_ok"
     }
   ]
 }

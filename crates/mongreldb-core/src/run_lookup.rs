@@ -156,6 +156,10 @@ impl RunLookupDirectory {
     /// Insert or replace a `RunLocator` for `row_id`. Locators are kept
     /// newest-first; the most recent write wins for ties.
     pub fn insert(&mut self, row_id: RowId, locator: RunLocator) {
+        debug_assert!(
+            locator.validate_metadata().is_ok(),
+            "RunLookupDirectory::insert with invalid locator: {locator:?}"
+        );
         let entry = self.postings.entry(row_id).or_default();
         // Newest-first: locate the first locator whose `max_epoch`/`max_hlc`
         // is older than the new one and insert before it. Falls back to
@@ -408,14 +412,21 @@ impl RunLookupDirectory {
                 }
                 let contains_unstamped = cursor[0] != 0;
                 cursor = &cursor[1..];
-                list.locators.push(RunLocator {
+                let locator = RunLocator {
                     run_id,
                     min_epoch: Epoch(min_epoch),
                     max_epoch: Epoch(max_epoch),
                     min_hlc,
                     max_hlc,
                     contains_unstamped_versions: contains_unstamped,
-                });
+                };
+                if let Err(err) = locator.validate_metadata() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("run-lookup locator metadata invalid: {err:?}"),
+                    ));
+                }
+                list.locators.push(locator);
             }
             postings.insert(RowId(cur), list);
             prev = cur;
@@ -742,14 +753,21 @@ fn read_single_shard(path: &Path, fingerprint: u64) -> io::Result<BTreeMap<RowId
             }
             let contains_unstamped = cursor[0] != 0;
             cursor = &cursor[1..];
-            list.locators.push(RunLocator {
+            let locator = RunLocator {
                 run_id,
                 min_epoch: Epoch(min_epoch),
                 max_epoch: Epoch(max_epoch),
                 min_hlc,
                 max_hlc,
                 contains_unstamped_versions: contains_unstamped,
-            });
+            };
+            if let Err(err) = locator.validate_metadata() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("run-lookup locator metadata invalid: {err:?}"),
+                ));
+            }
+            list.locators.push(locator);
         }
         postings.insert(RowId(cur), list);
         prev = cur;
@@ -863,7 +881,42 @@ fn locator_is_newer(newer: RunLocator, older: RunLocator) -> bool {
     }
 }
 
+/// Why a [`RunLocator`]'s metadata is contradictory or incomplete (B468-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunLocatorMetadataError {
+    MinEpochAfterMaxEpoch,
+    PartialHlcEnvelope,
+    MinHlcAfterMaxHlc,
+    EmptyVersionEnvelope,
+}
+
 impl RunLocator {
+    /// Validate locator metadata invariants (B468-08).
+    ///
+    /// - `min_epoch <= max_epoch`
+    /// - HLC bounds are both present or both absent
+    /// - when both present: `min_hlc <= max_hlc`
+    /// - when both absent: `contains_unstamped_versions` must be true
+    pub fn validate_metadata(&self) -> std::result::Result<(), RunLocatorMetadataError> {
+        if self.min_epoch > self.max_epoch {
+            return Err(RunLocatorMetadataError::MinEpochAfterMaxEpoch);
+        }
+        match (self.min_hlc, self.max_hlc) {
+            (Some(min), Some(max)) => {
+                if min > max {
+                    return Err(RunLocatorMetadataError::MinHlcAfterMaxHlc);
+                }
+            }
+            (None, None) => {
+                if !self.contains_unstamped_versions {
+                    return Err(RunLocatorMetadataError::EmptyVersionEnvelope);
+                }
+            }
+            _ => return Err(RunLocatorMetadataError::PartialHlcEnvelope),
+        }
+        Ok(())
+    }
+
     /// `true` when this locator *cannot* contain a version visible to
     /// `snapshot`. Conservative: when in doubt, return `false` so the caller
     /// opens the run. The proof is split into the stamped and unstamped
@@ -874,7 +927,12 @@ impl RunLocator {
     ///   can span the snapshot and still host an older visible version);
     /// - an unstamped version may be visible when the locator's minimum
     ///   epoch is at or below the snapshot epoch.
+    ///
+    /// Contradictory/malformed metadata never proves impossibility (B468-08).
     pub fn is_impossible_for(&self, snapshot: Snapshot) -> bool {
+        if self.validate_metadata().is_err() {
+            return false;
+        }
         let stamped_possible = self.may_have_visible_stamped_version(snapshot);
         let unstamped_possible = self.may_have_visible_unstamped_version(snapshot);
 
@@ -1088,17 +1146,25 @@ pub fn rebuild_from_runs_system_only(runs: &[RunRef], table: &Table) -> Result<R
             Ok(())
         })?;
         for (row_id, (min_epoch, max_epoch, min_hlc, max_hlc, contains_unstamped)) in per_row {
-            dir.insert(
-                row_id,
-                RunLocator {
-                    run_id: run_ref.run_id,
-                    min_epoch,
-                    max_epoch,
-                    min_hlc,
-                    max_hlc,
-                    contains_unstamped_versions: contains_unstamped,
-                },
+            let locator = RunLocator {
+                run_id: run_ref.run_id,
+                min_epoch,
+                max_epoch,
+                min_hlc,
+                max_hlc,
+                contains_unstamped_versions: contains_unstamped,
+            };
+            // B468-08 §12.5: builder must not emit contradictory metadata.
+            debug_assert!(
+                locator.validate_metadata().is_ok(),
+                "rebuild_from_runs_system_only produced invalid locator: {locator:?}"
             );
+            if let Err(err) = locator.validate_metadata() {
+                return Err(crate::error::MongrelError::InvalidArgument(format!(
+                    "run-lookup builder emitted invalid locator metadata: {err:?}"
+                )));
+            }
+            dir.insert(row_id, locator);
         }
     }
     Ok(dir)
@@ -1753,6 +1819,134 @@ mod tests {
         assert!(
             !unstamped.can_contain_version_newer_than(stamped_best, epoch_snap),
             "equal epoch is not strictly newer on the unstamped path"
+        );
+    }
+
+    #[test]
+    fn missing_hlc_and_not_unstamped_is_conservative_for_is_impossible() {
+        let snap = Snapshot::at(Epoch(20));
+        let bad = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(1),
+            max_epoch: Epoch(10),
+            min_hlc: None,
+            max_hlc: None,
+            contains_unstamped_versions: false,
+        };
+        assert!(bad.validate_metadata().is_err());
+        assert!(
+            !bad.is_impossible_for(snap),
+            "contradictory empty envelope must open the run"
+        );
+    }
+
+    #[test]
+    fn only_min_hlc_present_is_rejected() {
+        let loc = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(1),
+            max_epoch: Epoch(2),
+            min_hlc: Some(hlc_from_phys(10)),
+            max_hlc: None,
+            contains_unstamped_versions: false,
+        };
+        assert_eq!(
+            loc.validate_metadata(),
+            Err(RunLocatorMetadataError::PartialHlcEnvelope)
+        );
+        assert!(!loc.is_impossible_for(Snapshot::at(Epoch(5))));
+    }
+
+    #[test]
+    fn only_max_hlc_present_is_rejected() {
+        let loc = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(1),
+            max_epoch: Epoch(2),
+            min_hlc: None,
+            max_hlc: Some(hlc_from_phys(10)),
+            contains_unstamped_versions: true,
+        };
+        assert_eq!(
+            loc.validate_metadata(),
+            Err(RunLocatorMetadataError::PartialHlcEnvelope)
+        );
+    }
+
+    #[test]
+    fn min_hlc_greater_than_max_hlc_is_rejected() {
+        let loc = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(1),
+            max_epoch: Epoch(2),
+            min_hlc: Some(hlc_from_phys(50)),
+            max_hlc: Some(hlc_from_phys(10)),
+            contains_unstamped_versions: false,
+        };
+        assert_eq!(
+            loc.validate_metadata(),
+            Err(RunLocatorMetadataError::MinHlcAfterMaxHlc)
+        );
+        assert!(!loc.is_impossible_for(Snapshot::at_hlc(Epoch(5), hlc_from_phys(20))));
+    }
+
+    #[test]
+    fn min_epoch_greater_than_max_epoch_is_rejected() {
+        let loc = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(9),
+            max_epoch: Epoch(2),
+            min_hlc: None,
+            max_hlc: None,
+            contains_unstamped_versions: true,
+        };
+        assert_eq!(
+            loc.validate_metadata(),
+            Err(RunLocatorMetadataError::MinEpochAfterMaxEpoch)
+        );
+    }
+
+    #[test]
+    fn valid_unstamped_only_locator_is_accepted() {
+        let loc = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(1),
+            max_epoch: Epoch(2),
+            min_hlc: None,
+            max_hlc: None,
+            contains_unstamped_versions: true,
+        };
+        assert!(loc.validate_metadata().is_ok());
+    }
+
+    #[test]
+    fn checkpoint_with_invalid_locator_is_rejected() {
+        // B468-08 §12.3/12.6: loader must reject contradictory locator metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = RunLookupDirectory::empty();
+        src.set_fingerprint(42);
+        // Insert a valid unstamped-only locator, then mutate in-memory to the
+        // contradictory empty envelope before writing the checkpoint.
+        src.insert(
+            RowId(1),
+            RunLocator {
+                run_id: 7,
+                min_epoch: Epoch(1),
+                max_epoch: Epoch(2),
+                min_hlc: None,
+                max_hlc: None,
+                contains_unstamped_versions: true,
+            },
+        );
+        src.postings.get_mut(&RowId(1)).unwrap().locators[0].contains_unstamped_versions = false;
+        let path = dir.path().join("lookup-bad.ckpt");
+        src.write_checkpoint(&path).unwrap();
+        let err = RunLookupDirectory::read_checkpoint(&path, 42).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("locator metadata invalid")
+                || err.to_string().contains("EmptyVersionEnvelope"),
+            "unexpected error: {err}"
         );
     }
 }

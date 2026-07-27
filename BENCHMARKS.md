@@ -421,8 +421,8 @@ P2 point query (µs, client-observed for the loopback rows):
 
 The two loopback gates stay within run-to-run variance of each other (both
 far under the 250 ms tripwire); the full-feature build carries no point-query
-penalty on this path. Single-invocation captures; repeat invocations of the
-harvester append records for multi-repetition medians.
+penalty on this path. The harvester defaults to five repetitions and fail-closes when multi-rep
+median p95 tripwires are exceeded (`p0p2-threshold-verdict.jsonl`).
 
 ## Closure status
 
@@ -448,3 +448,17 @@ scripts/run-p0-p2-measurements.sh target/bench-results/rem-j                    
 ```
 
 
+
+
+## B468 residual-closure P0/P2 integration
+
+The exact-SHA five-repetition P0/P2 harvest (`scripts/run-p0-p2-measurements.sh`)
+is the machine-enforced evidence source for residual closure. Default `REPS=5`.
+It writes `p0-results.jsonl`, `p2-standalone-results.jsonl`,
+`p2-full-feature-results.jsonl`, and `p0p2-threshold-verdict.jsonl`. Residual-closure
+requires all four as core artifacts and evaluates multi-rep median p95
+tripwires (fail closed). Each row carries the git SHA envelope plus `rep`.
+
+Current train label: workspace version at capture time; cite the SHA recorded
+in `commit.txt` of the residual-closure artifact bundle rather than a dirty
+working tree.

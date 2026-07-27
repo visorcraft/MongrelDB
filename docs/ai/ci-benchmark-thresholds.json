@@ -4,7 +4,7 @@
   "minimum_queries": 10,
   "ann": {
     "maximum_p95_us": 2500,
-    "minimum_hamming_recall_at_10": 0.70,
+    "minimum_hamming_recall_at_10": 0.7,
     "minimum_cosine_recall_at_10": 0.15
   },
   "sparse": {
@@ -12,9 +12,18 @@
   },
   "minhash": {
     "maximum_p95_us": 3000,
-    "minimum_candidate_recall_at_10": 0.70
+    "minimum_candidate_recall_at_10": 0.7
   },
   "hybrid": {
     "maximum_p95_us": 15000
+  },
+  "churn_oracle": {
+    "hnsw_binary_sign_recall_at_k": 0.95,
+    "hnsw_dense_recall_at_k": 0.9,
+    "diskann_dense_recall_at_k": 0.9,
+    "ivf_dense_recall_at_k": 0.85,
+    "product_quantization_recall_at_k": 0.8,
+    "minhash_median_recall_at_k": 0.8,
+    "pr_smoke_operations": 500
   }
 }
