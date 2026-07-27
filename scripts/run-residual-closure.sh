@@ -1310,6 +1310,29 @@ EOF
     failures+=("semantic_threshold_missing_jsonl_fails")
   fi
 
+  # FF-09: jsonl_jq must reject records with status=fail (not presence-only).
+  printf '%s\n'     '{"test":"index_churn_oracle::eligibility::sparse::authorization","metric":{"status":"fail","actual_count":0},"unit":"verdict"}'     > "$SELF_TEST_DIR/elig-fail.jsonl"
+  set +e
+  jq -se 'all([.[] | select(.test|startswith("index_churn_oracle::eligibility::"))][]; .metric.status=="pass" and (.metric.actual_count // 0) > 0)'     "$SELF_TEST_DIR/elig-fail.jsonl" >/dev/null 2>&1
+  outcome=$?
+  set -e
+  if [[ "$outcome" -ne 0 ]]; then
+    echo "  [ OK ] jsonl_jq_rejects_status_fail"
+    passed=$((passed + 1))
+  else
+    failures+=("jsonl_jq_rejects_status_fail")
+  fi
+  set +e
+  jq -se 'any(.[]; .test=="index_churn_oracle::sparse_tie_break" and .metric.status=="pass" and .metric.ordering_equal==true)'     "$FIXTURES/bundle-ok/churn-oracle.jsonl" >/dev/null 2>&1
+  outcome=$?
+  set -e
+  if [[ "$outcome" -eq 0 ]]; then
+    echo "  [ OK ] jsonl_jq_accepts_semantic_pass"
+    passed=$((passed + 1))
+  else
+    failures+=("jsonl_jq_accepts_semantic_pass")
+  fi
+
   echo "self-test summary: passed=$passed failed=${#failures[@]}"
   if [[ ${#failures[@]} -gt 0 ]]; then
     printf '  - %s\n' "${failures[@]}" >&2
@@ -1746,6 +1769,17 @@ checklist_row_mark() {
       done < <(jq -r '.records[]' <<<"$entry")
       if [[ "$ok" -eq 1 ]]; then echo x; else echo ' '; fi
       ;;
+    jsonl_jq)
+      # FF-09: semantic success, not mere record presence.
+      local jsonl jq_expr
+      jsonl="$(jq -r '.jsonl' <<<"$entry")"
+      jq_expr="$(jq -r '.jq' <<<"$entry")"
+      if [[ -s "$OUT/$jsonl" ]] && jq -se "$jq_expr" "$OUT/$jsonl" >/dev/null 2>&1; then
+        echo x
+      else
+        echo ' '
+      fi
+      ;;
     threshold)
       local key
       key="$(jq -r '.threshold' <<<"$entry")"
@@ -1814,6 +1848,9 @@ checklist_row_proof_detail() {
     jsonl_records)
       jq -r '"\(.jsonl) records: \(.records | join(", "))"' <<<"$entry"
       ;;
+    jsonl_jq)
+      jq -r '"\(.jsonl) jq /\(.jq)/"' <<<"$entry"
+      ;;
     threshold)
       jq -r '"closure-status.json thresholds.\(.threshold)"' <<<"$entry"
       ;;
@@ -1873,6 +1910,18 @@ checklist_row_proof_detail() {
   echo "  artifact bundle, reads \`commit.txt\`, and rejects the bundle if its"
   echo "  contents do not match the requested SHA."
 } > "$OUT/closure-checklist.md"
+
+# FF-09/14: honest history status (never fabricate 30/4 passes).
+if bash "$REPO_ROOT/scripts/churn-history-check.sh" >"$OUT/history-check.log" 2>&1; then
+  jq -nc --arg status pass --argjson nightly 30 --argjson weekly 4 \
+    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
+    > "$OUT/history-status.jsonl"
+else
+  jq -nc --arg status fail --argjson nightly 0 --argjson weekly 0 \
+    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
+    > "$OUT/history-status.jsonl"
+fi
+
 
 # Stamp every shard artifact with SHA sidecar (after the checklist exists so
 # it is stamped too). Loop over glob expansion with nullglob so a missing

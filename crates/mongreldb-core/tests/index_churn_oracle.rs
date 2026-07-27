@@ -1158,6 +1158,11 @@ mod harness {
         pub unexpected_underfills: u64,
         /// Accumulated ineligible hits across checkpoints (FF-07).
         pub ineligible_hits_total: u64,
+        /// Exact-family order/membership/score mismatch counts (FF-07).
+        pub membership_mismatches: u64,
+        pub ordering_mismatches: u64,
+        pub score_mismatches: u64,
+        pub final_model_equal: bool,
     }
 
     impl Harness {
@@ -1184,6 +1189,10 @@ mod harness {
                 checkpoint_recalls: Vec::new(),
                 unexpected_underfills: 0,
                 ineligible_hits_total: 0,
+                membership_mismatches: 0,
+                ordering_mismatches: 0,
+                score_mismatches: 0,
+                final_model_equal: false,
             }
         }
 
@@ -3908,10 +3917,12 @@ mod replay {
                             .into_iter()
                             .map(|r| r.row_id.0)
                             .collect();
-                        assert!(
-                            engine_actual.is_subset(&model_expected)
-                                || engine_actual.is_subset(&pin.expected_at_pin),
-                            "historical read op {op_index}: engine={engine_actual:?}                              model={model_expected:?} pin_capture={:?}",
+                        // FF-01: independent model snapshot is the oracle —
+                        // require exact equality (empty engine cannot soft-pass).
+                        assert_eq!(
+                            engine_actual, model_expected,
+                            "historical read op {op_index}: engine={engine_actual:?} \
+                             model={model_expected:?} pin_capture={:?}",
                             pin.expected_at_pin
                         );
                         let epoch = pin.engine_snapshot.epoch.0;
@@ -4224,6 +4235,21 @@ mod replay {
                         act_rids.len(),
                     );
                 }
+                // FF-07: accumulate measured equality signals before assert
+                // (assert still fails closed on defects).
+                if family.is_exact() {
+                    if exp_rids != act_rids {
+                        harness.membership_mismatches =
+                            harness.membership_mismatches.saturating_add(1);
+                        harness.ordering_mismatches = harness.ordering_mismatches.saturating_add(1);
+                    }
+                    for (e, a) in exp_scores.iter().zip(act_scores.iter()) {
+                        if (e - a).abs() > 1e-5 {
+                            harness.score_mismatches = harness.score_mismatches.saturating_add(1);
+                            break;
+                        }
+                    }
+                }
                 let context = FailureContext {
                     family: family.name().to_string(),
                     seed,
@@ -4292,6 +4318,7 @@ mod replay {
             "final model/engine state diverged:\n{}",
             final_context.render()
         );
+        harness.final_model_equal = true;
         emit_oracle_metric(
             &format!("index_churn_oracle::final_consistency::{}", family.name()),
             serde_json::json!({
@@ -4355,6 +4382,10 @@ mod replay {
             checkpoint_count: harness.checkpoint_recalls.len(),
             unexpected_underfills: harness.unexpected_underfills,
             ineligible_hits: harness.ineligible_hits_total,
+            membership_mismatches: harness.membership_mismatches,
+            ordering_mismatches: harness.ordering_mismatches,
+            score_mismatches: harness.score_mismatches,
+            final_model_equal: harness.final_model_equal,
             candidate_cap_hits: harness.cap_hits,
             work_budget_exhaustions: harness.budget_trips,
         }
@@ -4373,6 +4404,10 @@ mod replay {
         pub checkpoint_count: usize,
         pub unexpected_underfills: u64,
         pub ineligible_hits: u64,
+        pub membership_mismatches: u64,
+        pub ordering_mismatches: u64,
+        pub score_mismatches: u64,
+        pub final_model_equal: bool,
         pub candidate_cap_hits: u64,
         pub work_budget_exhaustions: u64,
     }
@@ -4447,10 +4482,13 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
             serde_json::json!({
                 "status": "pass",
                 "exact": true,
-                "membership_equal": true,
-                "ordering_equal": true,
-                "score_equal": true,
-                "final_model_equal": true,
+                "membership_equal": summary.membership_mismatches == 0,
+                "ordering_equal": summary.ordering_mismatches == 0,
+                "score_equal": summary.score_mismatches == 0,
+                "final_model_equal": summary.final_model_equal,
+                "membership_mismatches": summary.membership_mismatches,
+                "ordering_mismatches": summary.ordering_mismatches,
+                "score_mismatches": summary.score_mismatches,
                 "seed": seed,
                 "operations": summary.ops,
                 "ineligible_hits": summary.ineligible_hits,
@@ -4485,7 +4523,7 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "required_recall": floor,
                 "ineligible_hits": summary.ineligible_hits,
                 "unexpected_underfills": summary.unexpected_underfills,
-                "final_model_equal": true,
+                "final_model_equal": summary.final_model_equal,
                 "seed": seed,
                 "operations": summary.ops,
                 "checkpoints": summary.checkpoint_count,
@@ -6098,16 +6136,26 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
         !after.iter().any(|h| h.row_id.0 == delete_rid),
         "{family_label}: deleted rid must not reappear after reopen"
     );
-    // Measure post-delete/post-compact historical recall while table was open.
-    let post_delete_recall = {
-        let act: HashSet<u64> = hist3.iter().map(|h| h.row_id.0).collect();
-        let exp: HashSet<u64> = hist_expected_rids.iter().copied().collect();
-        if exp.is_empty() {
+    // FF-03: remeasure recall at each stage against the frozen historical expected set.
+    let stage_recall = |hits: &[mongreldb_core::query::RetrieverHit]| -> f32 {
+        let act: HashSet<u64> = hits.iter().map(|h| h.row_id.0).collect();
+        if exp_set.is_empty() {
             1.0
         } else {
-            exp.intersection(&act).count() as f32 / exp.len() as f32
+            exp_set.intersection(&act).count() as f32 / exp_set.len() as f32
         }
     };
+    let post_update_recall = stage_recall(&hist2);
+    let post_delete_recall = stage_recall(&hist3);
+    let post_compaction_recall = post_delete_recall; // hist3 is after flush+compact
+    assert!(
+        post_update_recall + 1e-6 >= floor,
+        "{family_label} post_update historical recall {post_update_recall} < floor {floor}"
+    );
+    assert!(
+        post_delete_recall + 1e-6 >= floor,
+        "{family_label} post_delete historical recall {post_delete_recall} < floor {floor}"
+    );
     assert!(
         hist3.iter().any(|h| h.row_id.0 == delete_rid),
         "{family_label}: historical must retain deleted rid {delete_rid} before reopen"
@@ -6119,9 +6167,9 @@ fn ann_historical_matrix(schema: Schema, family_label: &str) {
             "status": "pass",
             "required_recall": floor,
             "initial_recall": hist_recall,
-            "post_update_recall": hist_recall,
+            "post_update_recall": post_update_recall,
             "post_delete_recall": post_delete_recall,
-            "post_compaction_recall": post_delete_recall,
+            "post_compaction_recall": post_compaction_recall,
             "post_reopen_recall": null,
             "snapshot_contract": "B_in_memory_snapshot_not_durable_across_reopen",
             "historical_ineligible_hits": historical_ineligible,
@@ -6830,22 +6878,26 @@ fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
             expired_hits += 1;
         }
     }
+    // FF-06: every returned row must belong to the explicit expected live set
+    // (hot ∪ live, excluding expired); require full k when eligible ≥ k.
+    let expected_live: HashSet<u64> = hot_rids.iter().chain(live_rids.iter()).copied().collect();
     assert_eq!(
         expired_hits, 0,
         "{family_key} expired best scorers must not appear: {ttl_hits:?}"
     );
-    assert!(
-        ttl_hits.iter().all(|h| !expired_rids.contains(&h.row_id.0)),
-        "{family_key} only non-expired allowed: {ttl_hits:?}"
+    let mut ineligible_ttl = 0usize;
+    for h in &ttl_hits {
+        if !expected_live.contains(&h.row_id.0) {
+            ineligible_ttl += 1;
+        }
+    }
+    assert_eq!(
+        ineligible_ttl, 0,
+        "{family_key} TTL hits outside expected_live={expected_live:?}: {ttl_hits:?}"
     );
-    assert!(
-        ttl_hits
-            .iter()
-            .any(|h| live_rids.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
-        "{family_key} TTL query must return non-expired corpus rows; got {ttl_hits:?}"
-    );
-    assert!(
-        ttl_hits.len() >= k,
+    assert_eq!(
+        ttl_hits.len(),
+        k,
         "{family_key} expected full k live under TTL, got {}",
         ttl_hits.len()
     );
@@ -6855,9 +6907,11 @@ fn eligibility_ann(schema: Schema, family_key: &str, dim: usize) {
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": expected_live.len(),
             "actual_count": ttl_hits.len(),
             "expired_hits": expired_hits,
-            "live_present": true,
+            "ineligible_hits": ineligible_ttl,
+            "live_set_membership_ok": true,
         }),
     );
 
@@ -7075,19 +7129,22 @@ fn eligibility_sparse() {
         .filter(|h| expired.contains(&h.row_id.0))
         .count();
     assert_eq!(expired_hits, 0, "sparse expired best leaked: {ttl_hits:?}");
-    // Live corpus = original hot (still unexpired) + newly inserted live rows.
-    let non_expired_ok = ttl_hits.iter().all(|h| !expired.contains(&h.row_id.0));
-    assert!(non_expired_ok);
-    assert!(
-        ttl_hits.len() >= k,
-        "sparse TTL full k from live corpus, got {}",
-        ttl_hits.len()
+    let expected_live: HashSet<u64> = hot_rids.iter().chain(live.iter()).copied().collect();
+    let mut ineligible_ttl = 0usize;
+    for h in &ttl_hits {
+        if !expected_live.contains(&h.row_id.0) {
+            ineligible_ttl += 1;
+        }
+    }
+    assert_eq!(
+        ineligible_ttl, 0,
+        "sparse TTL hits outside expected_live={expected_live:?}: {ttl_hits:?}"
     );
-    assert!(
-        ttl_hits
-            .iter()
-            .any(|h| live.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
-        "sparse TTL must return non-expired rows: {ttl_hits:?}"
+    assert_eq!(
+        ttl_hits.len(),
+        k,
+        "sparse TTL full k, got {}",
+        ttl_hits.len()
     );
     emit_eligibility(
         "sparse",
@@ -7095,9 +7152,11 @@ fn eligibility_sparse() {
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": expected_live.len(),
             "actual_count": ttl_hits.len(),
             "expired_hits": expired_hits,
-            "live_present": true,
+            "ineligible_hits": ineligible_ttl,
+            "live_set_membership_ok": true,
         }),
     );
 
@@ -7291,23 +7350,29 @@ fn eligibility_minhash() {
         .filter(|h| expired.contains(&h.row_id.0))
         .count();
     assert_eq!(expired_hits, 0, "mh expired leaked: {ttl_hits:?}");
-    assert!(ttl_hits.iter().all(|h| !expired.contains(&h.row_id.0)));
-    assert!(
-        ttl_hits
-            .iter()
-            .any(|h| live.contains(&h.row_id.0) || hot_rids.contains(&h.row_id.0)),
-        "mh TTL must return non-expired rows: {ttl_hits:?}"
+    let expected_live: HashSet<u64> = hot_rids.iter().chain(live.iter()).copied().collect();
+    let mut ineligible_ttl = 0usize;
+    for h in &ttl_hits {
+        if !expected_live.contains(&h.row_id.0) {
+            ineligible_ttl += 1;
+        }
+    }
+    assert_eq!(
+        ineligible_ttl, 0,
+        "mh TTL hits outside expected_live={expected_live:?}: {ttl_hits:?}"
     );
-    assert!(ttl_hits.len() >= k, "mh TTL full k got {}", ttl_hits.len());
+    assert_eq!(ttl_hits.len(), k, "mh TTL full k got {}", ttl_hits.len());
     emit_eligibility(
         "minhash",
         "ttl",
         serde_json::json!({
             "status": "pass",
             "requested_k": k,
+            "eligible_count": expected_live.len(),
             "actual_count": ttl_hits.len(),
             "expired_hits": expired_hits,
-            "live_present": true,
+            "ineligible_hits": ineligible_ttl,
+            "live_set_membership_ok": true,
         }),
     );
 

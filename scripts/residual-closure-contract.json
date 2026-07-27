@@ -478,19 +478,9 @@
     },
     {
       "statement": "every non-Bitmap index oracle passes",
-      "proof": "jsonl_records",
+      "proof": "jsonl_jq",
       "jsonl": "churn-oracle.jsonl",
-      "records": [
-        "index_churn_oracle::verdict::fm",
-        "index_churn_oracle::verdict::learned_range",
-        "index_churn_oracle::verdict::ann_hnsw_dense",
-        "index_churn_oracle::verdict::ann_hnsw_binary_sign",
-        "index_churn_oracle::verdict::ann_product_quantization",
-        "index_churn_oracle::verdict::ann_diskann_dense",
-        "index_churn_oracle::verdict::ann_ivf_dense",
-        "index_churn_oracle::verdict::sparse",
-        "index_churn_oracle::verdict::minhash"
-      ]
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::fm\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::learned_range\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::ann_hnsw_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::ann_hnsw_binary_sign\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::ann_product_quantization\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::ann_diskann_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::ann_ivf_dense\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::sparse\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true)) and any(.[]; .test==\"index_churn_oracle::verdict::minhash\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and (.metric.unexpected_underfills // 0)==0 and (.metric.final_model_equal==true))"
     },
     {
       "statement": "no stale/deleted/expired/unauthorized row is returned",
@@ -639,58 +629,21 @@
     },
     {
       "statement": "Sparse exact tie-break is ascending RowId",
-      "proof": "jsonl_records",
+      "proof": "jsonl_jq",
       "jsonl": "churn-oracle.jsonl",
-      "records": [
-        "index_churn_oracle::sparse_tie_break"
-      ]
+      "jq": "any(.[]; .test==\"index_churn_oracle::sparse_tie_break\" and .metric.status==\"pass\" and .metric.ordering_equal==true)"
     },
     {
       "statement": "all ANN backends honor historical snapshots",
-      "proof": "jsonl_records",
+      "proof": "jsonl_jq",
       "jsonl": "churn-oracle.jsonl",
-      "records": [
-        "index_churn_oracle::snapshot_history::ann_hnsw_dense",
-        "index_churn_oracle::snapshot_history::ann_hnsw_binarysign",
-        "index_churn_oracle::snapshot_history::ann_hnsw_pq",
-        "index_churn_oracle::snapshot_history::ann_diskann_dense",
-        "index_churn_oracle::snapshot_history::ann_ivf_dense"
-      ]
+      "jq": "all([.[] | select(.test|startswith(\"index_churn_oracle::snapshot_history::\"))][]; .metric.status==\"pass\" and ((.metric.initial_recall // 0) >= (.metric.required_recall // 0)) and ((.metric.post_update_recall // .metric.initial_recall // 0) >= (.metric.required_recall // 0)) and (.metric.historical_ineligible_hits // 0)==0)"
     },
     {
       "statement": "ranked family eligibility matrix complete (auth/filter/ttl/stale)",
-      "proof": "jsonl_records",
+      "proof": "jsonl_jq",
       "jsonl": "churn-oracle.jsonl",
-      "records": [
-        "index_churn_oracle::eligibility::sparse::hard_filter",
-        "index_churn_oracle::eligibility::sparse::authorization",
-        "index_churn_oracle::eligibility::sparse::ttl",
-        "index_churn_oracle::eligibility::sparse::stale_delete",
-        "index_churn_oracle::eligibility::minhash::hard_filter",
-        "index_churn_oracle::eligibility::minhash::authorization",
-        "index_churn_oracle::eligibility::minhash::ttl",
-        "index_churn_oracle::eligibility::minhash::stale_delete",
-        "index_churn_oracle::eligibility::ann_hnsw_dense::hard_filter",
-        "index_churn_oracle::eligibility::ann_hnsw_dense::authorization",
-        "index_churn_oracle::eligibility::ann_hnsw_dense::ttl",
-        "index_churn_oracle::eligibility::ann_hnsw_dense::stale_delete",
-        "index_churn_oracle::eligibility::ann_hnsw_binary_sign::hard_filter",
-        "index_churn_oracle::eligibility::ann_hnsw_binary_sign::authorization",
-        "index_churn_oracle::eligibility::ann_hnsw_binary_sign::ttl",
-        "index_churn_oracle::eligibility::ann_hnsw_binary_sign::stale_delete",
-        "index_churn_oracle::eligibility::ann_product_quantization::hard_filter",
-        "index_churn_oracle::eligibility::ann_product_quantization::authorization",
-        "index_churn_oracle::eligibility::ann_product_quantization::ttl",
-        "index_churn_oracle::eligibility::ann_product_quantization::stale_delete",
-        "index_churn_oracle::eligibility::ann_diskann_dense::hard_filter",
-        "index_churn_oracle::eligibility::ann_diskann_dense::authorization",
-        "index_churn_oracle::eligibility::ann_diskann_dense::ttl",
-        "index_churn_oracle::eligibility::ann_diskann_dense::stale_delete",
-        "index_churn_oracle::eligibility::ann_ivf_dense::hard_filter",
-        "index_churn_oracle::eligibility::ann_ivf_dense::authorization",
-        "index_churn_oracle::eligibility::ann_ivf_dense::ttl",
-        "index_churn_oracle::eligibility::ann_ivf_dense::stale_delete"
-      ]
+      "jq": "all([.[] | select(.test|startswith(\"index_churn_oracle::eligibility::\"))][]; .metric.status==\"pass\" and (.metric.actual_count // 0) > 0 and (.metric.ineligible_hits // 0)==0)"
     },
     {
       "statement": "history tooling exists",
@@ -699,8 +652,9 @@
     },
     {
       "statement": "30-nightly/4-weekly history passes",
-      "proof": "file",
-      "file": "closure-status.json"
+      "proof": "jsonl_jq",
+      "jsonl": "history-status.jsonl",
+      "jq": "any(.[]; .status==\"pass\" and (.nightly // 0) >= 30 and (.weekly // 0) >= 4)"
     }
   ]
 }
