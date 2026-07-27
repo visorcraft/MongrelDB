@@ -1333,6 +1333,47 @@ EOF
     failures+=("jsonl_jq_accepts_semantic_pass")
   fi
 
+  # FF-09/14: pipeline body must redirect-write history-status.jsonl BEFORE
+  # closure-checklist.md so the 30/4 jsonl_jq row cannot fail-open on a
+  # stale pass from a prior run. Match only real redirects ("> \"$OUT/...\"")
+  # so self-test comments and awk patterns do not count as writes.
+  hist_write_line="$(
+    awk '/^[[:space:]]*>[[:space:]]*"\$OUT\/history-status\.jsonl"/ { print NR; exit }' "$0"
+  )"
+  checklist_write_line="$(
+    awk '/>[[:space:]]*"\$OUT\/closure-checklist\.md"/ { print NR; exit }' "$0"
+  )"
+  if [[ -n "$hist_write_line" && -n "$checklist_write_line" ]] \
+    && [[ "$hist_write_line" -lt "$checklist_write_line" ]]; then
+    echo "  [ OK ] history_status_written_before_checklist (L${hist_write_line}<L${checklist_write_line})"
+    passed=$((passed + 1))
+  else
+    failures+=("history_status_written_before_checklist (hist=${hist_write_line:-none} checklist=${checklist_write_line:-none})")
+  fi
+
+  # FF-09/14: contract jq must reject a fail history-status even when a
+  # previous pass record existed (overwrite + re-evaluate path).
+  hist_jq='any(.[]; .status=="pass" and (.nightly // 0) >= 30 and (.weekly // 0) >= 4)'
+  printf '%s\n' '{"status":"pass","nightly":30,"weekly":4,"source":"stale"}' \
+    > "$SELF_TEST_DIR/history-status.jsonl"
+  set +e
+  jq -se "$hist_jq" "$SELF_TEST_DIR/history-status.jsonl" >/dev/null 2>&1
+  stale_ok=$?
+  set -e
+  # Simulate this-run honest write after churn-history-check fails.
+  printf '%s\n' '{"status":"fail","nightly":0,"weekly":0,"source":"churn-history-check.sh"}' \
+    > "$SELF_TEST_DIR/history-status.jsonl"
+  set +e
+  jq -se "$hist_jq" "$SELF_TEST_DIR/history-status.jsonl" >/dev/null 2>&1
+  fresh_fail=$?
+  set -e
+  if [[ "$stale_ok" -eq 0 && "$fresh_fail" -ne 0 ]]; then
+    echo "  [ OK ] history_status_jsonl_jq_rejects_fresh_fail"
+    passed=$((passed + 1))
+  else
+    failures+=("history_status_jsonl_jq_rejects_fresh_fail (stale_ok=$stale_ok fresh_fail=$fresh_fail)")
+  fi
+
   echo "self-test summary: passed=$passed failed=${#failures[@]}"
   if [[ ${#failures[@]} -gt 0 ]]; then
     printf '  - %s\n' "${failures[@]}" >&2
@@ -1728,10 +1769,25 @@ jq -s \
   }
   ' "$SUITES_JSONL" > "$OUT/closure-status.json"
 
+# FF-09/14: honest history status MUST be written BEFORE closure-checklist.md
+# so the contract jsonl_jq row ("30-nightly/4-weekly history passes") evaluates
+# this run's status. Writing after the checklist lets a stale
+# OUT/history-status.jsonl with status=pass fail-open the box.
+# Never fabricate 30/4 passes: only churn-history-check.sh may set status=pass.
+if bash "$REPO_ROOT/scripts/churn-history-check.sh" >"$OUT/history-check.log" 2>&1; then
+  jq -nc --arg status pass --argjson nightly 30 --argjson weekly 4 \
+    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
+    > "$OUT/history-status.jsonl"
+else
+  jq -nc --arg status fail --argjson nightly 0 --argjson weekly 0 \
+    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
+    > "$OUT/history-status.jsonl"
+fi
+
 # --------------------------------------------------------------------------
 # Closure checklist (§13.11). Every row maps to the exact suite/tests that
 # prove it via contract `checklist` entries — no proxies from unrelated
-# logs.
+# logs. Depends on history-status.jsonl already being present (FF-09/14).
 # --------------------------------------------------------------------------
 COMMIT_LONG="$EXPECTED_SHA"
 COMMIT_SHORT="$SHORT_SHA"
@@ -1910,18 +1966,6 @@ checklist_row_proof_detail() {
   echo "  artifact bundle, reads \`commit.txt\`, and rejects the bundle if its"
   echo "  contents do not match the requested SHA."
 } > "$OUT/closure-checklist.md"
-
-# FF-09/14: honest history status (never fabricate 30/4 passes).
-if bash "$REPO_ROOT/scripts/churn-history-check.sh" >"$OUT/history-check.log" 2>&1; then
-  jq -nc --arg status pass --argjson nightly 30 --argjson weekly 4 \
-    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
-    > "$OUT/history-status.jsonl"
-else
-  jq -nc --arg status fail --argjson nightly 0 --argjson weekly 0 \
-    '{status:$status, nightly:$nightly, weekly:$weekly, source:"churn-history-check.sh"}' \
-    > "$OUT/history-status.jsonl"
-fi
-
 
 # Stamp every shard artifact with SHA sidecar (after the checklist exists so
 # it is stamped too). Loop over glob expansion with nullglob so a missing
