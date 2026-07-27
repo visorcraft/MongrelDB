@@ -335,7 +335,7 @@ configuration, not a claim that every production corpus has identical recall.
 | LearnedRange | Exact range | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
 | FmIndex | Exact substring | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
 | Sparse | Exact dot-product top-k | Higher score, then `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
-| MinHash | Approximate LSH candidates; exact verification cannot recover missed candidates | Higher verified Jaccard score, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| MinHash | Approximate LSH candidates; exact verification cannot recover missed candidates | Higher verified Jaccard score, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.80 (see below) |
 | ANN HNSW BinarySign | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.95 |
 | ANN HNSW Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
 | ANN DiskANN Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
@@ -346,13 +346,48 @@ configuration, not a claim that every production corpus has identical recall.
 
 - **FmIndex:** exact substring matching; no recall floor.
 - **LearnedRange:** exact range matching; no recall floor.
-- **Sparse:** exact dot-product ranking; no recall floor.
-- **MinHash:** 0.90 on the deterministic corpus.
+- **Sparse:** exact dot-product ranking; the churn oracle asserts exact
+  top-k membership, exact `RowId` ordering, and score equality within 1e-5
+  against an independent model at every checkpoint.
+- **MinHash:** 0.80 median recall on the deterministic oracle corpus (see
+  below); the exact-duplicate gate is 1.0.
 - **ANN HNSW BinarySign:** 0.95.
 - **ANN HNSW Dense:** 0.90.
 - **ANN DiskANN Dense:** 0.90.
 - **ANN IVF Dense:** 0.85.
 - **ANN Product Quantization:** 0.80 with rerank.
+
+### MinHash recall floor
+
+`MINHASH_GENERAL_RECALL_FLOOR` (in
+`crates/mongreldb-core/tests/index_churn_oracle.rs`) is **0.80**. It is
+enforced as the *median* tie-tolerant recall across every checkpoint of a
+500-operation churn run, with an additional per-checkpoint guard that
+recall never collapses to zero on a non-empty oracle answer. Measured
+healthy recall on the deterministic corpus (128-permutation signatures,
+32 LSH bands, near-duplicate-heavy corpus, 500 operations per seed) is a
+**median of 1.0 on every seed of the CI matrix (1-8)**; individual
+checkpoints occasionally dip (observed min samples 0.33-1.0) when an LSH
+band miss or an estimator reordering drops one top-k row, which is why
+the gate is a median rather than a per-checkpoint minimum. The floor sits
+far below the healthy median but far above total failure. Lowering the
+floor — ever below 0.80 — requires an approved ADR.
+
+Two complementary gates apply:
+
+- **Exact-duplicate gate (recall 1.0):** at least k live rows whose stored
+  set equals the query set are always returned with estimated Jaccard 1.0,
+  in ascending-`RowId` tie-break order, with no stale/deleted/expired row.
+- **General corpus gate (floor 0.80):** recall is tie/estimation-noise
+  tolerant — an expected top-k row counts as found when the engine returns
+  it or substitutes a row whose exact Jaccard is at least as high. A
+  genuine LSH band miss can only substitute lower-similarity rows and is
+  counted as a miss.
+
+Sparse and MinHash retrieval honor the caller-supplied snapshot through
+`Table::retrieve_at`: a pinned snapshot answers with the historical
+(postings-visible) state across update, delete, flush, compaction, and
+close+reopen; the current snapshot reflects the latest committed state.
 
 ### Tie-break rules
 

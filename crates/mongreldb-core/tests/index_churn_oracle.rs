@@ -90,6 +90,22 @@ mod support {
     #[allow(clippy::unusual_byte_groupings)]
     pub const DEFAULT_SEED: u64 = 0xC0FFEE_BEEF_DEAD_BE;
 
+    /// General-corpus MinHash recall floor (REM-F §10.6). Measured healthy
+    /// recall on the deterministic oracle corpus (seeds 1-8, 500 ops) is a
+    /// median of 1.0; the floor sits far below that but far above total
+    /// failure. Never lower this without an approved ADR, and never below
+    /// 0.80. The exact-duplicate gate stays at 1.0 regardless.
+    pub const MINHASH_GENERAL_RECALL_FLOOR: f32 = 0.80;
+
+    /// Ops per MinHash churn run (REM-F §10.6). The general-recall gate is a
+    /// MEDIAN over per-checkpoint samples, so a run must produce enough
+    /// checkpoints for the median to be meaningful: at 500 ops and a 50-op
+    /// checkpoint cadence each run yields 10 samples, which absorbs the
+    /// estimator-noise dips LSH ranking legitimately produces (measured
+    /// healthy median 1.0 on seeds 1-8). Other families gate per checkpoint
+    /// and stay at the fast 75-op PR default.
+    pub const MINHASH_MEDIAN_GATE_OPS: usize = 500;
+
     /// PR smoke seeds (spec §47.1). Identical to the fixed seeds requested
     /// in the spec, in ascending order.
     pub const PR_SMOKE_SEEDS: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1064,16 +1080,23 @@ mod harness {
                     })
             })
             .collect();
+        // Mirror the FULL row payload in the model (not just the PK): the
+        // per-checkpoint oracle reads the indexed column from the model, so
+        // dropping it would silently erase batch rows from every expected
+        // answer (REM-G model repair).
+        let row_reprs: Vec<Vec<(u16, ValueRepr)>> = rows
+            .iter()
+            .map(|cols| {
+                cols.iter()
+                    .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
+                    .collect()
+            })
+            .collect();
         let epoch = pending_epoch(table);
         let rids = table
             .put_batch(rows)
             .unwrap_or_else(|e| panic!("put_batch_unique op {op_index}: {e}"));
-        for (pk, rid) in pks.iter().zip(rids) {
-            let cols = [(1u16, Value::Int64(*pk))];
-            let reprs: Vec<(u16, ValueRepr)> = cols
-                .iter()
-                .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
-                .collect();
+        for ((pk, reprs), rid) in pks.iter().zip(row_reprs).zip(rids) {
             harness
                 .model
                 .upsert_with_rid(*pk, reprs, true, rid.0, epoch);
@@ -1098,16 +1121,20 @@ mod harness {
                     })
             })
             .collect();
+        // Same full-payload model repair as `apply_put_batch_unique`.
+        let row_reprs: Vec<Vec<(u16, ValueRepr)>> = rows
+            .iter()
+            .map(|cols| {
+                cols.iter()
+                    .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
+                    .collect()
+            })
+            .collect();
         let epoch = pending_epoch(table);
         let rids = table
             .put_batch(rows)
             .unwrap_or_else(|e| panic!("put_batch_duplicate op {op_index}: {e}"));
-        for (pk, rid) in pks.iter().zip(rids) {
-            let cols = [(1u16, Value::Int64(*pk))];
-            let reprs: Vec<(u16, ValueRepr)> = cols
-                .iter()
-                .map(|(cid, v)| (*cid, ValueRepr::from_value(v)))
-                .collect();
+        for ((pk, reprs), rid) in pks.iter().zip(row_reprs).zip(rids) {
             harness
                 .model
                 .upsert_with_rid(*pk, reprs, true, rid.0, epoch);
@@ -1182,6 +1209,11 @@ mod family_mod {
         fn recall_floor(&self) -> f32 {
             1.0
         }
+
+        /// End-of-replay family gate (e.g. the MinHash median-recall
+        /// floor). Called once per replay with the final failure context so
+        /// a violation renders the full §11.5 artifact.
+        fn finish(&self, _context: &FailureContext) {}
 
         /// Retriever used by the candidate-cap and work-budget pressure
         /// probes. `None` for exact query-path families (FM, LearnedRange):
@@ -2511,7 +2543,22 @@ mod families {
 
     // ----- MinHash top-k ----------------------------------------------
 
-    pub struct MinHashFamily;
+    /// MinHash family adapter. `recall_samples` accumulates one
+    /// tie-tolerant recall sample per checkpoint; `finish` enforces the
+    /// documented median floor (§10.6).
+    #[derive(Default)]
+    pub struct MinHashFamily {
+        pub recall_samples: std::cell::RefCell<Vec<f32>>,
+    }
+
+    /// MinHash oracle answer: the exact-Jaccard top-k plus the exact
+    /// Jaccard of every positive-similarity live row, so the recall gate
+    /// can accept tie/estimation-noise substitutes (§10.6).
+    #[derive(Debug, Clone)]
+    pub struct MinHashExpected {
+        pub topk: Vec<(u64, f64)>,
+        pub exact_j: std::collections::BTreeMap<u64, f64>,
+    }
 
     impl MinHashFamily {
         pub fn schema() -> Schema {
@@ -2556,14 +2603,6 @@ mod families {
             }
         }
 
-        pub fn make_set(rng: &mut Lcg) -> Vec<&'static str> {
-            const VOCAB: &[&str] = &["a", "b", "c", "d", "x", "y", "z", "w", "p", "q"];
-            let n = rng.gen_range(1, 5);
-            (0..n)
-                .map(|_| VOCAB[rng.gen_range(0, VOCAB.len())])
-                .collect()
-        }
-
         /// Canonical query set. Near-duplicate corpus rows overlap it
         /// heavily, which is the workload MinHash serves (near-duplicate
         /// detection); background rows exercise the disjoint case.
@@ -2575,11 +2614,49 @@ mod families {
                 .map(|s| SetMember::String((*s).to_string()))
                 .collect()
         }
+
+        pub fn query_set_strings() -> HashSet<String> {
+            Self::QUERY_SET.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        /// Corpus generator: ~60% near-duplicates of the query set (2-4
+        /// query tokens plus 0-1 noise tokens → exact Jaccard 0.4..=1.0),
+        /// ~40% background rows over the full 10-token vocabulary (mostly
+        /// disjoint). Near-duplicate-heavy corpora are what LSH indexing is
+        /// for, and they give the top-k rows enough similarity that the
+        /// band-sharing probability is high — a recall floor is then a
+        /// meaningful gate instead of a coin flip.
+        pub fn make_set(rng: &mut Lcg) -> Vec<&'static str> {
+            const NOISE_TOKENS: &[&str] = &["x", "y", "z", "w", "p", "q"];
+            let mut set: Vec<&'static str> = Vec::new();
+            if rng.gen_bool(0.6) {
+                let mut tokens = Self::QUERY_SET.to_vec();
+                for i in (1..tokens.len()).rev() {
+                    let j = rng.gen_range(0, i + 1);
+                    tokens.swap(i, j);
+                }
+                let m = rng.gen_range(2, 5);
+                set.extend(tokens.into_iter().take(m));
+                if rng.gen_bool(0.4) {
+                    set.push(NOISE_TOKENS[rng.gen_range(0, NOISE_TOKENS.len())]);
+                }
+            } else {
+                const VOCAB: &[&str] = &["a", "b", "c", "d", "x", "y", "z", "w", "p", "q"];
+                let n = rng.gen_range(1, 5);
+                for _ in 0..n {
+                    let token = VOCAB[rng.gen_range(0, VOCAB.len())];
+                    if !set.contains(&token) {
+                        set.push(token);
+                    }
+                }
+            }
+            set
+        }
     }
 
     impl ChurnOracleFamily for MinHashFamily {
         type Query = (Vec<SetMember>, usize);
-        type Expected = Vec<(u64, f64)>;
+        type Expected = MinHashExpected;
         type Actual = Vec<(u64, f32)>;
 
         fn name(&self) -> &'static str {
@@ -2634,33 +2711,28 @@ mod families {
             snapshot: Snapshot,
             query: &Self::Query,
         ) -> Self::Expected {
-            let (qset, k) = query;
-            let qstrings: HashSet<String> = qset
-                .iter()
-                .filter_map(|m| match m {
-                    SetMember::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect();
-            let mut scored: Vec<(u64, f64)> = model
-                .live_rows(snapshot)
-                .into_iter()
-                .filter_map(|row| match row.cols.get(&self.indexed_column()) {
-                    Some(ValueRepr::Bytes(b)) => {
-                        let set = unpack_minhash_members(b);
-                        let j = jaccard(&qstrings, &set);
-                        Some((row.rid, j))
+            let (_, k) = query;
+            let qstrings = Self::query_set_strings();
+            let mut exact_j = std::collections::BTreeMap::new();
+            for row in model.live_rows(snapshot) {
+                if let Some(ValueRepr::Bytes(b)) = row.cols.get(&self.indexed_column()) {
+                    let set = unpack_minhash_members(b);
+                    let j = jaccard(&qstrings, &set);
+                    // Zero-similarity rows can never be LSH candidates and
+                    // carry no ranking signal; the oracle top-k is over
+                    // positive-similarity rows only.
+                    if j > 0.0 {
+                        exact_j.insert(row.rid, j);
                     }
-                    _ => None,
-                })
-                .collect();
-            scored.sort_by(|(r1, j1), (r2, j2)| {
-                j2.partial_cmp(j1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(r1.cmp(r2))
-            });
+                }
+            }
+            let mut scored: Vec<(u64, f64)> = exact_j.iter().map(|(r, j)| (*r, *j)).collect();
+            scored.sort_by(|(r1, j1), (r2, j2)| j2.total_cmp(j1).then_with(|| r1.cmp(r2)));
             scored.truncate(*k);
-            scored
+            MinHashExpected {
+                topk: scored,
+                exact_j,
+            }
         }
 
         fn actual(
@@ -2669,13 +2741,17 @@ mod families {
             snapshot: Snapshot,
             query: &Self::Query,
         ) -> mongreldb_core::Result<Self::Actual> {
-            let _ = snapshot;
             let (qset, k) = query;
-            let hits = table.retrieve(&Retriever::MinHash {
-                column_id: self.indexed_column(),
-                members: qset.clone(),
-                k: *k,
-            })?;
+            // Snapshot-aware retrieval (REM-F §10.7).
+            let hits = table.retrieve_at(
+                &Retriever::MinHash {
+                    column_id: self.indexed_column(),
+                    members: qset.clone(),
+                    k: *k,
+                },
+                snapshot,
+                None,
+            )?;
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
@@ -2691,33 +2767,57 @@ mod families {
             actual: &Self::Actual,
             context: &FailureContext,
         ) {
-            if expected.is_empty() {
-                return;
-            }
-            // MinHash is approximate LSH: enforce a recall floor against
-            // the model's exact top-k, and verify no zero-similarity hits
-            // (estimated J = 0 would mean the engine has no signal).
-            let exp_set: HashSet<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let intersect = exp_set.intersection(&act_set).count();
-            let recall = if exp_set.is_empty() {
-                1.0
-            } else {
-                intersect as f32 / exp_set.len() as f32
-            };
-            assert!(
-                recall >= self.recall_floor(),
-                "MinHash recall {recall} < floor {}:\n{}",
-                self.recall_floor(),
-                context.render()
-            );
+            // Gate 1 (always): no stale/deleted/expired row and no
+            // zero-similarity hit — every returned rid must be live at the
+            // queried snapshot with positive exact Jaccard.
             for (rid, est) in actual {
+                assert!(
+                    expected.exact_j.contains_key(rid),
+                    "MinHash returned stale/deleted/expired or zero-similarity rid {rid}:\n{}",
+                    context.render()
+                );
                 assert!(
                     *est > 0.0,
                     "MinHash zero-J hit rid {rid}:\n{}",
                     context.render()
                 );
             }
+            if expected.topk.is_empty() {
+                return;
+            }
+            // Gate 2: tie/estimation-noise-tolerant recall against the
+            // model's exact-Jaccard top-k. An expected row counts as found
+            // when the engine returned it, or when the engine returned an
+            // unused row whose exact Jaccard is at least as high (the
+            // estimator legitimately reorders near-ties). A genuine LSH
+            // band miss can only substitute a lower-similarity row and is
+            // counted as a miss.
+            let mut pool: Vec<(u64, f64)> = actual
+                .iter()
+                .map(|(rid, _)| (*rid, expected.exact_j[rid]))
+                .collect();
+            pool.sort_by(|(r1, j1), (r2, j2)| j2.total_cmp(j1).then_with(|| r1.cmp(r2)));
+            let mut found = 0usize;
+            for (rid, ej) in &expected.topk {
+                if let Some(pos) = pool.iter().position(|(r, _)| r == rid) {
+                    pool.remove(pos);
+                    found += 1;
+                } else if let Some(pos) = pool.iter().position(|(_, j)| *j >= *ej) {
+                    pool.remove(pos);
+                    found += 1;
+                }
+            }
+            let recall = found as f32 / expected.topk.len() as f32;
+            self.recall_samples.borrow_mut().push(recall);
+            // Total LSH failure on a non-empty oracle answer fails
+            // immediately; the aggregate median floor is enforced in
+            // `finish`.
+            assert!(
+                recall > 0.0,
+                "MinHash total recall failure (0/{}) at one checkpoint:\n{}",
+                expected.topk.len(),
+                context.render()
+            );
         }
 
         fn is_exact(&self) -> bool {
@@ -2725,12 +2825,42 @@ mod families {
         }
 
         fn recall_floor(&self) -> f32 {
-            0.0
+            MINHASH_GENERAL_RECALL_FLOOR
+        }
+
+        fn finish(&self, context: &FailureContext) {
+            let samples = self.recall_samples.borrow();
+            assert!(
+                !samples.is_empty(),
+                "MinHash oracle recorded no recall samples:\n{}",
+                context.render()
+            );
+            let mut sorted = samples.clone();
+            sorted.sort_by(f32::total_cmp);
+            let median = sorted[sorted.len() / 2];
+            let min = *sorted.first().unwrap();
+            emit_oracle_metric(
+                "index_churn_oracle::minhash_recall",
+                serde_json::json!({
+                    "median": median,
+                    "min": min,
+                    "samples": samples.len(),
+                    "floor": MINHASH_GENERAL_RECALL_FLOOR,
+                }),
+                "recall",
+            );
+            assert!(
+                median >= self.recall_floor(),
+                "MinHash median recall {median} < floor {} (min {min}, {} samples):\n{}",
+                self.recall_floor(),
+                samples.len(),
+                context.render()
+            );
         }
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
-            let rids: Vec<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.iter().map(|(_, s)| *s).collect();
+            let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
@@ -2741,7 +2871,7 @@ mod families {
         }
 
         fn expected_full_count(&self, expected: &Self::Expected) -> usize {
-            expected.len()
+            expected.topk.len()
         }
     }
 }
@@ -3003,20 +3133,24 @@ mod replay {
             }
             // 60..=62: TTL enable (3%; removed when TTL is off)
             60..=62 if !config.ttl.off() => {
-                // 1-hour TTL — long enough that the rows are not expired
-                // during a multi-second test run; the `set_ttl` path is
-                // exercised end-to-end. Per-row TTL expiry semantics are
-                // covered in `tests/ttl.rs`.
+                // 100-year TTL — long enough that NO row expires during the
+                // run (the rng-generated nonces sit ~1ms after the epoch, so
+                // any human-scale duration would expire them); the `set_ttl`
+                // path is exercised end-to-end without collapsing the
+                // eligible set the checkpoint oracles rank over. Per-row TTL
+                // expiry semantics are covered in `tests/ttl.rs`, and the
+                // expire-everything variant is op 71 behind the TTL axis.
+                const CHURN_TTL_NANOS: u64 = 3_155_760_000_000_000_000; // 100 years
                 table
-                    .set_ttl("nonce", 3_600_000_000_000)
+                    .set_ttl("nonce", CHURN_TTL_NANOS)
                     .unwrap_or_else(|e| panic!("set_ttl op {op_index}: {e}"));
                 harness
                     .model
-                    .set_ttl(family.non_indexed_column(), 3_600_000_000_000);
+                    .set_ttl(family.non_indexed_column(), CHURN_TTL_NANOS);
                 harness.ttl_version += 1;
                 harness.record(Op::SetTtl {
                     column_id: family.non_indexed_column(),
-                    duration_nanos: 3_600_000_000_000,
+                    duration_nanos: CHURN_TTL_NANOS,
                 });
             }
             // 63: clear TTL (1%)
@@ -3531,6 +3665,29 @@ mod replay {
             );
         }
 
+        // Family-specific end-of-replay gate (MinHash median recall).
+        let mut model_sorted: Vec<u64> = model_rids.iter().copied().collect();
+        model_sorted.sort_unstable();
+        let mut engine_sorted: Vec<u64> = engine_rids.iter().copied().collect();
+        engine_sorted.sort_unstable();
+        let final_context = FailureContext {
+            family: family.name().to_string(),
+            seed,
+            operation_index: total_ops,
+            snapshot_epoch: snap.epoch,
+            last_50_ops: harness.tail(50),
+            expected_row_ids: model_sorted,
+            actual_row_ids: engine_sorted,
+            expected_scores: Vec::new(),
+            actual_scores: Vec::new(),
+            eligible_count: model_rids.len(),
+            visibility_rejected: harness.model.tombstones.len(),
+            authorization_rejected: 0,
+            candidate_cap_hit: false,
+            underfill_reason: UnderfillReason::None,
+        };
+        family.finish(&final_context);
+
         if let Some(path) = &config.metrics_json {
             let stale = harness.model.tombstones.len();
             let live = engine_rids.len();
@@ -3669,7 +3826,11 @@ fn churn_oracle_sparse() {
 
 #[test]
 fn churn_oracle_minhash() {
-    family_test(MinHashFamily, operation_count(75), "minhash");
+    family_test(
+        MinHashFamily::default(),
+        operation_count(MINHASH_MEDIAN_GATE_OPS),
+        "minhash",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3915,8 +4076,10 @@ fn churn_oracle_pr_smoke_all_families() {
     // PR smoke (spec §47.1): every family × every PR_SMOKE_SEED seed. The
     // per-family op count is intentionally low (75) so PR runs stay fast;
     // the spec's 500-op density is exercised by the per-family tests via
-    // `MONGRELDB_ORACLE_OPERATIONS=500 cargo test ...`. Fails closed on any
-    // recall-floor divergence.
+    // `MONGRELDB_ORACLE_OPERATIONS=500 cargo test ...`. MinHash is the one
+    // exception: its median-recall gate (§10.6) needs the 500-op density to
+    // be meaningful, so its leg runs at MINHASH_MEDIAN_GATE_OPS. Fails
+    // closed on any recall-floor divergence.
     let config = OracleConfig::from_env();
     for &seed in &PR_SMOKE_SEEDS {
         let d = tempdir().expect("tempdir");
@@ -4041,11 +4204,14 @@ fn churn_oracle_pr_smoke_all_families() {
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
+        // MinHash runs at the documented 500-op density: its general-recall
+        // gate is a median over per-checkpoint samples (§10.6), which needs
+        // more checkpoints than the fast 75-op mix provides.
         run_replay(
-            MinHashFamily,
+            MinHashFamily::default(),
             seed,
-            75,
-            25,
+            operation_count(MINHASH_MEDIAN_GATE_OPS),
+            50,
             &d,
             None,
             Some(&enc),
