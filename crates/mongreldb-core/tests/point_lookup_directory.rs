@@ -10,6 +10,23 @@ use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{Database, RowId, Table, Value};
 use tempfile::tempdir;
 
+/// Emit a structured one-line JSON record for the residual-closure script
+/// (`scripts/run-residual-closure.sh`) to harvest. The script greps for
+/// lines starting with `{"test":` and writes them to the corresponding
+/// `<topic>-results.jsonl` artifact.
+macro_rules! emit_metric {
+    ($name:literal, $metric:expr, $unit:literal) => {
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": $name,
+                "metric": $metric,
+                "unit": $unit,
+            })
+        )
+    };
+}
+
 fn pk_schema() -> Schema {
     Schema {
         schema_id: 1,
@@ -762,6 +779,13 @@ fn complete_directory_miss_opens_zero_run_readers() {
         after.directory_lookup_hit > before.directory_lookup_hit,
         "complete directory miss must still register a hit (directory was usable)"
     );
+    // Spec §13.7: the residual-closure script consumes this JSON record
+    // instead of grepping cargo's human-readable test output.
+    emit_metric!(
+        "point_lookup_directory::complete_miss_opens_zero_readers",
+        run_readers_delta,
+        "readers"
+    );
 
     // Sanity: an existing live row still resolves through the directory
     // and is unchanged by the miss exercise.
@@ -991,4 +1015,230 @@ fn complete_miss_does_not_record_fallback() {
         after.directory_complete_miss_total - before.directory_complete_miss_total >= 1,
         "complete miss must increment complete_miss_total"
     );
+}
+
+// ----------------------------------------------------------------------------
+// REM-A / REM-B — point-directory HLC authority proofs (spec §5.6, §6.12).
+//
+// These tests install synthetic runs with exact (epoch, HLC) stamps through
+// the `__install_run_for_test` seam — the public write path stamps every
+// commit with `hlc.now()`, so exact stamps are not injectable otherwise —
+// rebuild the directory through the production publish path, and assert that
+// directory-assisted `Table::get` equals a forced full-run oracle (the
+// `UnavailableOrStale` range-scan branch reached by disabling the directory
+// via `__set_run_lookup_complete_for_test`).
+// ----------------------------------------------------------------------------
+
+use mongreldb_core::{Epoch, Row, Snapshot};
+use mongreldb_types::hlc::HlcTimestamp;
+
+fn hlc(physical_micros: u64) -> HlcTimestamp {
+    HlcTimestamp {
+        physical_micros,
+        logical: 0,
+        node_tiebreaker: 0,
+    }
+}
+
+fn stamped_row(rid: RowId, epoch: u64, hlc_micros: u64, value: i64) -> Row {
+    Row::new_with_hlc(rid, Epoch(epoch), hlc(hlc_micros)).with_column(1, Value::Int64(value))
+}
+
+fn unstamped_row(rid: RowId, epoch: u64, value: i64) -> Row {
+    Row::new(rid, Epoch(epoch)).with_column(1, Value::Int64(value))
+}
+
+/// Read `rid` under `snap` with the directory path forcibly disabled: the
+/// range-scan fallback opens every active run, so this is the full-run oracle
+/// the directory-assisted path must agree with.
+fn forced_full_run_oracle(table: &mut Table, rid: RowId, snap: Snapshot) -> Option<Row> {
+    table.__set_run_lookup_complete_for_test(false);
+    let oracle = table.get(rid, snap);
+    table.__set_run_lookup_complete_for_test(true);
+    oracle
+}
+
+/// Assert the directory-assisted read and the forced full-run oracle return
+/// the same version of `rid`.
+fn assert_directory_matches_oracle(
+    table: &mut Table,
+    rid: RowId,
+    snap: Snapshot,
+    expected_value: i64,
+) -> Row {
+    let oracle = forced_full_run_oracle(table, rid, snap)
+        .unwrap_or_else(|| panic!("full-run oracle must find rid {rid:?}"));
+    assert_eq!(
+        oracle.columns.get(&1),
+        Some(&Value::Int64(expected_value)),
+        "full-run oracle disagrees with the expected winner"
+    );
+
+    let got = table
+        .get(rid, snap)
+        .unwrap_or_else(|| panic!("directory-assisted get must find rid {rid:?}"));
+    assert_eq!(
+        got.columns.get(&1),
+        Some(&Value::Int64(expected_value)),
+        "directory-assisted get returned the wrong version"
+    );
+    assert_eq!(
+        got.committed_epoch, oracle.committed_epoch,
+        "directory-assisted get must return the same version as the full-run oracle"
+    );
+    assert_eq!(
+        got.commit_ts, oracle.commit_ts,
+        "directory-assisted get must return the same commit_ts as the full-run oracle"
+    );
+    got
+}
+
+/// REM-A (spec §5.6): one immutable run carries two stamped versions of the
+/// same `RowId` — HLC 100 ("visible") and HLC 1,000 ("future"). A snapshot
+/// at HLC 500 spans the locator's HLC envelope: the run must be opened and
+/// the HLC-100 version returned. The pre-fix proof compared `max_hlc`
+/// (1,000) against the snapshot and skipped the run entirely.
+#[test]
+fn hlc_spanning_run_returns_visible_older_stamped_version() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = RowId(7);
+    table
+        .__install_run_for_test(&[
+            stamped_row(rid, 10, 100, 100),
+            stamped_row(rid, 20, 1_000, 1_000),
+        ])
+        .unwrap();
+    table.__rebuild_run_lookup_for_test().unwrap();
+
+    let snap = Snapshot::at_hlc(Epoch(15), hlc(500));
+
+    let before = table.lookup_metrics_snapshot();
+    let got = assert_directory_matches_oracle(&mut table, rid, snap, 100);
+    let after = table.lookup_metrics_snapshot();
+
+    assert_eq!(
+        got.commit_ts,
+        Some(hlc(100)),
+        "the visible HLC-100 version must win over the HLC-1000 future version"
+    );
+    assert_eq!(
+        after.directory_run_readers_opened - before.directory_run_readers_opened,
+        1,
+        "the run spanning the snapshot must be opened, not pruned"
+    );
+}
+
+/// REM-A companion: a run whose *minimum* HLC is already above the snapshot
+/// is still skipped (the pruning must not regress into always-open).
+#[test]
+fn run_entirely_after_hlc_snapshot_stays_pruned() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = RowId(7);
+    table
+        .__install_run_for_test(&[stamped_row(rid, 10, 600, 600)])
+        .unwrap();
+    table.__rebuild_run_lookup_for_test().unwrap();
+
+    let snap = Snapshot::at_hlc(Epoch(15), hlc(500));
+    let before = table.lookup_metrics_snapshot();
+    let got = table.get(rid, snap);
+    let after = table.lookup_metrics_snapshot();
+
+    assert!(
+        got.is_none(),
+        "a run entirely above the HLC snapshot has no visible version"
+    );
+    assert_eq!(
+        after.directory_run_readers_opened - before.directory_run_readers_opened,
+        0,
+        "a run entirely above the snapshot must still be pruned"
+    );
+    // The oracle agrees there is nothing to return.
+    assert!(forced_full_run_oracle(&mut table, rid, snap).is_none());
+}
+
+/// REM-B wrong-result case 1 (spec §6.5): the remaining locator is mixed —
+/// an unstamped version (epoch 50) plus a stamped version (epoch 40,
+/// HLC 300) — and hides an HLC winner behind low epoch bounds. The current
+/// best (epoch 100, HLC 200) is stamped, so recency is HLC-based and the
+/// HLC-300 candidate must win. The snapshot epoch (45) hides the unstamped
+/// version, so the run's newest *visible* version is the stamped one. The
+/// pre-fix proof switched entirely to epoch for mixed locators and skipped
+/// the run.
+#[test]
+fn directory_get_matches_oracle_when_mixed_locator_hides_hlc_winner() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = RowId(7);
+    // Run 1: the stamped current-best candidate (epoch 100, HLC 200).
+    table
+        .__install_run_for_test(&[stamped_row(rid, 100, 200, 200)])
+        .unwrap();
+    // Run 2 (mixed): unstamped epoch 50 + stamped epoch 40 / HLC 300.
+    table
+        .__install_run_for_test(&[unstamped_row(rid, 50, 50), stamped_row(rid, 40, 300, 300)])
+        .unwrap();
+    table.__rebuild_run_lookup_for_test().unwrap();
+
+    let snap = Snapshot::at_hlc(Epoch(45), hlc(400));
+    let got = assert_directory_matches_oracle(&mut table, rid, snap, 300);
+    assert_eq!(got.commit_ts, Some(hlc(300)));
+}
+
+/// REM-B wrong-result case 2 (spec §6.6): an epoch-only snapshot with two
+/// stamped candidates. Both rows are epoch-visible, but recency between two
+/// stamped versions is HLC-based, so the HLC-300 candidate in the
+/// epoch-older run must win. The pre-fix proof only took the HLC path for
+/// HLC-authoritative snapshots and skipped the run on epoch bounds.
+#[test]
+fn directory_get_matches_oracle_when_epoch_snapshot_hides_hlc_winner() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = RowId(7);
+    table
+        .__install_run_for_test(&[stamped_row(rid, 100, 200, 200)])
+        .unwrap();
+    table
+        .__install_run_for_test(&[stamped_row(rid, 50, 300, 300)])
+        .unwrap();
+    table.__rebuild_run_lookup_for_test().unwrap();
+
+    let snap = Snapshot::at(Epoch(200));
+    let got = assert_directory_matches_oracle(&mut table, rid, snap, 300);
+    assert_eq!(got.commit_ts, Some(hlc(300)));
+}
+
+/// REM-B wrong-result case 3 (spec §6.7): the current best is unstamped
+/// (epoch 450) and the remaining stamped candidate (epoch 500, HLC 200) is
+/// HLC-visible under the snapshot (epoch 450, HLC 300) even though its local
+/// epoch exceeds the snapshot epoch. One side is unstamped, so recency falls
+/// back to epoch and the epoch-500 candidate must win. The pre-fix proof
+/// capped the locator epoch at the snapshot epoch (`min(500, 450) = 450`)
+/// and skipped the run. The HLC-400 filler version in run 1 keeps that run
+/// first under both orderings while being invisible at HLC 300.
+#[test]
+fn directory_get_matches_oracle_when_unstamped_best_faces_stamped_candidate() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
+    let rid = RowId(7);
+    // Run 1 (mixed): the unstamped best (epoch 450) + an HLC-invisible
+    // filler (epoch 600, HLC 400) that keeps this run first in the walk.
+    table
+        .__install_run_for_test(&[
+            unstamped_row(rid, 450, 450),
+            stamped_row(rid, 600, 400, 400),
+        ])
+        .unwrap();
+    // Run 2 (stamped-only): the HLC-visible epoch-500 candidate.
+    table
+        .__install_run_for_test(&[stamped_row(rid, 500, 200, 200)])
+        .unwrap();
+    table.__rebuild_run_lookup_for_test().unwrap();
+
+    let snap = Snapshot::at_hlc(Epoch(450), hlc(300));
+    let got = assert_directory_matches_oracle(&mut table, rid, snap, 200);
+    assert_eq!(got.commit_ts, Some(hlc(200)));
+    assert_eq!(got.committed_epoch, Epoch(500));
 }

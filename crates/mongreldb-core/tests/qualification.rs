@@ -57,6 +57,14 @@ fn percentile(sorted_or_unsorted: &mut [u128], fraction: f64) -> u128 {
     sorted_or_unsorted[((sorted_or_unsorted.len() - 1) as f64 * fraction).round() as usize]
 }
 
+/// Median absolute deviation around the median; REM-J evidence requires the
+/// distribution shape (min/max/MAD), not just percentiles.
+fn median_absolute_deviation(samples: &[u128], median: u128) -> u128 {
+    let mut deviations: Vec<u128> = samples.iter().map(|s| s.abs_diff(median)).collect();
+    deviations.sort_unstable();
+    deviations[deviations.len() / 2]
+}
+
 /// `/proc/self/status` field in bytes (Linux only; `None` elsewhere).
 fn rss_bytes(field: &str) -> Option<u64> {
     std::fs::read_to_string("/proc/self/status")
@@ -385,6 +393,9 @@ fn warm_point_query_p95_baseline() {
     let p50_ns = percentile(&mut samples_ns.clone(), 0.50);
     let p95_ns = percentile(&mut samples_ns.clone(), 0.95);
     let p99_ns = percentile(&mut samples_ns, 0.99);
+    let min_ns = *samples_ns.iter().min().unwrap();
+    let max_ns = *samples_ns.iter().max().unwrap();
+    let mad_ns = median_absolute_deviation(&samples_ns, p50_ns);
     println!(
         "{}",
         serde_json::json!({
@@ -392,7 +403,7 @@ fn warm_point_query_p95_baseline() {
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "rows": ROWS,
             "queries": QUERIES,
-            "point_query_latency": {"p50_us": p50_ns as f64 / 1e3, "p95_us": p95_ns as f64 / 1e3, "p99_us": p99_ns as f64 / 1e3},
+            "point_query_latency": {"p50_us": p50_ns as f64 / 1e3, "p95_us": p95_ns as f64 / 1e3, "p99_us": p99_ns as f64 / 1e3, "min_us": min_ns as f64 / 1e3, "max_us": max_ns as f64 / 1e3, "mad_us": mad_ns as f64 / 1e3},
             "peak_rss_bytes": peak_rss_bytes(),
         })
     );

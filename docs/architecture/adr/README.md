@@ -21,6 +21,9 @@ cluster formats are merged.
 | [0010](0010-rolling-upgrade-compatibility.md) | Rolling upgrade compatibility | Accepted |
 | [0011](0011-release-workspace-and-lock-boundaries.md) | Release workspace and lock boundaries | Accepted |
 | [0012](0012-swappable-ann-backends.md) | Swappable ANN backends (HNSW/DiskANN/IVF + PQ) | Accepted |
+| [0013](0013-persistent-result-cache-publication.md) | Persistent result-cache publication | Accepted |
+| [0014](0014-residual-closure-evidence.md) | Residual-closure evidence | Accepted |
+| [0015](0015-persistent-cache-publication-policy.md) | Persistent-cache publication failure policy and generation identity | Accepted |
 
 ## Format
 

@@ -157,6 +157,30 @@ impl Snapshot {
     }
 }
 
+/// Winner selection between two visible versions of the same `RowId` when
+/// candidates are folded in **physical write order** (oldest first): the
+/// candidate supersedes unless the current winner is *strictly* newer —
+/// i.e. an exact stamp tie goes to the later physical write. Every version
+/// container (Bε-tree leaf, internal buffer, PMA, sorted run) preserves
+/// insertion order among equal `(RowId, Epoch)` keys, so the later write is
+/// the tombstone for a same-span create+delete (and the live row for a
+/// same-span delete+re-put); without the tie rule the fold is unstable and
+/// a same-span deleted row can resurrect after flush/reopen.
+#[inline]
+pub fn version_supersedes(
+    candidate_epoch: Epoch,
+    candidate_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    current_epoch: Epoch,
+    current_commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+) -> bool {
+    !Snapshot::version_is_newer(
+        current_epoch,
+        current_commit_ts,
+        candidate_epoch,
+        candidate_commit_ts,
+    )
+}
+
 /// Compact `(epoch, commit_ts)` stamp used to compare candidates across runs
 /// without losing `commit_ts` at API boundaries (REM-001). Visibility still
 /// flows through [`Snapshot::observes_row`]; this helper only centralizes

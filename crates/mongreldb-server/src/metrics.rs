@@ -416,6 +416,39 @@ pub fn hot_lookup_metrics(snap: &LookupMetricsSnapshot) -> String {
         "hot_checkpoint_rejected_total {}\n",
         snap.hot_checkpoint_rejected_total
     ));
+    // REM-D §8.7: persistent result-cache publication availability.
+    out.push_str(
+        "# HELP result_cache_persist_unavailable_total Transitions of persistent result-cache publication to unavailable.\n",
+    );
+    out.push_str("# TYPE result_cache_persist_unavailable_total counter\n");
+    out.push_str(&format!(
+        "result_cache_persist_unavailable_total {}\n",
+        snap.result_cache_persist_unavailable_total
+    ));
+    out.push_str(
+        "# HELP result_cache_persist_skipped_total Query-path persistent result-cache writes skipped because publication was unavailable.\n",
+    );
+    out.push_str("# TYPE result_cache_persist_skipped_total counter\n");
+    out.push_str(&format!(
+        "result_cache_persist_skipped_total {}\n",
+        snap.result_cache_persist_skipped_total
+    ));
+    out.push_str(
+        "# HELP result_cache_worker_spawn_failures_total Persistent result-cache worker spawn / I/O-setup failures.\n",
+    );
+    out.push_str("# TYPE result_cache_worker_spawn_failures_total counter\n");
+    out.push_str(&format!(
+        "result_cache_worker_spawn_failures_total {}\n",
+        snap.result_cache_worker_spawn_failures_total
+    ));
+    out.push_str(
+        "# HELP result_cache_worker_shutdown_total Persistent result-cache worker shutdowns while the cache was live.\n",
+    );
+    out.push_str("# TYPE result_cache_worker_shutdown_total counter\n");
+    out.push_str(&format!(
+        "result_cache_worker_shutdown_total {}\n",
+        snap.result_cache_worker_shutdown_total
+    ));
     out
 }
 
@@ -459,6 +492,11 @@ pub fn aggregate_hot_metrics(state: &crate::AppState) -> LookupMetricsSnapshot {
         agg.result_cache_persist_errors_total += snap.result_cache_persist_errors_total;
         agg.result_cache_persist_shutdown_abandoned_total +=
             snap.result_cache_persist_shutdown_abandoned_total;
+        agg.result_cache_persist_unavailable_total += snap.result_cache_persist_unavailable_total;
+        agg.result_cache_persist_skipped_total += snap.result_cache_persist_skipped_total;
+        agg.result_cache_worker_spawn_failures_total +=
+            snap.result_cache_worker_spawn_failures_total;
+        agg.result_cache_worker_shutdown_total += snap.result_cache_worker_shutdown_total;
         for i in 0..agg.hot_fallback_reasons.len() {
             agg.hot_fallback_reasons[i] += snap.hot_fallback_reasons[i];
         }

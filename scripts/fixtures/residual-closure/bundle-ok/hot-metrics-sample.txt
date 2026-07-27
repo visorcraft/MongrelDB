@@ -1,0 +1,6 @@
+# HELP hot_lookup_total Total primary-key lookups.
+# TYPE hot_lookup_total counter
+hot_lookup_total 128
+# HELP hot_fallback_total Total HOT fallbacks.
+# TYPE hot_fallback_total counter
+hot_fallback_total 0

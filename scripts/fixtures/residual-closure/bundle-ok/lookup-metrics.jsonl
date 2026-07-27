@@ -1,0 +1,3 @@
+{"test":"lookup_metrics::healthy_pk_lookup_records_zero_fallback","metric":0,"unit":"fallbacks"}
+{"test":"lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback","metric":0,"unit":"fallbacks"}
+{"test":"lookup_metrics::snapshot_to_metrics_is_consistent","metric":1,"unit":"consistent"}

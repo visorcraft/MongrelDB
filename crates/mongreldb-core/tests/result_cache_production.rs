@@ -441,6 +441,115 @@ fn production_loader_rejects_older_logical_generation() {
 }
 
 // ============================================================================
+// 19.5b — production loader rejects a FUTURE logical generation (REM-E §9.5)
+// ============================================================================
+
+/// Rewrite the `run_generation` field (offset 24..32) of the first `.bin`
+/// frame under `rcache` to `new_gen` and recompute the CRC32C trailer, so the
+/// tampered file is structurally valid and only the generation check can
+/// reject it. Returns the tampered file's path.
+fn tamper_frame_generation(rcache: &std::path::Path, new_gen: u64) -> std::path::PathBuf {
+    let path = first_bin_file(rcache).expect("file present");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[24..32].copy_from_slice(&new_gen.to_le_bytes());
+    let body_len = bytes.len() - 4;
+    let new_crc = crc32c::crc32c(&bytes[..body_len]);
+    bytes[body_len..].copy_from_slice(&new_crc.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    path
+}
+
+fn read_frame_generation(path: &std::path::Path) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    u64::from_le_bytes(bytes[24..32].try_into().unwrap())
+}
+
+#[test]
+fn production_loader_rejects_future_logical_generation() {
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+    let rcache = rcache_path(&table_dir);
+
+    let mut db = Table::create(&table_dir, test_schema(), 1).unwrap();
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+    let q = alpha_query();
+    let _ = db.query_cached(&q).unwrap();
+    let _ = db.flush_persistent_cache(2_000);
+    db.shutdown_persistent_cache(500);
+    drop(db);
+
+    // Edit the frame's generation to `current + 100` (a frame "from the
+    // future", as after a backup/PITR restore) and recompute the CRC so only
+    // the generation check can reject it.
+    let current_gen = read_frame_generation(&first_bin_file(&rcache).expect("file present"));
+    let path = tamper_frame_generation(&rcache, current_gen + 100);
+
+    // Reopen: the loader must reject and remove the future-generation file.
+    let mut db2 = Table::open(&table_dir).unwrap();
+    db2._set_persist_min_bytes_for_test(0);
+    let pre_disk_hit = db2.lookup_metrics_snapshot().result_cache_disk_hit;
+    assert!(
+        !path.exists(),
+        "future-generation file should be removed by the loader"
+    );
+
+    // The query recomputes the correct result; the rejected file must not
+    // have counted as a disk hit.
+    let r = db2.query_cached(&q).unwrap();
+    assert_eq!(r.len(), 100);
+    let post_disk_hit = db2.lookup_metrics_snapshot().result_cache_disk_hit;
+    assert_eq!(
+        post_disk_hit, pre_disk_hit,
+        "rejected future-generation file must not increment the disk-hit counter"
+    );
+
+    // The cache recovers: after the recompute is published, a fresh frame at
+    // the exact current generation exists and is loadable.
+    let _ = db2.flush_persistent_cache(2_000);
+    let new_path = first_bin_file(&rcache).expect("fresh frame republished");
+    assert_eq!(read_frame_generation(&new_path), current_gen);
+}
+
+#[test]
+fn production_loader_rejects_future_logical_generation_encrypted() {
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+    let rcache = rcache_path(&table_dir);
+    let passphrase = "hunter2";
+
+    let mut db = Table::create_encrypted(&table_dir, test_schema(), 1, passphrase).unwrap();
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+    let q = alpha_query();
+    let _ = db.query_cached(&q).unwrap();
+    let _ = db.flush_persistent_cache(2_000);
+    db.shutdown_persistent_cache(500);
+    drop(db);
+
+    // The frame header is plaintext even when the payload is encrypted, so
+    // the same generation tamper + CRC recompute applies.
+    let current_gen = read_frame_generation(&first_bin_file(&rcache).expect("file present"));
+    let path = tamper_frame_generation(&rcache, current_gen + 100);
+
+    let mut db2 = Table::open_encrypted(&table_dir, passphrase).unwrap();
+    let pre_disk_hit = db2.lookup_metrics_snapshot().result_cache_disk_hit;
+    assert!(
+        !path.exists(),
+        "future-generation encrypted frame should be removed by the loader"
+    );
+    let r = db2.query_cached(&q).unwrap();
+    assert_eq!(r.len(), 100);
+    let post_disk_hit = db2.lookup_metrics_snapshot().result_cache_disk_hit;
+    assert_eq!(
+        post_disk_hit, pre_disk_hit,
+        "rejected future-generation file must not increment the disk-hit counter"
+    );
+}
+
+// ============================================================================
 // 19.6 — corrupt frame / wrong key / truncated header
 // ============================================================================
 
@@ -573,13 +682,15 @@ fn production_loader_rejects_legacy_unframed_files() {
 }
 
 // ============================================================================
-// 19.7 — synchronous fallback parity: same MLCP format
+// 19.7 — explicit maintenance sync API still writes MLCP (REM-D §8.8)
 // ============================================================================
 
 #[test]
-fn synchronous_fallback_parity() {
-    // Disable the persistent writer (post-construction), then drive a
-    // cached query. The sync fallback must use the same MLCP format as the
+fn explicit_maintenance_sync_api_still_writes_mlcp() {
+    // The query path never publishes synchronously — even after the worker
+    // is shut down. The explicit maintenance API
+    // (`_persist_cached_entry_synchronously_for_maintenance`) remains as the
+    // only synchronous publisher, and it uses the same MLCP format as the
     // async worker.
     let dir = tempdir().unwrap();
     let table_dir = dir.path().to_path_buf();
@@ -589,15 +700,23 @@ fn synchronous_fallback_parity() {
     db.bulk_load(rows(200)).unwrap();
     db.flush().unwrap();
     db._set_persist_min_bytes_for_test(0);
-    // Shut the worker down so the cache inserts use the sync fallback.
+    // Shut the worker down so no background writer is installed.
     db.shutdown_persistent_cache(500);
 
     let q = alpha_query();
     let r = db.query_cached(&q).unwrap();
     assert_eq!(r.len(), 100);
+    // The query-path persist was skipped (publication disabled): no frame.
+    assert!(
+        first_bin_file(&rcache).is_none(),
+        "query path must not write synchronously after worker shutdown"
+    );
+
+    // The explicit maintenance flush publishes the in-memory entry.
+    assert!(db._persist_cached_entry_synchronously_for_maintenance(&q));
 
     // The on-disk file must start with MLCP.
-    let path = first_bin_file(&rcache).expect("sync fallback wrote a file");
+    let path = first_bin_file(&rcache).expect("maintenance flush wrote a file");
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[..FRAME_MAGIC.len()], &FRAME_MAGIC);
     // It must round-trip through the shared decoder.
@@ -611,6 +730,178 @@ fn synchronous_fallback_parity() {
     let mut db2 = Table::open(&table_dir).unwrap();
     let r2 = db2.query_cached(&q).unwrap();
     assert_eq!(r2.len(), 100);
+}
+
+// ============================================================================
+// REM-D §8.8 — publication unavailability never performs query-thread I/O
+// ============================================================================
+
+fn beta_query() -> Query {
+    Query::new().and(Condition::BitmapEq {
+        column_id: 2,
+        value: b"beta!".to_vec(),
+    })
+}
+
+fn count_bin_files(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("bin"))
+        .count()
+}
+
+#[test]
+fn worker_spawn_failure_does_not_perform_query_thread_io() {
+    // Force worker startup failure through the real `Table::create` wiring.
+    // The table must still open and serve queries; the query thread must
+    // never fall back to synchronous persistent-cache I/O.
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+    let rcache = rcache_path(&table_dir);
+
+    Table::_force_persistent_worker_spawn_failure_for_test(true);
+    let created = Table::create(&table_dir, test_schema(), 1);
+    Table::_force_persistent_worker_spawn_failure_for_test(false);
+    let mut db = created.unwrap();
+
+    let snap = db.lookup_metrics_snapshot();
+    assert_eq!(
+        snap.result_cache_worker_spawn_failures_total, 1,
+        "spawn failure must be counted"
+    );
+    assert_eq!(
+        snap.result_cache_persist_unavailable_total, 1,
+        "the unavailable transition must be counted"
+    );
+
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+
+    let q = alpha_query();
+    let t0 = Instant::now();
+    let r = db.query_cached(&q).unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(r.len(), 100);
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "query must return promptly with no writer (took {elapsed:?})"
+    );
+
+    // No frame was written: publication was skipped, not performed inline.
+    assert!(
+        first_bin_file(&rcache).is_none(),
+        "worker absence must not produce a synchronous on-disk frame"
+    );
+    let snap = db.lookup_metrics_snapshot();
+    assert!(
+        snap.result_cache_persist_skipped_total >= 1,
+        "skipped publication must be counted"
+    );
+}
+
+#[test]
+fn query_after_writer_shutdown_does_not_write_synchronously() {
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+    let rcache = rcache_path(&table_dir);
+
+    let mut db = Table::create(&table_dir, test_schema(), 1).unwrap();
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+    let q = alpha_query();
+    let _ = db.query_cached(&q).unwrap();
+    let _ = db.flush_persistent_cache(2_000);
+    db.shutdown_persistent_cache(500);
+
+    let files_before = count_bin_files(&rcache);
+    // A different query (a fresh cache key) after the worker is gone.
+    let q2 = beta_query();
+    let r = db.query_cached(&q2).unwrap();
+    assert_eq!(r.len(), 100);
+    assert_eq!(
+        count_bin_files(&rcache),
+        files_before,
+        "no new frame may be written after writer shutdown"
+    );
+
+    let snap = db.lookup_metrics_snapshot();
+    assert!(
+        snap.result_cache_worker_shutdown_total >= 1,
+        "worker shutdown must be counted"
+    );
+    assert!(
+        snap.result_cache_persist_skipped_total >= 1,
+        "post-shutdown persist must be counted as skipped"
+    );
+}
+
+#[test]
+fn writer_unavailable_keeps_memory_cache_result() {
+    // The in-memory tier is authoritative: with publication disabled, the
+    // second identical query must be served from the memory cache.
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+
+    Table::_force_persistent_worker_spawn_failure_for_test(true);
+    let created = Table::create(&table_dir, test_schema(), 1);
+    Table::_force_persistent_worker_spawn_failure_for_test(false);
+    let mut db = created.unwrap();
+
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+
+    let q = alpha_query();
+    let pre = db.lookup_metrics_snapshot().result_cache_memory_hit;
+    let r1 = db.query_cached(&q).unwrap();
+    let r2 = db.query_cached(&q).unwrap();
+    let post = db.lookup_metrics_snapshot().result_cache_memory_hit;
+    assert_eq!(r1.len(), 100);
+    assert_eq!(r2.len(), 100);
+    assert!(
+        post > pre,
+        "second query must hit the in-memory cache (was {pre}, now {post})"
+    );
+}
+
+#[test]
+fn writer_unavailable_increments_skip_metric() {
+    // The skip must be observable both through `LookupMetricsSnapshot` and
+    // through the query trace.
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().to_path_buf();
+
+    Table::_force_persistent_worker_spawn_failure_for_test(true);
+    let created = Table::create(&table_dir, test_schema(), 1);
+    Table::_force_persistent_worker_spawn_failure_for_test(false);
+    let mut db = created.unwrap();
+
+    db.bulk_load(rows(200)).unwrap();
+    db.flush().unwrap();
+    db._set_persist_min_bytes_for_test(0);
+
+    let q = alpha_query();
+    let (r, trace) = mongreldb_core::trace::QueryTrace::capture(|| db.query_cached(&q));
+    assert_eq!(r.unwrap().len(), 100);
+    assert!(
+        trace.result_cache_persist_skipped,
+        "query trace must record the skipped persist ({trace})"
+    );
+    assert_eq!(
+        trace.result_cache_persist_skip_reason,
+        Some("worker_spawn_failed"),
+        "trace must carry the disabled reason label"
+    );
+
+    let snap = db.lookup_metrics_snapshot();
+    assert!(snap.result_cache_persist_skipped_total >= 1);
+    assert!(snap.result_cache_persist_unavailable_total >= 1);
+    assert!(snap.result_cache_worker_spawn_failures_total >= 1);
 }
 
 // ============================================================================

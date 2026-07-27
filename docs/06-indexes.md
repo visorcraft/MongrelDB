@@ -380,6 +380,70 @@ to replay its deterministic corpus, queries, and churn sequence. Replay also
 requires the same binary and oracle configuration. Leave it unset for a fresh
 corpus; every run must print its selected seed so a failure can be reproduced.
 
+### Churn-oracle coverage axes (nightly/weekly workflows)
+
+`crates/mongreldb-core/tests/index_churn_oracle.rs` honors the coverage-axis
+env contract consumed by `.github/workflows/index-churn-nightly.yml` and
+`index-churn-weekly.yml` (full contract in `scripts/churn-history-check.sh`).
+With none of these set, the harness runs the historical PR-smoke mix
+byte-for-byte; every knob only adds or removes coverage. `"1"` enables an
+axis' enhanced behavior, `"0"` removes the axis from the op mix entirely —
+including when the weekly profile would otherwise imply it:
+
+- `MONGRELDB_ORACLE_ENCRYPTION`: `"1"` creates the churn table itself with
+  AES-256-GCM (`Table::create_encrypted`, reopened via `open_encrypted`);
+  `"0"` also removes the encrypted-sibling lifecycle ops from the mix.
+- `MONGRELDB_ORACLE_TTL`: `"1"` adds an expire-everything TTL op (a 1µs TTL,
+  deterministic because the timestamp column always sits more than 1µs in
+  the past by the next checkpoint); `"0"` removes the set/clear TTL ops.
+- `MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS`: `"1"` adds pinned historical
+  snapshot reads — the harness captures the engine's visible row set at pin
+  time and asserts a later re-read of the pinned epoch never gains rows
+  (TTL expiry may only shrink it; a TTL policy change forces a re-pin).
+  `"0"` removes the snapshot-pin ops.
+- `MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE`: `"1"` adds a probe retrieval
+  with `max_fused_candidates = 1` so ANN queries exceed the candidate cap;
+  the trace's `candidate_cap_hit` is counted into the metrics JSON. The
+  hard candidate cap binds on the ANN retrieval path only: Sparse and
+  MinHash still run the probe (their paths accept the constrained
+  execution context) and FM/LearnedRange keep the delete-based pressure
+  op, because the exact query path exposes no candidate cap.
+- `MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE`: `"1"` adds a work-budget probe:
+  a zero-budget retrieval must fail explicitly with `WorkBudgetExceeded`
+  (or charge nothing on an empty index), and a generous budget must
+  succeed. Only the scored-retrieval surface (`Table::retrieve…`) accepts
+  a work budget, so the probe is engine-inert for FM/LearnedRange — an
+  honest limitation, not a silent skip.
+- `MONGRELDB_ORACLE_LIFECYCLE_OPS`: `"1"` raises flush/compact/rebuild/
+  close+reopen to full op-matrix weight; `"0"` removes all lifecycle ops.
+- `MONGRELDB_ORACLE_WEEKLY_PROFILE=1` implies `"1"` for every axis above
+  except encryption (the weekly workflow sets encryption per seed), and
+  tunes the mix: hot-key churn biased by
+  `MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO` (default 100 — a target bias,
+  not a guaranteed ratio; the achieved stale:live ratio is reported in the
+  metrics JSON), `MONGRELDB_ORACLE_HOT_KEY_HISTORY` (default 512 target
+  versions per hot key), plus explicit, step-scheduled compaction
+  (`MONGRELDB_ORACLE_COMPACTION_CYCLES`, default 8) and close+reopen
+  (`MONGRELDB_ORACLE_REOPEN_CYCLES`, default 4) cycles.
+- `MONGRELDB_ORACLE_METRICS_JSON`: path to a JSON object keyed by record
+  name with per-family op counts, op/query wall-clock latency percentiles
+  (p50/p95/p99/max), cap-hit and budget-trip counts, achieved stale:live
+  ratio, and peak RSS (`VmHWM`). Family tests share one process, so each
+  family merges its entry under a lock. The weekly workflow parses
+  `max_rss_kb` from `/usr/bin/time -v` externally.
+- `MONGRELDB_ORACLE_FAILURE_DIR`: on any oracle assertion failure the
+  harness copies the failing database directory, the full operation log,
+  and the panic context into `<dir>/<family>-seed-<seed>/` before
+  re-raising the panic.
+
+Known oracle limitation: compaction physically reclaims TTL-expired rows,
+while the oracle model treats TTL as a query-time filter that `clear_ttl`
+reverses. The harness therefore asserts TTL-adjacent properties
+directionally (the auth allowed-set check is subset-based: the engine must
+never return a row outside the allowed set, but a legitimately reclaimed
+row may be absent), matching the long-standing soft final-consistency
+check.
+
 ## Choosing the Right Index
 
 | Your query pattern | Recommended index |

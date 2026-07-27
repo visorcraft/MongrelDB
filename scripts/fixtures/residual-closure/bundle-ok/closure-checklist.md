@@ -1,0 +1,1 @@
+# Residual closure checklist (fixture)

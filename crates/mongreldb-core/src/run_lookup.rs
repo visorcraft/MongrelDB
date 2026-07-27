@@ -866,34 +866,45 @@ fn locator_is_newer(newer: RunLocator, older: RunLocator) -> bool {
 impl RunLocator {
     /// `true` when this locator *cannot* contain a version visible to
     /// `snapshot`. Conservative: when in doubt, return `false` so the caller
-    /// opens the run. Mirrors the snapshot rules in spec §8.4 step 7:
+    /// opens the run. The proof is split into the stamped and unstamped
+    /// possibilities and never uses positional tuple fields (REM-A):
     ///
-    /// - HLC-authoritative snapshot + all-stamped locator → compare HLC
-    ///   bounds; the locator must be entirely above the snapshot.
-    /// - Epoch-only snapshot + locator without HLC → compare epoch bounds.
-    /// - Mixed stamped/unstamped locator → conservative (return `false`).
-    /// - Unknown / missing bound → conservative.
+    /// - a stamped version may be visible when the locator's **minimum**
+    ///   HLC is at or below the snapshot (`min_hlc`, not `max_hlc` — a run
+    ///   can span the snapshot and still host an older visible version);
+    /// - an unstamped version may be visible when the locator's minimum
+    ///   epoch is at or below the snapshot epoch.
     pub fn is_impossible_for(&self, snapshot: Snapshot) -> bool {
-        // A run that also carries legacy (unstamped) versions may still host
-        // a version that's only visible under the epoch rule. Conservative
-        // means we must NOT skip such a run.
-        if self.contains_unstamped_versions {
+        let stamped_possible = self.may_have_visible_stamped_version(snapshot);
+        let unstamped_possible = self.may_have_visible_unstamped_version(snapshot);
+
+        !stamped_possible && !unstamped_possible
+    }
+
+    /// `true` when a stamped version inside this locator may be visible to
+    /// `snapshot`. HLC-authoritative snapshots compare HLC bounds; epoch-only
+    /// snapshots compare epoch bounds (stamped rows remain epoch-visible
+    /// under the dual-model rule). The locator's `min_epoch` is aggregated
+    /// across stamped and unstamped rows, so a false positive (opening a run
+    /// that could have been skipped) is possible — that is safe; a false
+    /// negative (skipping a run that contains a visible row) is not.
+    fn may_have_visible_stamped_version(&self, snapshot: Snapshot) -> bool {
+        let Some(min_hlc) = self.min_hlc else {
             return false;
+        };
+
+        if snapshot.uses_hlc_authority() {
+            min_hlc <= snapshot.commit_ts
+        } else {
+            self.min_epoch <= snapshot.epoch
         }
-        match (snapshot.uses_hlc_authority(), self.max_hlc, self.min_hlc) {
-            // HLC-authoritative + locator fully stamped: skip when the locator's
-            // minimum HLC already exceeds the snapshot — every version it
-            // contains is too new to be visible.
-            (true, Some(min_hlc), _) => min_hlc > snapshot.commit_ts,
-            // Epoch-only + locator has no HLC at all: skip when the locator's
-            // minimum epoch already exceeds the snapshot.
-            (false, None, _) => {
-                let snap_epoch = snapshot.epoch;
-                self.min_epoch > snap_epoch
-            }
-            // Any other mix is incomparable — stay conservative.
-            _ => false,
-        }
+    }
+
+    /// `true` when an unstamped version inside this locator may be visible to
+    /// `snapshot`. Unstamped visibility is epoch-based under both snapshot
+    /// modes.
+    fn may_have_visible_unstamped_version(&self, snapshot: Snapshot) -> bool {
+        self.contains_unstamped_versions && self.min_epoch <= snapshot.epoch
     }
 
     /// Safe early-stop proof for `Table::get`. Returns `true` when this
@@ -902,65 +913,78 @@ impl RunLocator {
     /// only when the locator provably cannot — the caller may then skip
     /// opening this run and increment the early-stop counter.
     ///
+    /// The proof asks the stamped and unstamped questions independently
+    /// (REM-B): a locator is skippable only when neither a stamped nor an
+    /// unstamped version inside it can beat `best`. The recency rule of
+    /// [`Snapshot::version_is_newer`] is honored exactly — HLC recency
+    /// applies whenever both candidates are stamped, regardless of whether
+    /// the snapshot itself is HLC-authoritative.
+    ///
     /// Conservative: when the metadata is too sparse to prove impossibility,
     /// returns `true` so the caller opens the run (correctness wins over the
     /// optimization).
-    ///
-    /// Cases handled (per REM-004 §36):
-    ///
-    /// 1. **Pure HLC**: locator is fully stamped (no unstamped versions),
-    ///    `best` is HLC-stamped, and the snapshot is HLC-authoritative.
-    ///    Comparison uses HLC order; a visible version with HLC > best.hlc
-    ///    would beat.
-    /// 2. **Mixed / epoch-only**: any other combination. Comparison falls
-    ///    back to epoch order; a visible version with epoch > best.epoch
-    ///    would beat.
-    /// 3. **Unknown metadata**: missing HLC bounds or other gaps → returns
-    ///    `true` (caller opens).
     pub(crate) fn can_contain_version_newer_than(
         &self,
         best: VersionStamp,
         snapshot: Snapshot,
     ) -> bool {
-        // Pure HLC comparison is only sound when:
-        //   - locator has no unstamped (so every row in the run is stamped),
-        //   - locator records an HLC bound (so we know the envelope),
-        //   - best is HLC-stamped (so HLC order applies),
-        //   - snapshot is HLC-authoritative (so visibility is HLC-bounded).
-        // Outside this quadruple intersection, the mixed comparison in
-        // `Snapshot::version_is_newer` falls back to epoch order, so we
-        // must check epoch. Missing HLC bounds also force the epoch path
-        // (unknown metadata must stay conservative).
-        let pure_hlc = !self.contains_unstamped_versions
-            && self.max_hlc.is_some()
-            && best.hlc.is_some()
-            && snapshot.uses_hlc_authority();
-
-        if pure_hlc {
-            // Need a stamped version with HLC > best.hlc, visible at
-            // snapshot.commit_ts. Visibility caps the locator's max HLC at
-            // snapshot.commit_ts.
-            let best_hlc = best.hlc.expect("pure_hlc requires best.hlc");
-            let max_locator_hlc = self.max_hlc.expect("pure_hlc requires max_hlc");
-            let max_visible_hlc = if max_locator_hlc <= snapshot.commit_ts {
-                max_locator_hlc
-            } else {
-                snapshot.commit_ts
-            };
-            return max_visible_hlc > best_hlc;
+        // Unknown metadata: the locator records no usable HLC envelope and
+        // claims no unstamped versions, so neither proof below can establish
+        // anything. Contradictory-by-construction metadata must stay
+        // conservative — open the run.
+        if (self.min_hlc.is_none() || self.max_hlc.is_none()) && !self.contains_unstamped_versions {
+            return true;
         }
+        self.stamped_version_may_beat(best, snapshot)
+            || self.unstamped_version_may_beat(best, snapshot)
+    }
 
-        // Mixed / legacy / unknown-metadata: comparison falls back to
-        // epoch order. A visible version with epoch > best.epoch beats.
-        // Visibility caps the locator's max epoch at snapshot.epoch (the
-        // dual-model snapshot rule applies whether the locator version is
-        // stamped or not).
-        let max_visible_epoch = if self.max_epoch <= snapshot.epoch {
-            self.max_epoch
-        } else {
-            snapshot.epoch
+    /// `true` when a **stamped** version inside this locator may be visible
+    /// to `snapshot` and strictly newer than `best`.
+    ///
+    /// - Stamped candidate versus stamped best compares HLC — under an
+    ///   HLC-authoritative snapshot visibility caps the locator's max HLC at
+    ///   `snapshot.commit_ts`; under an epoch-only snapshot visibility is
+    ///   epoch-based but recency is still HLC-based, so the proof only
+    ///   requires some stamped row to be epoch-visible while the locator's
+    ///   max HLC exceeds the best (the locator does not preserve the
+    ///   per-version epoch↔HLC correlation, so this is conservative).
+    /// - Stamped candidate versus unstamped best compares epoch. Under an
+    ///   HLC-authoritative snapshot the candidate is HLC-visible regardless
+    ///   of its local epoch, so `max_epoch` is **not** capped by
+    ///   `snapshot.epoch`; under an epoch-only snapshot both visibility and
+    ///   recency are epoch-based and the cap applies.
+    fn stamped_version_may_beat(&self, best: VersionStamp, snapshot: Snapshot) -> bool {
+        let (Some(min_hlc), Some(max_hlc)) = (self.min_hlc, self.max_hlc) else {
+            return false;
         };
-        max_visible_epoch > best.epoch
+
+        match best.hlc {
+            Some(best_hlc) => {
+                if snapshot.uses_hlc_authority() {
+                    max_hlc.min(snapshot.commit_ts) > best_hlc
+                } else {
+                    self.min_epoch <= snapshot.epoch && max_hlc > best_hlc
+                }
+            }
+            None => {
+                if snapshot.uses_hlc_authority() {
+                    min_hlc <= snapshot.commit_ts && self.max_epoch > best.epoch
+                } else {
+                    self.max_epoch.min(snapshot.epoch) > best.epoch
+                }
+            }
+        }
+    }
+
+    /// `true` when an **unstamped** version inside this locator may be
+    /// visible to `snapshot` and strictly newer than `best`. One side of the
+    /// comparison is unstamped, so recency uses epoch; unstamped visibility
+    /// is also epoch-based under both snapshot modes. `max_epoch` includes
+    /// stamped versions too, so this may be a false positive — it cannot
+    /// produce a false negative.
+    fn unstamped_version_may_beat(&self, best: VersionStamp, snapshot: Snapshot) -> bool {
+        self.contains_unstamped_versions && self.max_epoch.min(snapshot.epoch) > best.epoch
     }
 }
 
@@ -1407,9 +1431,8 @@ mod tests {
 
         // Truly unknown: locator with no HLC bounds AND no
         // contains_unstamped flag — metadata is contradictory and we
-        // cannot prove anything. The helper should fall back to the
-        // epoch path; with max_epoch = 10 and best.epoch = 5 the epoch
-        // path returns true (could beat on epoch alone).
+        // cannot prove anything in either direction. The proof must stay
+        // conservative and keep the run open.
         let l_unknown = RunLocator {
             run_id: 2,
             min_epoch: Epoch(10),
@@ -1425,6 +1448,311 @@ mod tests {
         assert!(
             l_unknown.can_contain_version_newer_than(best_lower, snap),
             "unknown metadata with higher possible epoch must stay conservative"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // REM-A (spec §5.6): the HLC impossibility proof must use `min_hlc`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn locator_spanning_hlc_snapshot_is_not_impossible() {
+        // One run carries an old visible version (HLC 100) and a newer
+        // invisible version (HLC 1,000); the snapshot sits between them.
+        let locator = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(20),
+            min_hlc: Some(hlc_from_phys(100)),
+            max_hlc: Some(hlc_from_phys(1_000)),
+            contains_unstamped_versions: false,
+        };
+        let snapshot = Snapshot::at_hlc(Epoch(15), hlc_from_phys(500));
+        assert!(
+            !locator.is_impossible_for(snapshot),
+            "min_hlc 100 <= snapshot 500: the run spans the snapshot and must be opened"
+        );
+    }
+
+    #[test]
+    fn locator_entirely_after_hlc_snapshot_is_impossible() {
+        let locator = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(20),
+            min_hlc: Some(hlc_from_phys(600)),
+            max_hlc: Some(hlc_from_phys(1_000)),
+            contains_unstamped_versions: false,
+        };
+        let snapshot = Snapshot::at_hlc(Epoch(15), hlc_from_phys(500));
+        assert!(
+            locator.is_impossible_for(snapshot),
+            "min_hlc 600 > snapshot 500: every stamped version is too new"
+        );
+    }
+
+    #[test]
+    fn locator_entirely_before_hlc_snapshot_is_possible() {
+        let locator = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(20),
+            min_hlc: Some(hlc_from_phys(100)),
+            max_hlc: Some(hlc_from_phys(200)),
+            contains_unstamped_versions: false,
+        };
+        let snapshot = Snapshot::at_hlc(Epoch(15), hlc_from_phys(500));
+        assert!(
+            !locator.is_impossible_for(snapshot),
+            "locator entirely below the snapshot is obviously possible"
+        );
+    }
+
+    #[test]
+    fn mixed_locator_is_impossible_only_when_both_paths_are_excluded() {
+        // Stamped path open (min_hlc visible) even though the epoch bound
+        // exceeds the snapshot epoch.
+        let stamped_side_open = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(60),
+            max_epoch: Epoch(70),
+            min_hlc: Some(hlc_from_phys(100)),
+            max_hlc: Some(hlc_from_phys(900)),
+            contains_unstamped_versions: true,
+        };
+        let snap = Snapshot::at_hlc(Epoch(50), hlc_from_phys(500));
+        assert!(
+            !stamped_side_open.is_impossible_for(snap),
+            "stamped min_hlc 100 <= 500 keeps the mixed locator possible"
+        );
+        // Unstamped path open (min_epoch visible) even though every HLC is
+        // above the snapshot.
+        let unstamped_side_open = RunLocator {
+            run_id: 2,
+            min_epoch: Epoch(40),
+            max_epoch: Epoch(70),
+            min_hlc: Some(hlc_from_phys(600)),
+            max_hlc: Some(hlc_from_phys(900)),
+            contains_unstamped_versions: true,
+        };
+        assert!(
+            !unstamped_side_open.is_impossible_for(snap),
+            "unstamped min_epoch 40 <= 50 keeps the mixed locator possible"
+        );
+        // Both paths excluded: min_hlc above the snapshot AND min_epoch
+        // above the snapshot epoch.
+        let fully_after = RunLocator {
+            run_id: 3,
+            min_epoch: Epoch(60),
+            max_epoch: Epoch(70),
+            min_hlc: Some(hlc_from_phys(600)),
+            max_hlc: Some(hlc_from_phys(900)),
+            contains_unstamped_versions: true,
+        };
+        assert!(
+            fully_after.is_impossible_for(snap),
+            "every stamped version is HLC-invisible and every unstamped version is epoch-invisible"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // REM-B (spec §6.12): authority-matrix tests for the split
+    // stamped/unstamped early-stop proof.
+    // ------------------------------------------------------------------
+
+    /// Spec §6.5: a mixed locator (unstamped epoch 50 + stamped epoch 40 /
+    /// HLC 300) must not be epoch-pruned against a stamped best (epoch 100 /
+    /// HLC 200) — the stamped candidate wins by HLC.
+    #[test]
+    fn mixed_locator_stamped_candidate_can_beat_stamped_best_by_hlc() {
+        let locator = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(40),
+            max_epoch: Epoch(50),
+            min_hlc: Some(hlc_from_phys(300)),
+            max_hlc: Some(hlc_from_phys(300)),
+            contains_unstamped_versions: true,
+        };
+        let snapshot = Snapshot::at_hlc(Epoch(200), hlc_from_phys(400));
+        let best = VersionStamp {
+            epoch: Epoch(100),
+            hlc: Some(hlc_from_phys(200)),
+        };
+        assert!(
+            locator.can_contain_version_newer_than(best, snapshot),
+            "stamped candidate HLC 300 > best HLC 200; the locator must be opened"
+        );
+    }
+
+    /// Spec §6.6: under an epoch-only snapshot, two stamped candidates are
+    /// still ordered by HLC — the epoch-only snapshot must not disable HLC
+    /// recency.
+    #[test]
+    fn epoch_snapshot_stamped_candidate_can_beat_stamped_best_by_hlc() {
+        let locator = stamped_loc(1, 50, 300);
+        let snapshot = Snapshot::at(Epoch(200));
+        let best = VersionStamp {
+            epoch: Epoch(100),
+            hlc: Some(hlc_from_phys(200)),
+        };
+        assert!(
+            locator.can_contain_version_newer_than(best, snapshot),
+            "stamped vs stamped recency is HLC-based even under an epoch-only snapshot"
+        );
+        // Negative cell: the locator's max HLC does not exceed the best.
+        let older = stamped_loc(2, 50, 150);
+        assert!(
+            !older.can_contain_version_newer_than(best, snapshot),
+            "max_hlc 150 <= best HLC 200 and no unstamped rows: provably cannot beat"
+        );
+        // Negative cell: no stamped row can be epoch-visible.
+        let future = RunLocator {
+            run_id: 3,
+            min_epoch: Epoch(300),
+            max_epoch: Epoch(400),
+            min_hlc: Some(hlc_from_phys(300)),
+            max_hlc: Some(hlc_from_phys(300)),
+            contains_unstamped_versions: false,
+        };
+        assert!(
+            !future.can_contain_version_newer_than(best, snapshot),
+            "min_epoch 300 > snapshot epoch 200: no stamped row is epoch-visible"
+        );
+    }
+
+    /// Spec §6.7: a stamped candidate under HLC visibility is visible
+    /// regardless of its local epoch, so its epoch must NOT be capped by
+    /// `snapshot.epoch` when the best is unstamped.
+    #[test]
+    fn hlc_snapshot_stamped_candidate_can_beat_unstamped_best_by_epoch() {
+        let locator = stamped_loc(1, 500, 200);
+        let snapshot = Snapshot::at_hlc(Epoch(300), hlc_from_phys(300));
+        let best = VersionStamp {
+            epoch: Epoch(400),
+            hlc: None,
+        };
+        assert!(
+            locator.can_contain_version_newer_than(best, snapshot),
+            "candidate HLC 200 <= snapshot 300 and epoch 500 > best epoch 400: must open"
+        );
+        // Negative cell: the stamped candidate is HLC-invisible.
+        let invisible = stamped_loc(2, 500, 400);
+        assert!(
+            !invisible.can_contain_version_newer_than(best, snapshot),
+            "min_hlc 400 > snapshot 300: no stamped version is visible"
+        );
+        // Negative cell: visible, but its epoch cannot beat the best.
+        let older = stamped_loc(3, 350, 200);
+        assert!(
+            !older.can_contain_version_newer_than(best, snapshot),
+            "max_epoch 350 <= best epoch 400: provably cannot beat"
+        );
+    }
+
+    /// Unstamped candidates use epoch visibility and epoch recency under
+    /// both snapshot modes.
+    #[test]
+    fn unstamped_candidate_uses_epoch_visibility_under_hlc_snapshot() {
+        let locator = loc(1, 250, None); // unstamped-only, epoch 250
+        let snapshot = Snapshot::at_hlc(Epoch(300), hlc_from_phys(1_000));
+        let best = VersionStamp {
+            epoch: Epoch(200),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        assert!(
+            locator.can_contain_version_newer_than(best, snapshot),
+            "unstamped epoch 250 > best epoch 200 and visible at snapshot epoch 300"
+        );
+        // Visibility cap: the snapshot epoch hides the whole locator.
+        let tight_snap = Snapshot::at_hlc(Epoch(240), hlc_from_phys(1_000));
+        let tight_best = VersionStamp {
+            epoch: Epoch(240),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        assert!(
+            !locator.can_contain_version_newer_than(tight_best, tight_snap),
+            "min(250, 240) = 240 <= best epoch 240: no visible unstamped version can beat"
+        );
+        // Epoch-only snapshot behaves identically for unstamped candidates.
+        let epoch_snap = Snapshot::at(Epoch(300));
+        assert!(
+            locator.can_contain_version_newer_than(best, epoch_snap),
+            "unstamped epoch comparison does not depend on the snapshot mode"
+        );
+    }
+
+    /// Metadata that cannot prove anything in either direction must keep the
+    /// run open.
+    #[test]
+    fn unknown_metadata_is_conservative() {
+        let best = VersionStamp {
+            epoch: Epoch(5),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        let hlc_snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(100));
+        let epoch_snap = Snapshot::at(Epoch(20));
+        // Contradictory: claims fully stamped but records no HLC envelope.
+        let no_envelope = RunLocator {
+            run_id: 1,
+            min_epoch: Epoch(10),
+            max_epoch: Epoch(10),
+            min_hlc: None,
+            max_hlc: None,
+            contains_unstamped_versions: false,
+        };
+        for snap in [hlc_snap, epoch_snap] {
+            assert!(
+                no_envelope.can_contain_version_newer_than(best, snap),
+                "missing HLC envelope without the unstamped flag is unknown: stay conservative"
+            );
+        }
+        // Partial envelope (min without max) is equally unprovable.
+        let partial = RunLocator {
+            min_hlc: Some(hlc_from_phys(10)),
+            ..no_envelope
+        };
+        assert!(
+            partial.can_contain_version_newer_than(best, hlc_snap),
+            "a partial HLC envelope cannot prove impossibility: stay conservative"
+        );
+    }
+
+    /// Strict inequality is required everywhere: equal HLC or equal epoch
+    /// never counts as newer.
+    #[test]
+    fn equal_authority_does_not_count_as_strictly_newer() {
+        let hlc_snap = Snapshot::at_hlc(Epoch(20), hlc_from_phys(100));
+        // Stamped vs stamped, equal HLC.
+        let stamped = stamped_loc(1, 10, 50);
+        let stamped_best = VersionStamp {
+            epoch: Epoch(10),
+            hlc: Some(hlc_from_phys(50)),
+        };
+        assert!(
+            !stamped.can_contain_version_newer_than(stamped_best, hlc_snap),
+            "equal HLC is not strictly newer"
+        );
+        // Unstamped vs unstamped, equal epoch.
+        let unstamped = loc(2, 10, None);
+        let unstamped_best = VersionStamp {
+            epoch: Epoch(10),
+            hlc: None,
+        };
+        assert!(
+            !unstamped.can_contain_version_newer_than(unstamped_best, hlc_snap),
+            "equal epoch is not strictly newer"
+        );
+        // Stamped vs unstamped best under an epoch-only snapshot, equal
+        // epoch.
+        let epoch_snap = Snapshot::at(Epoch(20));
+        assert!(
+            !stamped.can_contain_version_newer_than(unstamped_best, epoch_snap),
+            "equal epoch is not strictly newer on the stamped-vs-unstamped path"
+        );
+        // Unstamped candidate vs stamped best, equal epoch.
+        assert!(
+            !unstamped.can_contain_version_newer_than(stamped_best, epoch_snap),
+            "equal epoch is not strictly newer on the unstamped path"
         );
     }
 }

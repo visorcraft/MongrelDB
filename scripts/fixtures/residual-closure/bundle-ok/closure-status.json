@@ -1,0 +1,33 @@
+{
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "short_sha": "0123456789ab",
+  "toolchain": "1.97.1",
+  "started_at": "2026-01-01T00:00:00Z",
+  "completed_at": "2026-01-01T01:00:00Z",
+  "suites": [
+    {"name": "point_lookup_directory", "exit_code": 0, "passed": 12, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "run_lookup_unit", "exit_code": 0, "passed": 8, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "rem001_multi_run_hlc_authority", "exit_code": 0, "passed": 8, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "sorted_run_hlc_visibility", "exit_code": 0, "passed": 6, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "point_lookup_runs", "exit_code": 0, "passed": 4, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "pass"},
+    {"name": "result_cache_async_persistence", "exit_code": 0, "passed": 30, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "result_cache_production", "exit_code": 0, "passed": 10, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "controlled_scan_streaming", "exit_code": 0, "passed": 16, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "controlled_scan_streaming_release", "exit_code": 0, "passed": 16, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "hnsw_connectivity", "exit_code": 0, "passed": 5, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "index_churn_oracle", "exit_code": 0, "passed": 12, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "lookup_metrics", "exit_code": 0, "passed": 9, "failed": 0, "ignored": 0, "required_tests": "pass", "thresholds": "skipped"},
+    {"name": "hot_metrics_export", "exit_code": 0, "passed": 2, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "full_core_tests", "exit_code": 0, "passed": 900, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "full_workspace_tests", "exit_code": 0, "passed": 1400, "failed": 0, "ignored": 0, "required_tests": "skipped", "thresholds": "skipped"},
+    {"name": "index_churn_oracle_eight_seed_matrix", "exit_code": 0, "required_tests": "skipped", "thresholds": "skipped"}
+  ],
+  "thresholds": {
+    "complete_miss_reader_opens": 0,
+    "complete_miss_ok": 1,
+    "point_lookup_256_to_1_p95_ratio": 1.4,
+    "point_lookup_p95_ratio_observed": 1.2,
+    "point_lookup_p95_ratio_ok": 1
+  },
+  "overall": "pass"
+}

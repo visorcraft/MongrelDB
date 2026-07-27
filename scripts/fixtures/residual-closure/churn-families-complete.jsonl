@@ -1,0 +1,10 @@
+{"test":"index_churn_oracle::family::fm","metric":123,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::learned_range","metric":120,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::ann_hnsw_dense","metric":121,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::ann_hnsw_binary_sign","metric":119,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::ann_product_quantization","metric":122,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::ann_diskann_dense","metric":121,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::ann_ivf_dense","metric":120,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::sparse","metric":118,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::family::minhash","metric":117,"unit":"live_rid_count"}
+{"test":"index_churn_oracle::seed_determinism","metric":1,"unit":"seed"}

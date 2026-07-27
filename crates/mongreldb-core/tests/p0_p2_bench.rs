@@ -18,9 +18,10 @@
 //! Gate separation:
 //! - The default-standalone build (no `cluster`/`oidc`/`vault-kms` features)
 //!   is the production target for P2; the numbers below match that path.
-//! - The full-feature build (`--features cluster,oidc,vault-kms`) is a
-//!   separate gate; it pulls in additional cold code paths and is run via:
-//!   `cargo test -p mongreldb-core --test p0_p2_bench --release --features cluster,oidc,vault-kms`
+//! - The full-feature build (`cluster`/`oidc`/`vault-kms`) is a separate
+//!   gate. Those features live on `mongreldb-server`, not `mongreldb-core`,
+//!   so the full-feature P2 gate runs the server loopback benchmark:
+//!   `cargo test -p mongreldb-server --test scale_test --release --features cluster,oidc,vault-kms -- --nocapture loopback_point_query_p95_baseline`
 //! - The two gates must both pass; never merge one gate's numbers into the
 //!   other. Compare both against the documented SLOs in BENCHMARKS.md.
 //!
@@ -50,7 +51,58 @@ fn pk_schema() -> Schema {
     }
 }
 
-fn measure<F: FnMut()>(iters: usize, mut f: F) -> (u128, u128) {
+/// Full latency statistics for one benchmark, in nanoseconds. REM-J
+/// requires p50/p95/p99 plus min/max and the median absolute deviation so
+/// evidence captures the distribution shape, not just two percentiles.
+#[derive(Clone, Copy)]
+struct Stats {
+    iters: usize,
+    p50_ns: u128,
+    p95_ns: u128,
+    p99_ns: u128,
+    min_ns: u128,
+    max_ns: u128,
+    mad_ns: u128,
+}
+
+impl Stats {
+    fn from_samples(mut samples_ns: Vec<u128>) -> Self {
+        debug_assert!(!samples_ns.is_empty());
+        samples_ns.sort_unstable();
+        let iters = samples_ns.len();
+        let percentile = |q: usize| samples_ns[(iters * q) / 100].min(samples_ns[iters - 1]);
+        let p50_ns = percentile(50);
+        // Median absolute deviation: median of |sample - p50|.
+        let mut deviations: Vec<u128> = samples_ns
+            .iter()
+            .map(|sample| sample.abs_diff(p50_ns))
+            .collect();
+        deviations.sort_unstable();
+        Stats {
+            iters,
+            p50_ns,
+            p95_ns: percentile(95),
+            p99_ns: percentile(99),
+            min_ns: samples_ns[0],
+            max_ns: samples_ns[iters - 1],
+            mad_ns: deviations[iters / 2],
+        }
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "iters": self.iters,
+            "p50_us": self.p50_ns as f64 / 1e3,
+            "p95_us": self.p95_ns as f64 / 1e3,
+            "p99_us": self.p99_ns as f64 / 1e3,
+            "min_us": self.min_ns as f64 / 1e3,
+            "max_us": self.max_ns as f64 / 1e3,
+            "mad_us": self.mad_ns as f64 / 1e3,
+        })
+    }
+}
+
+fn measure<F: FnMut()>(iters: usize, mut f: F) -> Stats {
     // Warm-up: prime caches and lazy initializations.
     f();
     let mut samples_ns: Vec<u128> = Vec::with_capacity(iters);
@@ -59,10 +111,7 @@ fn measure<F: FnMut()>(iters: usize, mut f: F) -> (u128, u128) {
         f();
         samples_ns.push(started.elapsed().as_nanos());
     }
-    samples_ns.sort_unstable();
-    let p50 = samples_ns[iters / 2];
-    let p95 = samples_ns[(iters * 95) / 100];
-    (p50, p95)
+    Stats::from_samples(samples_ns)
 }
 
 #[test]
@@ -70,46 +119,37 @@ fn p0_p2_split_benchmarks() {
     let mut samples = serde_json::Map::new();
 
     // 1. table_create_only: time `Table::create` over many fresh tempdirs.
-    let (p50_create_ns, p95_create_ns) = measure(20, || {
+    let create_stats = measure(20, || {
         let dir = tempdir().unwrap();
         let _t = Table::create(dir.path(), pk_schema(), 1).unwrap();
     });
-    samples.insert(
-        "table_create_only".into(),
-        serde_json::json!({
-            "iters": 20,
-            "p50_us": p50_create_ns as f64 / 1e3,
-            "p95_us": p95_create_ns as f64 / 1e3,
-        }),
-    );
+    samples.insert("table_create_only".into(), create_stats.to_json());
 
     // 2. first_put_after_create: time the FIRST put on a fresh table. The
     //    P0 fix specifically targeted this path; numbers should be close to
     //    `put_steady_state_on_reused_table` after the deferred-root work.
-    let (p50_first_ns, p95_first_ns) = measure(20, || {
+    let first_stats = measure(20, || {
         let dir = tempdir().unwrap();
         let mut t = Table::create(dir.path(), pk_schema(), 1).unwrap();
         t.put(vec![(1, Value::Int64(1))]).unwrap();
         t.commit().unwrap();
     });
-    samples.insert(
-        "first_put_after_create".into(),
-        serde_json::json!({
-            "iters": 20,
-            "p50_us": p50_first_ns as f64 / 1e3,
-            "p95_us": p95_first_ns as f64 / 1e3,
-        }),
-    );
+    samples.insert("first_put_after_create".into(), first_stats.to_json());
 
     // 3. put_steady_state_on_reused_table: amortize across many puts so any
     //    one-time table-create cost drops out. This is the metric that was
-    //    conflated with creation in the original regression.
+    //    conflated with creation in the original regression. Per-put samples
+    //    give the full REM-J distribution; the amortized average is kept for
+    //    continuity with the historical SLO.
     const STEADY_PUTS: usize = 1_000;
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), pk_schema(), 1).unwrap();
     let steady_started = Instant::now();
+    let mut steady_samples_ns: Vec<u128> = Vec::with_capacity(STEADY_PUTS);
     for i in 0..STEADY_PUTS {
+        let put_started = Instant::now();
         table.put(vec![(1, Value::Int64(i as i64))]).unwrap();
+        steady_samples_ns.push(put_started.elapsed().as_nanos());
         if i % 100 == 99 {
             table.commit().unwrap();
         }
@@ -117,14 +157,16 @@ fn p0_p2_split_benchmarks() {
     table.commit().unwrap();
     let steady_total_ns = steady_started.elapsed().as_nanos();
     let steady_avg_ns = steady_total_ns / STEADY_PUTS as u128;
-    samples.insert(
-        "put_steady_state_on_reused_table".into(),
-        serde_json::json!({
-            "iters": STEADY_PUTS,
-            "avg_us_per_put": steady_avg_ns as f64 / 1e3,
-            "total_ms": steady_total_ns as f64 / 1e6,
-        }),
-    );
+    let mut steady_json = Stats::from_samples(steady_samples_ns).to_json();
+    steady_json
+        .as_object_mut()
+        .unwrap()
+        .insert("avg_us_per_put".into(), (steady_avg_ns as f64 / 1e3).into());
+    steady_json
+        .as_object_mut()
+        .unwrap()
+        .insert("total_ms".into(), (steady_total_ns as f64 / 1e6).into());
+    samples.insert("put_steady_state_on_reused_table".into(), steady_json);
 
     // 4. put_batch_1000: a single 1 000-row transaction. Different cost
     //    profile from steady-state single puts (one commit, one fsync).
@@ -156,18 +198,11 @@ fn p0_p2_split_benchmarks() {
     for i in 0..200i64 {
         table.put(vec![(1, Value::Int64(i))]).unwrap();
     }
-    let (p50_commit_ns, p95_commit_ns) = measure(50, || {
+    let commit_stats = measure(50, || {
         table.put(vec![(1, Value::Int64(0))]).unwrap();
         table.commit().unwrap();
     });
-    samples.insert(
-        "commit_fsync".into(),
-        serde_json::json!({
-            "iters": 50,
-            "p50_us": p50_commit_ns as f64 / 1e3,
-            "p95_us": p95_commit_ns as f64 / 1e3,
-        }),
-    );
+    samples.insert("commit_fsync".into(), commit_stats.to_json());
 
     println!(
         "{}",

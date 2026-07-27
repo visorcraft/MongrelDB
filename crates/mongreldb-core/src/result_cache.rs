@@ -177,7 +177,11 @@ pub fn read_header_only(bytes: &[u8]) -> Option<PersistedHeader> {
 /// the entry on any mismatch. The `logical_generation` is the durable table
 /// epoch (`Table::current_epoch().0`) — never a process-local counter — so a
 /// valid frame from an older logical state cannot be served after a commit
-/// has advanced the epoch.
+/// has advanced the epoch. Persistent cache frames are valid only for the
+/// **exact** logical table generation: a frame from a *future* generation
+/// (backup/PITR restore, manual `_rcache` copy, partial filesystem rollback)
+/// can contain rows that do not exist in the restored table and is rejected
+/// with the same `GenerationMismatch` as an older frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersistentCacheIdentity {
     pub table_id: u64,
@@ -192,6 +196,61 @@ pub struct PersistContext {
     pub identity: PersistentCacheIdentity,
     pub key: u64,
     pub entry_generation: u64,
+}
+
+/// Why persistent publication is unavailable for a result cache. Each variant
+/// carries a stable [`PersistenceDisabledReason::label`] used in query traces
+/// and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceDisabledReason {
+    /// The cache has no persistent directory configured.
+    NoDirectory,
+    /// The background worker (or its I/O setup) failed to start.
+    WorkerSpawnFailed,
+    /// The background worker was shut down (e.g. `Database::close`).
+    WorkerShutdown,
+    /// The writer queue was unavailable (e.g. poisoned / not installed).
+    QueueUnavailable,
+}
+
+impl PersistenceDisabledReason {
+    /// Stable lowercase label for metrics, traces, and logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoDirectory => "no_directory",
+            Self::WorkerSpawnFailed => "worker_spawn_failed",
+            Self::WorkerShutdown => "worker_shutdown",
+            Self::QueueUnavailable => "queue_unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for PersistenceDisabledReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Explicit persistent-publication state of a result cache. Replaces the
+/// implicit `Option<writer>` semantics: the query path either enqueues onto
+/// the background writer or **skips** persistent publication (keeping the
+/// in-memory entry and incrementing the skip metric). There is no
+/// query-thread synchronous write fallback — the persistent cache is
+/// disposable optimization state and its loss degrades to a recompute.
+pub enum PersistentPublicationState {
+    /// Background writer installed; publication is asynchronous.
+    Async(Arc<PersistentResultCacheWriter>),
+    /// Publication unavailable; query-path persists are skipped.
+    Disabled(PersistenceDisabledReason),
+}
+
+impl std::fmt::Debug for PersistentPublicationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Async(_) => f.write_str("PersistentPublicationState::Async(..)"),
+            Self::Disabled(reason) => write!(f, "PersistentPublicationState::Disabled({reason:?})"),
+        }
+    }
 }
 
 /// Error returned by [`encode_persisted_entry`] when the payload cannot be
@@ -227,7 +286,8 @@ pub enum CacheLoadRejection {
     TableIdMismatch { expected: u64, found: u64 },
     /// Schema identity does not match the open table.
     SchemaIdMismatch { expected: u64, found: u64 },
-    /// Logical generation is older than the open table's current epoch.
+    /// Logical generation does not exactly match the open table's current
+    /// epoch (both older and future generations are rejected).
     GenerationMismatch { expected: u64, found: u64 },
     /// The cache key embedded in the header does not match the on-disk file
     /// name (e.g. a file got renamed but its header still references the
@@ -271,8 +331,8 @@ impl std::fmt::Display for CacheLoadRejection {
 impl std::error::Error for CacheLoadRejection {}
 
 /// Frame an already-bincode-serialized payload using the MLCP layout. Both
-/// the async worker and the synchronous fallback call this — the on-disk
-/// format is unified across both paths (REM-002 §18.2). The payload is
+/// the async worker and the synchronous maintenance helper call this — the
+/// on-disk format is unified across both paths (REM-002 §18.2). The payload is
 /// encrypted (or left as plaintext) before framing; the magic / version /
 /// table / schema / generation / key / payload_len / CRC32C layout is the
 /// same for both encrypted and plaintext frames.
@@ -333,11 +393,14 @@ pub fn decode_persisted_entry(
             found: frame.header.schema_id,
         });
     }
-    if frame.header.run_generation < expected.logical_generation {
-        // Strict monotonic: a frame at an older logical generation cannot
-        // be served. Anything from the same or newer generation is accepted;
-        // a newer generation can only appear via a fresh write through the
-        // shared encoder.
+    if frame.header.run_generation != expected.logical_generation {
+        // Exact identity: persistent cache frames are valid only for the
+        // exact logical table generation. An older frame is stale; a future
+        // frame can only appear after a backup/PITR restore, a manual
+        // `_rcache` copy, or a partial filesystem rollback, and can contain
+        // rows that do not exist in the restored table. Both are rejected
+        // (and deleted best-effort by the caller) — accepting a future
+        // generation requires a separately designed restore protocol.
         return Err(CacheLoadRejection::GenerationMismatch {
             expected: expected.logical_generation,
             found: frame.header.run_generation,
@@ -1260,6 +1323,74 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(w.queue_depth(), 0);
         assert_eq!(w.abandoned_total(), 3);
+    }
+
+    // --------------------------------------------------------------------
+    // REM-E §9.5: exact logical-generation identity on load.
+    // --------------------------------------------------------------------
+
+    fn generation_context(table_id: u64, schema_id: u64, generation: u64) -> PersistContext {
+        PersistContext {
+            identity: PersistentCacheIdentity {
+                table_id,
+                schema_id,
+                logical_generation: generation,
+            },
+            key: 7,
+            entry_generation: 1,
+        }
+    }
+
+    fn assert_exact_generation_identity(cipher: Option<&AesCipher>) {
+        let expected = PersistentCacheIdentity {
+            table_id: 1,
+            schema_id: 1,
+            logical_generation: 50,
+        };
+        let payload = b"cached-rows-payload";
+
+        // generation == expected → accepted.
+        let bytes =
+            encode_persisted_entry(generation_context(1, 1, 50), payload, cipher).expect("encode");
+        let decoded = decode_persisted_entry(expected, 7, &bytes, cipher).expect("equal accepted");
+        assert_eq!(decoded, payload);
+
+        // generation < expected → rejected.
+        let bytes =
+            encode_persisted_entry(generation_context(1, 1, 49), payload, cipher).expect("encode");
+        let err = decode_persisted_entry(expected, 7, &bytes, cipher)
+            .expect_err("older generation rejected");
+        assert_eq!(
+            err,
+            CacheLoadRejection::GenerationMismatch {
+                expected: 50,
+                found: 49
+            }
+        );
+
+        // generation > expected → rejected (future frame after a restore).
+        let bytes =
+            encode_persisted_entry(generation_context(1, 1, 51), payload, cipher).expect("encode");
+        let err = decode_persisted_entry(expected, 7, &bytes, cipher)
+            .expect_err("future generation rejected");
+        assert_eq!(
+            err,
+            CacheLoadRejection::GenerationMismatch {
+                expected: 50,
+                found: 51
+            }
+        );
+    }
+
+    #[test]
+    fn loader_requires_exact_logical_generation_plaintext() {
+        assert_exact_generation_identity(None);
+    }
+
+    #[test]
+    fn loader_requires_exact_logical_generation_encrypted() {
+        let cipher = AesCipher::new(&[0x42u8; 32]).expect("32-byte key");
+        assert_exact_generation_identity(Some(&cipher));
     }
 }
 

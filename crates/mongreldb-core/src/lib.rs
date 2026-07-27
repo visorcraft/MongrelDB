@@ -254,7 +254,8 @@ pub use result_cache::{
     decode_frame, decode_persisted_entry, decrypt_payload, encode_frame, encode_persisted_entry,
     encrypt_payload, read_header_only, real_io_final_path, spawn_persistent_cache_worker,
     CacheLoadRejection, CachePersistError, DrainOutcome, DrainedOp, IoError, IoErrorKind,
-    PersistContext, PersistableEntry, PersistedFrame, PersistedHeader, PersistentCacheIdentity,
-    PersistentCacheIo, PersistentResultCacheWriter, RealPersistentCacheIo, StalenessGuard,
-    WriterLimits, WriterStalenessGuard, FRAME_FORMAT_VERSION, FRAME_MAGIC,
+    PersistContext, PersistableEntry, PersistedFrame, PersistedHeader, PersistenceDisabledReason,
+    PersistentCacheIdentity, PersistentCacheIo, PersistentPublicationState,
+    PersistentResultCacheWriter, RealPersistentCacheIo, StalenessGuard, WriterLimits,
+    WriterStalenessGuard, FRAME_FORMAT_VERSION, FRAME_MAGIC,
 };

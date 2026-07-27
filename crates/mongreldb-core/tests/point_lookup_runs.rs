@@ -60,16 +60,25 @@ fn percentile(sorted: &mut [u128], fraction: f64) -> u128 {
 /// Returns the assigned row ids (one per inserted row) and the actual run
 /// count observed after all flushes.
 fn build_with_runs(target_runs: usize) -> (tempfile::TempDir, Vec<RowId>, usize) {
+    build_with_runs_sized(target_runs, ROWS_PER_RUN)
+}
+
+/// `build_with_runs` with an explicit batch size. The 256-run scaling fixture
+/// uses the smaller `ROWS_PER_RUN_FINE` batches so it stays tractable.
+fn build_with_runs_sized(
+    target_runs: usize,
+    rows_per_run: usize,
+) -> (tempfile::TempDir, Vec<RowId>, usize) {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.create_table("t", pk_schema()).unwrap();
     let handle = db.table("t").unwrap();
 
-    let mut row_ids = Vec::with_capacity(target_runs * ROWS_PER_RUN);
+    let mut row_ids = Vec::with_capacity(target_runs * rows_per_run);
     let mut next_pk: i64 = 0;
     for _batch in 0..target_runs {
         let batch_start = next_pk;
-        let batch_end = batch_start + ROWS_PER_RUN as i64;
+        let batch_end = batch_start + rows_per_run as i64;
         let (_, ids) = db
             .transaction_with_row_ids(|t| {
                 for pk in batch_start..batch_end {
@@ -78,7 +87,7 @@ fn build_with_runs(target_runs: usize) -> (tempfile::TempDir, Vec<RowId>, usize)
                 Ok(())
             })
             .expect("batch commit");
-        assert_eq!(ids.len(), ROWS_PER_RUN);
+        assert_eq!(ids.len(), rows_per_run);
         row_ids.extend_from_slice(&ids);
         next_pk = batch_end;
         // Force-flush each batch so the mutable-run tier spills to a fresh
@@ -153,6 +162,49 @@ fn point_lookup_scaling_with_immutable_run_count() {
         "{}",
         serde_json::json!({
             "test": "point_lookup_scaling_with_immutable_run_count",
+            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "samples": samples,
+        })
+    );
+}
+
+/// 1-vs-256-run scaling record consumed by the residual-closure p95 ratio
+/// gate (`scripts/residual-closure-contract.json` →
+/// `thresholds.point_lookup_p95_ratio`, spec §13.9). Emits one record whose
+/// `samples` carry `point_query_latency.p95_us` for both `target_runs == 1`
+/// and `target_runs == 256` so the gate can compute p95(256) / p95(1)
+/// without cross-record joins. Heavy fixture (~1.28M rows at 256 runs), so
+/// it is marked `#[ignore]` and run by the closure pipeline in release mode
+/// via `-- --include-ignored`.
+#[test]
+#[ignore = "expensive: 256 flushed runs; run with -- --ignored --nocapture"]
+fn point_lookup_scaling_256_to_1() {
+    let mut samples = Vec::new();
+    let mut dirs: Vec<tempfile::TempDir> = Vec::new();
+    for &runs in &[1usize, 256] {
+        let (dir, row_ids, actual_runs) = build_with_runs_sized(runs, ROWS_PER_RUN_FINE);
+        // Reopen via the same path to ensure runs are on-disk before measuring.
+        // Keep the dir alive until after the measurements.
+        let db_path = dir.path().to_path_buf();
+        let db = Database::open(&db_path).unwrap();
+        let (p50_ns, p95_ns, p99_ns) = measure_point_query_latency(&db, &row_ids);
+        samples.push(serde_json::json!({
+            "target_runs": runs,
+            "actual_runs": actual_runs,
+            "rows": row_ids.len(),
+            "queries": QUERIES,
+            "point_query_latency": {
+                "p50_us": p50_ns as f64 / 1e3,
+                "p95_us": p95_ns as f64 / 1e3,
+                "p99_us": p99_ns as f64 / 1e3,
+            },
+        }));
+        dirs.push(dir);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "test": "point_lookup_scaling_256_to_1",
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "samples": samples,
         })

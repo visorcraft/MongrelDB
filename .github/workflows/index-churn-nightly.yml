@@ -1,0 +1,405 @@
+# Index churn nightly (Spec REM-H §12.2) — durable long-duration churn gate.
+#
+# Runs the index churn oracle across 100 deterministic seeds, sharded into 20
+# matrix jobs of 5 seeds each (fail-fast: false so every shard failure is
+# collected). Each shard runs every non-Bitmap index family at 10,000
+# operations per family per seed and emits a signed/SHA-stamped JSON result
+# artifact. The aggregate job only runs when every shard passes and publishes
+# the `index-churn-nightly-result` artifact that
+# `scripts/churn-history-check.sh` requires for the 30-consecutive-nightly
+# closure gate (Spec §12.3).
+#
+# Coverage axes (Spec §12.2 "compose shards across these axes sanely"):
+#   - all nine oracle families: fm, learned_range, ann_hnsw_dense,
+#     ann_hnsw_binary_sign, ann_product_quantization, ann_diskann_dense,
+#     ann_ivf_dense, sparse, minhash (record names
+#     `index_churn_oracle::family::<family>`);
+#   - encryption on/off, TTL, historical snapshots, candidate-cap pressure:
+#     four boolean axes derived from the shard index (16 combinations over
+#     shards 0-15; shards 16-19 repeat combinations 0-3 with fresh seeds);
+#   - reopen/rebuild/compaction: always enabled at full op-matrix weight
+#     (MONGRELDB_ORACLE_LIFECYCLE_OPS=1).
+#
+# Churn-oracle env contract (honored by crates/mongreldb-core/tests/
+# index_churn_oracle.rs; see scripts/churn-history-check.sh header for the
+# full contract):
+#   MONGRELDB_ORACLE_SEED                  single seed per test process
+#   MONGRELDB_ORACLE_OPERATIONS            ops per family per seed (10000 here)
+#   MONGRELDB_ORACLE_ENCRYPTION            1 = include encrypted lifecycle ops
+#   MONGRELDB_ORACLE_TTL                   1 = include TTL expiry ops
+#   MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS  1 = include pinned-snapshot reads
+#   MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE 1 = drive candidate caps hard
+#   MONGRELDB_ORACLE_LIFECYCLE_OPS         1 = reopen/rebuild/compaction ops
+#   MONGRELDB_ORACLE_FAILURE_DIR           persist failing DB dirs + op logs
+#
+# Reruns of the same SHA do not extend the durable history; the history gate
+# deduplicates by head_sha (Spec §12.3).
+
+name: index-churn-nightly
+
+on:
+  schedule:
+    # nightly at 05:00 UTC; staggered after qualification (03:00) and
+    # residual-closure (04:00).
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel an in-flight evidence run; history counts distinct SHAs.
+  group: index-churn-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN: "1.97.1"
+  ORACLE_OPS: "10000"
+  SEEDS_PER_SHARD: "5"
+
+jobs:
+  churn-shard:
+    name: "churn shard ${{ matrix.shard }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      # Spec §12.4: collect every shard failure; the workflow still fails
+      # if any shard fails.
+      fail-fast: false
+      matrix:
+        # 20 shards x 5 seeds = 100 deterministic seeds (seeds 1..100).
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Resolve shard axes and seed range
+        id: shard
+        run: |
+          set -euo pipefail
+          s="${{ matrix.shard }}"
+          first=$(( s * ${{ env.SEEDS_PER_SHARD }} + 1 ))
+          last=$(( first + ${{ env.SEEDS_PER_SHARD }} - 1 ))
+          {
+            echo "seeds=$(seq -s, "$first" "$last")"
+            echo "first_seed=$first"
+            echo "encryption=$(( s % 2 ))"
+            echo "ttl=$(( (s / 2) % 2 ))"
+            echo "snapshots=$(( (s / 4) % 2 ))"
+            echo "candidate_cap=$(( (s / 8) % 2 ))"
+          } >> "$GITHUB_OUTPUT"
+      - name: Run churn oracle shard (5 seeds x 9 families x 10000 ops)
+        env:
+          MONGRELDB_ORACLE_OPERATIONS: ${{ env.ORACLE_OPS }}
+          MONGRELDB_ORACLE_ENCRYPTION: ${{ steps.shard.outputs.encryption }}
+          MONGRELDB_ORACLE_TTL: ${{ steps.shard.outputs.ttl }}
+          MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS: ${{ steps.shard.outputs.snapshots }}
+          MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE: ${{ steps.shard.outputs.candidate_cap }}
+          MONGRELDB_ORACLE_LIFECYCLE_OPS: "1"
+        run: |
+          set -uo pipefail
+          out="$GITHUB_WORKSPACE/target/churn-nightly/shard-${{ matrix.shard }}"
+          mkdir -p "$out"
+          status=0
+          IFS=',' read -ra seeds <<< "${{ steps.shard.outputs.seeds }}"
+          for seed in "${seeds[@]}"; do
+            mkdir -p "$out/failures/seed-$seed"
+            MONGRELDB_ORACLE_SEED="$seed" \
+            MONGRELDB_ORACLE_FAILURE_DIR="$out/failures/seed-$seed" \
+              cargo test -p mongreldb-core --release --test index_churn_oracle \
+                --all-features -- --nocapture churn_oracle_ \
+                > "$out/seed-$seed.log" 2>&1
+            rc=$?
+            echo "$rc" > "$out/seed-$seed.exit"
+            if [[ $rc -ne 0 ]]; then
+              echo "::error::seed $seed failed (rc=$rc)"
+              echo "::error::replay: MONGRELDB_ORACLE_SEED=$seed MONGRELDB_ORACLE_OPERATIONS=${{ env.ORACLE_OPS }} \\"
+              echo "  cargo test -p mongreldb-core --release --test index_churn_oracle --all-features -- --nocapture churn_oracle_"
+              status=1
+            fi
+          done
+          MONGRELDB_ORACLE_SEED="${{ steps.shard.outputs.first_seed }}" \
+            cargo test -p mongreldb-core --release --test index_churn_oracle \
+              --all-features -- --nocapture seed_determinism \
+              > "$out/seed-determinism.log" 2>&1
+          rc=$?
+          echo "$rc" > "$out/seed-determinism.exit"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::seed_determinism failed (rc=$rc)"
+            status=1
+          fi
+          exit "$status"
+      - name: Build SHA-stamped shard result
+        if: always()
+        env:
+          SHARD_OUT: ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          SEEDS_CSV: ${{ steps.shard.outputs.seeds }}
+          AXIS_ENCRYPTION: ${{ steps.shard.outputs.encryption }}
+          AXIS_TTL: ${{ steps.shard.outputs.ttl }}
+          AXIS_SNAPSHOTS: ${{ steps.shard.outputs.snapshots }}
+          AXIS_CANDIDATE_CAP: ${{ steps.shard.outputs.candidate_cap }}
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          FAMILIES = [
+              "fm",
+              "learned_range",
+              "ann_hnsw_dense",
+              "ann_hnsw_binary_sign",
+              "ann_product_quantization",
+              "ann_diskann_dense",
+              "ann_ivf_dense",
+              "sparse",
+              "minhash",
+          ]
+          RECORD_RE = re.compile(r'^\{.*"test":')
+
+          out = os.environ["SHARD_OUT"]
+          seeds = os.environ["SEEDS_CSV"].split(",")
+          ops = int(os.environ["ORACLE_OPS"])
+
+          family_status = {f: "pass" for f in FAMILIES}
+          records_harvested = 0
+          seed_results = []
+          overall = "pass"
+
+          for seed in seeds:
+              log_path = os.path.join(out, f"seed-{seed}.log")
+              exit_path = os.path.join(out, f"seed-{seed}.exit")
+              exit_code = None
+              if os.path.exists(exit_path):
+                  with open(exit_path, encoding="utf-8") as fh:
+                      exit_code = int(fh.read().strip())
+              seen = set()
+              if os.path.exists(log_path):
+                  with open(log_path, encoding="utf-8") as fh:
+                      for line in fh:
+                          if not RECORD_RE.match(line):
+                              continue
+                          try:
+                              rec = json.loads(line)
+                          except json.JSONDecodeError:
+                              continue
+                          name = rec.get("test", "")
+                          if name.startswith("index_churn_oracle::family::"):
+                              seen.add(name.rsplit("::", 1)[-1])
+                              records_harvested += 1
+              missing = [f for f in FAMILIES if f not in seen]
+              seed_ok = exit_code == 0 and not missing
+              if exit_code != 0 or missing:
+                  overall = "fail"
+              for f in missing:
+                  family_status[f] = "fail"
+              seed_results.append(
+                  {
+                      "seed": int(seed),
+                      "exit_code": exit_code,
+                      "families_recorded": sorted(seen),
+                      "missing_families": missing,
+                      "status": "pass" if seed_ok else "fail",
+                  }
+              )
+
+          det_exit_path = os.path.join(out, "seed-determinism.exit")
+          det_exit = None
+          if os.path.exists(det_exit_path):
+              with open(det_exit_path, encoding="utf-8") as fh:
+                  det_exit = int(fh.read().strip())
+          det_log = os.path.join(out, "seed-determinism.log")
+          det_recorded = False
+          if os.path.exists(det_log):
+              with open(det_log, encoding="utf-8") as fh:
+                  for line in fh:
+                      if RECORD_RE.match(line) and '"index_churn_oracle::seed_determinism"' in line:
+                          det_recorded = True
+                          break
+          determinism_ok = det_exit == 0
+          if not determinism_ok:
+              overall = "fail"
+
+          payload = {
+              "kind": "nightly",
+              "workflow": "index-churn-nightly.yml",
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "toolchain": os.environ["TOOLCHAIN"],
+              "shard": int(os.environ["SHARD_INDEX"]),
+              "seeds": [int(s) for s in seeds],
+              "operations_per_family_per_seed": ops,
+              "axes": {
+                  "encryption": os.environ["AXIS_ENCRYPTION"] == "1",
+                  "ttl": os.environ["AXIS_TTL"] == "1",
+                  "historical_snapshots": os.environ["AXIS_SNAPSHOTS"] == "1",
+                  "candidate_cap_pressure": os.environ["AXIS_CANDIDATE_CAP"] == "1",
+                  "lifecycle_ops": True,
+              },
+              "seed_results": seed_results,
+              "family_status": family_status,
+              "records_harvested": records_harvested,
+              "seed_determinism": {
+                  "exit_code": det_exit,
+                  "metric_recorded": det_recorded,
+                  "status": "pass" if determinism_ok else "fail",
+              },
+              "overall": overall,
+          }
+          canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+          result = {
+              "schema": "mongreldb.churn-shard-result/v1",
+              "content_sha256": digest,
+              "payload": payload,
+          }
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fh:
+              json.dump(result, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          with open(os.path.join(out, "payload.json"), "w", encoding="utf-8") as fh:
+              fh.write(canonical)
+              fh.write("\n")
+          with open(os.path.join(out, "payload.json.sha256"), "w", encoding="utf-8") as fh:
+              fh.write(f"{digest}  payload.json\n")
+          print(f"shard {payload['shard']} overall={overall} sha256={digest}")
+          if overall != "pass":
+              sys.exit(0)  # failure is surfaced by the run step / aggregate gate
+          PYEOF
+        # NOTE: this step never masks a shard failure — the run step's exit
+        # code already failed the job; this step only renders evidence.
+      - name: Upload shard result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-churn-nightly-shard-${{ matrix.shard }}
+          path: |
+            ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/result.json
+            ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/payload.json
+            ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/payload.json.sha256
+            ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/*.log
+            ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/*.exit
+          retention-days: 400
+      - name: Upload failure evidence (DB directories + op logs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-evidence-index-churn-nightly-shard-${{ matrix.shard }}
+          path: ${{ github.workspace }}/target/churn-nightly/shard-${{ matrix.shard }}/failures/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  nightly-result:
+    name: Aggregate + stamp nightly result
+    runs-on: ubuntu-latest
+    # Only runs when every shard job succeeded (fail-closed; no if:always()).
+    needs: churn-shard
+    steps:
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: index-churn-nightly-shard-*
+          path: ${{ runner.temp }}/churn-shards
+      - name: Verify shard results and build stamped summary
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          root = os.environ["SHARDS_DIR"]
+          results = []
+          for entry in sorted(os.listdir(root)):
+              result_path = os.path.join(root, entry, "result.json")
+              if not os.path.exists(result_path):
+                  print(f"FAIL: shard artifact {entry} missing result.json", file=sys.stderr)
+                  sys.exit(1)
+              with open(result_path, encoding="utf-8") as fh:
+                  result = json.load(fh)
+              canonical = json.dumps(
+                  result["payload"], sort_keys=True, separators=(",", ":")
+              )
+              digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+              if digest != result.get("content_sha256"):
+                  print(f"FAIL: shard artifact {entry} digest mismatch", file=sys.stderr)
+                  sys.exit(1)
+              results.append(result)
+
+          if len(results) != 20:
+              print(f"FAIL: expected 20 shard results, found {len(results)}", file=sys.stderr)
+              sys.exit(1)
+
+          seeds = set()
+          failed = []
+          for result in results:
+              payload = result["payload"]
+              if payload.get("overall") != "pass":
+                  failed.append(payload.get("shard"))
+              if payload.get("sha") != os.environ["GITHUB_SHA"]:
+                  print(
+                      f"FAIL: shard {payload.get('shard')} stamped sha "
+                      f"{payload.get('sha')} != {os.environ['GITHUB_SHA']}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              seeds.update(payload.get("seeds", []))
+
+          if failed:
+              print(f"FAIL: shards reporting overall != pass: {failed}", file=sys.stderr)
+              sys.exit(1)
+          if len(seeds) != 100:
+              print(f"FAIL: expected 100 distinct seeds, found {len(seeds)}", file=sys.stderr)
+              sys.exit(1)
+
+          payload = {
+              "kind": "nightly",
+              "workflow": "index-churn-nightly.yml",
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "toolchain": "1.97.1",
+              "shards": 20,
+              "seeds": 100,
+              "operations_per_family_per_seed": 10000,
+              "families": 9,
+              "total_operations": 20 * 5 * 9 * 10000,
+              "shard_digests": {
+                  str(r["payload"]["shard"]): r["content_sha256"] for r in results
+              },
+              "overall": "pass",
+          }
+          canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+          summary = {
+              "schema": "mongreldb.churn-nightly-result/v1",
+              "content_sha256": digest,
+              "payload": payload,
+          }
+          out = os.environ["SUMMARY_DIR"]
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "nightly-summary.json"), "w", encoding="utf-8") as fh:
+              json.dump(summary, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          print(f"nightly summary overall=pass seeds=100 sha256={digest}")
+          PYEOF
+        env:
+          SHARDS_DIR: ${{ runner.temp }}/churn-shards
+          SUMMARY_DIR: ${{ runner.temp }}/churn-nightly-summary
+      - name: Upload nightly result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-churn-nightly-result
+          path: ${{ runner.temp }}/churn-nightly-summary/
+          retention-days: 400

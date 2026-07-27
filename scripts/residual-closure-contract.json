@@ -1,0 +1,343 @@
+{
+  "version": 1,
+  "description": "Residual-closure evidence contract (spec §13.3). The single source of truth read by both scripts/run-residual-closure.sh and the final artifact gate. Every required artifact must actually be created by the pipeline (§13.4): suites with proof=cargo_exit require a non-empty log + cargo exit 0 + parsed failed count 0; suites with proof=jsonl additionally require the exact emitted records listed in required_records. No nonexistent JSONL may be required and no missing JSON may be synthesized.",
+  "suites": [
+    {
+      "name": "point_lookup_directory",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--test", "point_lookup_directory", "--all-features"],
+      "jsonl": "point-lookup-directory.jsonl",
+      "required_records": [
+        "point_lookup_directory::complete_miss_opens_zero_readers"
+      ]
+    },
+    {
+      "name": "run_lookup_unit",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--lib", "run_lookup::tests", "--all-features"]
+    },
+    {
+      "name": "rem001_multi_run_hlc_authority",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--lib", "rem001_multi_run_hlc_authority", "--all-features"],
+      "required_log_tests": [
+        "multi_run_rows_for_rids_uses_hlc_winner_when_epoch_is_inverted",
+        "multi_run_projected_column_uses_hlc_winner_when_epoch_is_inverted",
+        "ann_candidate_eligibility_uses_hlc_winner_across_runs",
+        "ttl_inverted_run_is_admitted_via_values_for_rids_at",
+        "hot_candidate_inspection_uses_full_snapshot_for_run_versions",
+        "learned_range_rebuild_indexes_only_hlc_visible_winners",
+        "rebuild_indexes_uses_global_hlc_winners_not_run_iteration_order",
+        "version_stamp_is_newer_than_matches_snapshot_rule"
+      ]
+    },
+    {
+      "name": "sorted_run_hlc_visibility",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--test", "sorted_run_hlc_visibility", "--all-features"]
+    },
+    {
+      "name": "point_lookup_runs",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--release", "--test", "point_lookup_runs"],
+      "test_args": ["--include-ignored"],
+      "jsonl": "point-lookup-runs.jsonl",
+      "required_records": [
+        "point_lookup_scaling_with_immutable_run_count",
+        "point_lookup_scaling_256_to_1"
+      ],
+      "required_thresholds": [
+        {
+          "jq": "[.[] | select(.test==\"point_lookup_scaling_with_immutable_run_count\")][0].samples | length >= 3",
+          "label": "scaling samples >= 3"
+        }
+      ]
+    },
+    {
+      "name": "result_cache_async_persistence",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--test", "result_cache_async_persistence", "--all-features"]
+    },
+    {
+      "name": "result_cache_production",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--test", "result_cache_production", "--all-features"]
+    },
+    {
+      "name": "controlled_scan_streaming",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--test", "controlled_scan_streaming", "--all-features"],
+      "jsonl": "controlled-scan.jsonl",
+      "required_records": [
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order",
+        "controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order",
+        "controlled_scan::dense_single_row_history_streams",
+        "controlled_scan::memtable_cursor_does_not_precollect_every_version"
+      ]
+    },
+    {
+      "name": "controlled_scan_streaming_release",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--release", "--test", "controlled_scan_streaming"],
+      "test_args": ["--include-ignored"],
+      "jsonl": "controlled-scan-release.jsonl",
+      "required_records": [
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order",
+        "controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order",
+        "controlled_scan::dense_single_row_history_streams",
+        "controlled_scan::memtable_cursor_does_not_precollect_every_version"
+      ]
+    },
+    {
+      "name": "hnsw_connectivity",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--test", "hnsw_connectivity", "--all-features"]
+    },
+    {
+      "name": "index_churn_oracle",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--test", "index_churn_oracle", "--all-features"],
+      "jsonl": "churn-oracle.jsonl",
+      "required_records": [
+        "index_churn_oracle::family::fm",
+        "index_churn_oracle::family::learned_range",
+        "index_churn_oracle::family::ann_hnsw_dense",
+        "index_churn_oracle::family::ann_hnsw_binary_sign",
+        "index_churn_oracle::family::ann_product_quantization",
+        "index_churn_oracle::family::ann_diskann_dense",
+        "index_churn_oracle::family::ann_ivf_dense",
+        "index_churn_oracle::family::sparse",
+        "index_churn_oracle::family::minhash",
+        "index_churn_oracle::seed_determinism"
+      ]
+    },
+    {
+      "name": "lookup_metrics",
+      "proof": "jsonl",
+      "command": ["-p", "mongreldb-core", "--test", "lookup_metrics", "--all-features"],
+      "jsonl": "lookup-metrics.jsonl",
+      "required_records": [
+        "lookup_metrics::healthy_pk_lookup_records_zero_fallback",
+        "lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback",
+        "lookup_metrics::snapshot_to_metrics_is_consistent"
+      ]
+    },
+    {
+      "name": "hot_metrics_export",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-server", "--test", "hot_metrics_export", "--all-features"]
+    },
+    {
+      "name": "full_core_tests",
+      "proof": "cargo_exit",
+      "command": ["-p", "mongreldb-core", "--tests", "--all-features", "--lib"]
+    },
+    {
+      "name": "full_workspace_tests",
+      "proof": "cargo_exit",
+      "command": ["--workspace", "--all-features", "--exclude", "mongreldb-perf", "--tests"]
+    }
+  ],
+  "thresholds": {
+    "complete_miss": {
+      "jsonl": "point-lookup-directory.jsonl",
+      "record": "point_lookup_directory::complete_miss_opens_zero_readers",
+      "expect": 0,
+      "status_key": "complete_miss_ok",
+      "description": "Opened-reader delta for a complete directory miss must be exactly 0 (spec §13.7), read from the JSON emission, never from a grep of cargo output."
+    },
+    "point_lookup_p95_ratio": {
+      "jsonl": "point-lookup-runs.jsonl",
+      "record": "point_lookup_scaling_256_to_1",
+      "baseline_target_runs": 1,
+      "comparison_target_runs": 256,
+      "max_ratio_env": "POINT_LOOKUP_MAX_P95_RATIO",
+      "default_max_ratio": 1.4,
+      "status_key": "point_lookup_p95_ratio_ok",
+      "label_key": "point_lookup_256_to_1_p95_ratio",
+      "description": "p95(256 runs) / p95(1 run) must be <= the threshold (spec §13.9). Fails closed when either sample is absent; no jq // defaults may mask missing data. The exact threshold used is recorded in closure-status.json."
+    }
+  },
+  "churn_matrix": {
+    "seeds": [1, 2, 3, 4, 5, 6, 7, 8],
+    "operations_env": "MONGRELDB_ORACLE_OPERATIONS",
+    "seed_env": "MONGRELDB_ORACLE_SEED",
+    "default_operations": 500,
+    "matrix_file": "churn-oracle-matrix.jsonl",
+    "seed_log_pattern": "churn-oracle-seed-<seed>.log",
+    "command": ["-p", "mongreldb-core", "--test", "index_churn_oracle", "--all-features"],
+    "families": [
+      {"record": "index_churn_oracle::family::fm", "name": "FM"},
+      {"record": "index_churn_oracle::family::learned_range", "name": "LearnedRange"},
+      {"record": "index_churn_oracle::family::ann_hnsw_dense", "name": "AnnHnswDense"},
+      {"record": "index_churn_oracle::family::ann_hnsw_binary_sign", "name": "AnnHnswBinarySign"},
+      {"record": "index_churn_oracle::family::ann_product_quantization", "name": "AnnPQ"},
+      {"record": "index_churn_oracle::family::ann_diskann_dense", "name": "DiskANN"},
+      {"record": "index_churn_oracle::family::ann_ivf_dense", "name": "IVF"},
+      {"record": "index_churn_oracle::family::sparse", "name": "Sparse"},
+      {"record": "index_churn_oracle::family::minhash", "name": "MinHash"}
+    ],
+    "extra_required_records": [
+      "index_churn_oracle::seed_determinism"
+    ],
+    "description": "One summary object per seed (spec §13.10): {seed, status, families_seen}. A seed fails when its exit code is nonzero, any required family is absent, any family metric says failure (metric == false, ok == false, or status == \"fail\"), or a harvested line is malformed JSON."
+  },
+  "core_artifacts": [
+    "commit.txt",
+    "environment.txt",
+    "toolchain.txt",
+    "closure-status.json",
+    "closure-checklist.md",
+    "churn-oracle-matrix.jsonl",
+    "hot-metrics-sample.txt"
+  ],
+  "checklist": [
+    {
+      "statement": "HLC multi-run regressions pass",
+      "proof": "suite_exit",
+      "suite": "rem001_multi_run_hlc_authority"
+    },
+    {
+      "statement": "run-locator unit proofs pass",
+      "proof": "suite_exit",
+      "suite": "run_lookup_unit"
+    },
+    {
+      "statement": "sorted-run scans obey full HLC authority",
+      "proof": "suite_exit",
+      "suite": "sorted_run_hlc_visibility"
+    },
+    {
+      "statement": "HOT mismatch never returns the mismatched row",
+      "proof": "jsonl_records",
+      "jsonl": "lookup-metrics.jsonl",
+      "records": ["lookup_metrics::healthy_pk_lookup_uses_hot_fast_path_with_zero_fallback"]
+    },
+    {
+      "statement": "HOT failures execute the real fallback",
+      "proof": "jsonl_records",
+      "jsonl": "lookup-metrics.jsonl",
+      "records": ["lookup_metrics::healthy_pk_lookup_records_zero_fallback"]
+    },
+    {
+      "statement": "HNSW nodes remain reachable",
+      "proof": "suite_exit",
+      "suite": "hnsw_connectivity"
+    },
+    {
+      "statement": "every non-Bitmap index oracle passes",
+      "proof": "jsonl_records",
+      "jsonl": "churn-oracle.jsonl",
+      "records": [
+        "index_churn_oracle::family::fm",
+        "index_churn_oracle::family::learned_range",
+        "index_churn_oracle::family::ann_hnsw_dense",
+        "index_churn_oracle::family::ann_hnsw_binary_sign",
+        "index_churn_oracle::family::ann_product_quantization",
+        "index_churn_oracle::family::ann_diskann_dense",
+        "index_churn_oracle::family::ann_ivf_dense",
+        "index_churn_oracle::family::sparse",
+        "index_churn_oracle::family::minhash"
+      ]
+    },
+    {
+      "statement": "no stale/deleted/expired/unauthorized row is returned",
+      "proof": "suite_exit",
+      "suite": "point_lookup_directory"
+    },
+    {
+      "statement": "complete directory miss opens zero run readers",
+      "proof": "threshold",
+      "threshold": "complete_miss_ok"
+    },
+    {
+      "statement": "256-to-1 point-lookup p95 ratio is within the gate",
+      "proof": "threshold",
+      "threshold": "point_lookup_p95_ratio_ok"
+    },
+    {
+      "statement": "query thread performs no persistence I/O",
+      "proof": "suite_exit",
+      "suite": "result_cache_async_persistence"
+    },
+    {
+      "statement": "reopen and race coverage holds in production fixtures",
+      "proof": "suite_exit",
+      "suite": "result_cache_production"
+    },
+    {
+      "statement": "production cache behaviors hold",
+      "proof": "suite_exit",
+      "suite": "result_cache_production"
+    },
+    {
+      "statement": "memtable scan yields ascending strict order",
+      "proof": "jsonl_records",
+      "jsonl": "controlled-scan.jsonl",
+      "records": ["controlled_scan::one_million_row_memtable_yields_ascending_strict_order"]
+    },
+    {
+      "statement": "mutable run yields ascending strict order",
+      "proof": "jsonl_records",
+      "jsonl": "controlled-scan.jsonl",
+      "records": ["controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order"]
+    },
+    {
+      "statement": "dense single-row history streams",
+      "proof": "jsonl_records",
+      "jsonl": "controlled-scan.jsonl",
+      "records": ["controlled_scan::dense_single_row_history_streams"]
+    },
+    {
+      "statement": "memtable cursor does not precollect every version",
+      "proof": "jsonl_records",
+      "jsonl": "controlled-scan.jsonl",
+      "records": ["controlled_scan::memtable_cursor_does_not_precollect_every_version"]
+    },
+    {
+      "statement": "HOT reason sum equals fallback total",
+      "proof": "jsonl_records",
+      "jsonl": "lookup-metrics.jsonl",
+      "records": ["lookup_metrics::snapshot_to_metrics_is_consistent"]
+    },
+    {
+      "statement": "metrics are exported",
+      "proof": "suite_exit",
+      "suite": "hot_metrics_export"
+    },
+    {
+      "statement": "sample snapshot contains real Prometheus text",
+      "proof": "file_grep",
+      "file": "hot-metrics-sample.txt",
+      "pattern": "^# (HELP|TYPE) hot_|^hot_"
+    },
+    {
+      "statement": "all 8 smoke seeds execute with every family",
+      "proof": "churn_matrix"
+    },
+    {
+      "statement": "closure-status.json is non-empty",
+      "proof": "file",
+      "file": "closure-status.json"
+    },
+    {
+      "statement": "exact commit is recorded",
+      "proof": "commit"
+    },
+    {
+      "statement": "full core tests pass",
+      "proof": "suite_exit",
+      "suite": "full_core_tests"
+    },
+    {
+      "statement": "full workspace tests pass",
+      "proof": "suite_exit",
+      "suite": "full_workspace_tests"
+    },
+    {
+      "statement": "final checklist exists",
+      "proof": "file",
+      "file": "closure-checklist.md"
+    }
+  ]
+}

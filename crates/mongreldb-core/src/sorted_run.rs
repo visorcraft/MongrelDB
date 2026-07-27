@@ -2978,7 +2978,9 @@ impl RunReader {
         let has_commit_ts_col = self.has_column(SYS_COMMIT_TS);
         // Best version chosen with (epoch, hlc) snapshot-aware semantics.
         // We track the candidate's epoch + (optional) HLC so the
-        // `version_is_newer` comparator can use both.
+        // `version_is_newer` comparator can use both; exact-stamp ties are
+        // resolved to the later physical write (`epoch::version_supersedes`)
+        // because the page holds versions in write order.
         let mut best: Option<(u64, Option<HlcTimestamp>, usize, usize)> = None; // (epoch, commit_ts, page_seq, local index)
         for (seq, _page_row_start) in candidate_pages {
             let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
@@ -3031,9 +3033,17 @@ impl RunReader {
                 if !snapshot.observes_row(Epoch(epoch), commit_ts) {
                     continue;
                 }
+                // The group is in physical write order, so on an exact stamp
+                // tie the later entry — the tombstone of a same-span
+                // create+delete — supersedes (`epoch::version_supersedes`).
                 let candidate = (epoch, commit_ts, seq, lo + i);
                 let is_newer = best.as_ref().is_none_or(|cur| {
-                    Snapshot::version_is_newer(Epoch(candidate.0), candidate.1, Epoch(cur.0), cur.1)
+                    crate::epoch::version_supersedes(
+                        Epoch(candidate.0),
+                        candidate.1,
+                        Epoch(cur.0),
+                        cur.1,
+                    )
                 });
                 if is_newer {
                     best = Some(candidate);
@@ -4422,9 +4432,12 @@ impl RunReader {
             if !snapshot.observes_row(Epoch(e), commit_ts) {
                 continue;
             }
+            // Rows arrive in physical write order, so an exact stamp tie
+            // (same-span live+tombstone pair) goes to the later write
+            // (`epoch::version_supersedes`).
             best.entry(rid)
                 .and_modify(|cur| {
-                    if Snapshot::version_is_newer(Epoch(e), commit_ts, Epoch(cur.0), cur.1) {
+                    if crate::epoch::version_supersedes(Epoch(e), commit_ts, Epoch(cur.0), cur.1) {
                         *cur = (e, commit_ts, i);
                     }
                 })

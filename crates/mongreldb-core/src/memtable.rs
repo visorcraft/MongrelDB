@@ -10,7 +10,7 @@
 //! [`crate::epoch::Snapshot::version_is_newer`] when versions carry `commit_ts`
 //! (P0.5-T3); epoch-only APIs remain for dual-model legacy call sites.
 
-use crate::be_tree::{BeTree, LeafVersions};
+use crate::be_tree::{BeTree, BeTreeVersionCursor, BeTreeVersionCursorStats};
 use crate::epoch::{Epoch, Snapshot};
 use crate::rowid::RowId;
 use serde::{Deserialize, Serialize};
@@ -185,6 +185,10 @@ impl Row {
     }
 }
 
+/// Same-`RowId` group members gathered between cooperative cancellation
+/// checkpoints inside the memtable merge cursor (REM-C §7.11).
+const CURSOR_GROUP_CHECKPOINT_INTERVAL: usize = 256;
+
 /// Min-heap key used to merge memtable leaf streams in ascending
 /// `(RowId, Epoch)` order. We carry the version's epoch too so that the
 /// dedup pass at emit time has it without re-matching on `Cow`.
@@ -212,67 +216,148 @@ impl Ord for MemHead<'_> {
     }
 }
 
+/// K-way merge over the per-segment lazy [`BeTreeVersionCursor`] streams
+/// (REM-C §7.12). Holds one heap head per segment, pops the lowest `RowId`,
+/// gathers every head sharing that `RowId`, and emits the newest visible
+/// version exactly once per `RowId`. Candidates arrive oldest-first
+/// (ascending epoch; exact-key ties in physical write order — older segment
+/// index first, within a segment the tree's own write order) and the fold
+/// resolves ties with `epoch::version_supersedes`, so the later physical
+/// write wins an exact-stamp tie. No segment ever materializes more than
+/// its current head plus the current same-row group.
 pub struct MemtableVisibleVersionCursor<'a> {
-    leaves: Vec<LeafVersions<'a>>,
+    segments: Vec<BeTreeVersionCursor<'a>>,
     heap: BinaryHeap<MemHead<'a>>,
     snapshot: Snapshot,
+    /// Heap heads are pulled from each segment lazily on the first advance
+    /// so that construction is O(segments) and a cancelled control is
+    /// observed before any version streams.
+    primed: bool,
     finished: bool,
-    /// Number of source versions examined during the last `next()` call —
-    /// the dedup pass that picks the newest visible version per RowId.
+    /// Number of source versions examined during the last advance — the
+    /// dedup pass that picks the newest visible version per RowId.
     pub(crate) last_examined: usize,
     /// Peak `last_examined` across all calls so far.
     pub(crate) peak_examined: usize,
 }
 
-impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
-    type Item = (RowId, Epoch, Cow<'a, Row>);
+impl<'a> MemtableVisibleVersionCursor<'a> {
+    /// Controlled advance: checkpoints the supplied control while gathering
+    /// large same-`RowId` groups (§7.11) and threads it into the per-segment
+    /// Bε-tree cursors.
+    #[doc(hidden)] // streaming-cursor plumbing; used by the engine and tests
+    pub fn next_controlled(
+        &mut self,
+        control: &crate::ExecutionControl,
+    ) -> crate::Result<Option<(RowId, Epoch, Cow<'a, Row>)>> {
+        self.advance_impl(Some(control))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Aggregate Bε-tree cursor statistics across every segment source
+    /// (REM-C §7.6 test instrumentation).
+    #[doc(hidden)] // test instrumentation; not a stable public API
+    pub fn be_tree_cursor_stats(&self) -> BeTreeVersionCursorStats {
+        let mut total = BeTreeVersionCursorStats::default();
+        for segment in &self.segments {
+            let stats = segment.stats();
+            total.active_frames += stats.active_frames;
+            total.peak_active_frames = total.peak_active_frames.max(stats.peak_active_frames);
+            total.buffered_messages_owned += stats.buffered_messages_owned;
+            total.peak_buffered_messages_owned = total
+                .peak_buffered_messages_owned
+                .max(stats.peak_buffered_messages_owned);
+            total.total_versions_precollected += stats.total_versions_precollected;
+            total.versions_examined += stats.versions_examined;
+            total.checkpoints += stats.checkpoints;
+        }
+        total
+    }
+
+    fn segment_next(
+        &mut self,
+        index: usize,
+        control: Option<&crate::ExecutionControl>,
+    ) -> crate::Result<Option<Cow<'a, Row>>> {
+        match control {
+            Some(control) => self.segments[index].next_controlled(control),
+            None => Ok(self.segments[index].next()),
+        }
+    }
+
+    fn push_head(&mut self, index: usize, row: Cow<'a, Row>) {
+        self.heap.push(MemHead {
+            rid: row.row_id,
+            epoch: row.committed_epoch,
+            index: index as u32,
+            row,
+        });
+    }
+
+    fn prime(&mut self, control: Option<&crate::ExecutionControl>) -> crate::Result<()> {
+        for index in 0..self.segments.len() {
+            if let Some(row) = self.segment_next(index, control)? {
+                self.push_head(index, row);
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_impl(
+        &mut self,
+        control: Option<&crate::ExecutionControl>,
+    ) -> crate::Result<Option<(RowId, Epoch, Cow<'a, Row>)>> {
         if self.finished {
-            return None;
+            return Ok(None);
+        }
+        if !self.primed {
+            self.prime(control)?;
+            self.primed = true;
         }
         self.last_examined = 0;
         loop {
-            let MemHead {
+            let Some(MemHead {
                 rid,
                 epoch,
                 index,
                 row,
-            } = self.heap.pop()?;
+            }) = self.heap.pop()
+            else {
+                self.finished = true;
+                return Ok(None);
+            };
             self.last_examined += 1;
             // Advance the source the popped head came from.
-            if let Some(next) = self.leaves[index as usize].next() {
-                let (nepoch, _nrow_id) = (next.committed_epoch, next.row_id);
-                self.heap.push(MemHead {
-                    rid: next.row_id,
-                    epoch: nepoch,
-                    index,
-                    row: next,
-                });
+            if let Some(next) = self.segment_next(index as usize, control)? {
+                self.push_head(index as usize, next);
             }
             if !self.snapshot.observes_version(epoch, row.commit_ts) {
                 continue;
             }
             // Gather every remaining head that shares this rid; pick the
-            // newest visible version among them.
+            // newest visible version among them. Cancellation is observed
+            // inside large same-row groups (§7.11).
             let mut best = Some(row);
+            let mut gathered = 0usize;
             while self.heap.peek().is_some_and(|h| h.rid == rid) {
+                gathered += 1;
+                if gathered.is_multiple_of(CURSOR_GROUP_CHECKPOINT_INTERVAL) {
+                    if let Some(control) = control {
+                        control.checkpoint()?;
+                    }
+                }
                 let head = self.heap.pop().unwrap();
                 self.last_examined += 1;
-                if let Some(next) = self.leaves[head.index as usize].next() {
-                    let nepoch = next.committed_epoch;
-                    self.heap.push(MemHead {
-                        rid: next.row_id,
-                        epoch: nepoch,
-                        index: head.index,
-                        row: next,
-                    });
+                if let Some(next) = self.segment_next(head.index as usize, control)? {
+                    self.push_head(head.index as usize, next);
                 }
                 if self
                     .snapshot
                     .observes_version(head.epoch, head.row.commit_ts)
                     && best.as_ref().is_none_or(|current| {
-                        Snapshot::version_is_newer(
+                        // Candidates arrive oldest-first (ascending epoch,
+                        // ties broken by physical write order); an exact
+                        // stamp tie goes to the later write.
+                        crate::epoch::version_supersedes(
                             head.epoch,
                             head.row.commit_ts,
                             current.committed_epoch,
@@ -283,11 +368,24 @@ impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
                     best = Some(head.row);
                 }
             }
-            let best = best?;
+            let Some(best) = best else {
+                continue;
+            };
             let row_id = best.row_id;
             let epoch = best.committed_epoch;
             self.peak_examined = self.peak_examined.max(self.last_examined);
-            return Some((row_id, epoch, best));
+            return Ok(Some((row_id, epoch, best)));
+        }
+    }
+}
+
+impl<'a> Iterator for MemtableVisibleVersionCursor<'a> {
+    type Item = (RowId, Epoch, Cow<'a, Row>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.advance_impl(None) {
+            Ok(item) => item,
+            Err(_) => unreachable!("the no-cancellation path cannot fail"),
         }
     }
 }
@@ -389,6 +487,9 @@ impl Memtable {
         snapshot: crate::epoch::Snapshot,
     ) -> Option<(Epoch, Row)> {
         if !snapshot.uses_hlc_authority() {
+            // Newest segment first (active, then frozen in reverse): on an
+            // exact stamp tie the physically newer segment wins — within one
+            // segment ties are already resolved by the tree itself.
             let mut best = self.active.tree.get_version(row_id, snapshot.epoch);
             for segment in self.frozen.iter().rev() {
                 let Some(candidate) = segment.tree.get_version(row_id, snapshot.epoch) else {
@@ -412,8 +513,10 @@ impl Memtable {
                 if !snapshot.observes_row(row.committed_epoch, row.commit_ts) {
                     return;
                 }
+                // Candidates arrive in physical write order (oldest first);
+                // the later write wins an exact stamp tie.
                 if best.as_ref().is_none_or(|current| {
-                    crate::epoch::Snapshot::version_is_newer(
+                    crate::epoch::version_supersedes(
                         row.committed_epoch,
                         row.commit_ts,
                         current.committed_epoch,
@@ -473,8 +576,14 @@ impl Memtable {
         snapshot: crate::epoch::Snapshot,
     ) -> BTreeMap<RowId, Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
-        for segment in std::iter::once(&self.active.tree)
-            .chain(self.frozen.iter().rev().map(|segment| &segment.tree))
+        // Oldest segment first, and within a segment oldest write first, so
+        // `version_supersedes` can hand an exact stamp tie to the later
+        // physical write (newer segment / newer entry wins).
+        for segment in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.tree)
+            .chain(std::iter::once(&self.active.tree))
         {
             for row in segment.versions() {
                 if !snapshot.observes_version(row.committed_epoch, row.commit_ts) {
@@ -483,7 +592,7 @@ impl Memtable {
                 by_row
                     .entry(row.row_id)
                     .and_modify(|existing| {
-                        if crate::epoch::Snapshot::version_is_newer(
+                        if crate::epoch::version_supersedes(
                             row.committed_epoch,
                             row.commit_ts,
                             existing.committed_epoch,
@@ -502,27 +611,17 @@ impl Memtable {
         &'a self,
         snapshot: &Snapshot,
     ) -> MemtableVisibleVersionCursor<'a> {
-        let mut leaves: Vec<LeafVersions<'a>> = self
+        let segments: Vec<BeTreeVersionCursor<'a>> = self
             .frozen
             .iter()
             .map(|segment| segment.tree.leaf_versions_iter())
             .chain(std::iter::once(self.active.tree.leaf_versions_iter()))
             .collect();
-        let mut heap = BinaryHeap::new();
-        for (index, leaf) in leaves.iter_mut().enumerate() {
-            if let Some(row) = leaf.next() {
-                heap.push(MemHead {
-                    rid: row.row_id,
-                    epoch: row.committed_epoch,
-                    index: index as u32,
-                    row,
-                });
-            }
-        }
         MemtableVisibleVersionCursor {
-            leaves,
-            heap,
+            segments,
+            heap: BinaryHeap::new(),
             snapshot: *snapshot,
+            primed: false,
             finished: false,
             last_examined: 0,
             peak_examined: 0,
@@ -890,7 +989,8 @@ mod tests {
 
     /// Regression for the BeTree root-buffer-not-iterated bug (iss10).
     ///
-    /// Before the fix, [`crate::be_tree::LeafVersions`] walked only the
+    /// Before the fix, the Bε-tree version stream (now
+    /// [`crate::be_tree::BeTreeVersionCursor`]) walked only the
     /// consolidated leaves of the Bε-tree — silently skipping messages that
     /// were still sitting in an internal-node buffer pending flush. A scan
     /// over a live memtable that has triggered at least one split therefore
@@ -1002,5 +1102,155 @@ mod tests {
             Some(Value::Int64(x)) => *x,
             other => panic!("expected Int64 column, got {other:?}"),
         }
+    }
+
+    /// Build a memtable whose active tree has row 7 flushed into a leaf and
+    /// a root buffer that still has free capacity: 33 inserts split the root
+    /// leaf into an internal node, and 10 more inserts sit in its buffer
+    /// (BUFFER_CAP is 16), so one further mutation is guaranteed to stay
+    /// buffered at the root rather than flush to a leaf.
+    fn memtable_with_leaf_resident_seven() -> Memtable {
+        let mut m = Memtable::new();
+        for i in 0..33u64 {
+            m.upsert(row(i, 1));
+        }
+        for i in 100..110u64 {
+            m.upsert(row(i, 1));
+        }
+        m
+    }
+
+    /// REM-C §7.13: one `RowId` resident in both a leaf and an internal-node
+    /// buffer emits exactly once, with the newest (buffered) version.
+    #[test]
+    fn same_rowid_in_buffer_and_leaf_dedups_once() {
+        let mut m = memtable_with_leaf_resident_seven();
+        m.upsert(row(7, 2)); // buffered at the root; newer than the leaf copy
+        let got: Vec<(u64, u64, i64)> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(3)))
+            .filter(|(rid, _, _)| *rid == RowId(7))
+            .map(|(rid, epoch, row)| (rid.0, epoch.0, int_of_value(&row)))
+            .collect();
+        assert_eq!(got, vec![(7, 2, 70)], "row 7 must emit exactly once");
+    }
+
+    /// REM-C §7.13: one `RowId` spanning several frozen segments plus the
+    /// active segment emits exactly once, with the newest version.
+    #[test]
+    fn same_rowid_across_frozen_segments_dedups_once() {
+        let mut m = Memtable::new();
+        m.upsert(row(7, 1));
+        m.seal();
+        m.upsert(row(7, 2));
+        m.seal();
+        m.upsert(row(7, 3));
+        let got: Vec<(u64, u64)> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(10)))
+            .map(|(rid, epoch, _)| (rid.0, epoch.0))
+            .collect();
+        assert_eq!(got, vec![(7, 3)]);
+    }
+
+    /// REM-C §7.13: a tombstone still sitting in an internal-node buffer
+    /// suppresses the older leaf-resident live row.
+    #[test]
+    fn buffered_tombstone_suppresses_leaf_live_row() {
+        let mut m = memtable_with_leaf_resident_seven();
+        m.tombstone(RowId(7), Epoch(2)); // buffered at the root
+        let at_tombstone: Vec<(u64, bool)> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(3)))
+            .filter(|(rid, _, _)| *rid == RowId(7))
+            .map(|(_, epoch, row)| (epoch.0, row.deleted))
+            .collect();
+        assert_eq!(
+            at_tombstone,
+            vec![(2, true)],
+            "buffered tombstone is the newest visible version"
+        );
+        let before: Vec<(u64, bool)> = m
+            .newest_visible_iter(&Snapshot::at(Epoch(1)))
+            .filter(|(rid, _, _)| *rid == RowId(7))
+            .map(|(_, epoch, row)| (epoch.0, row.deleted))
+            .collect();
+        assert_eq!(before, vec![(1, false)]);
+    }
+
+    /// REM-C §7.13: HLC/epoch order inversion inside a single segment — the
+    /// cursor must pick the higher HLC even at a lower epoch.
+    #[test]
+    fn hlc_inversion_inside_one_segment() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let mut m = Memtable::new();
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(50), early).with_column(1, Value::Int64(1)));
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(1), late).with_column(1, Value::Int64(99)));
+        let snap = Snapshot::at_hlc(Epoch(99), late);
+        let got: Vec<(u64, i64)> = m
+            .newest_visible_iter(&snap)
+            .map(|(_, epoch, row)| (epoch.0, int_of_value(&row)))
+            .collect();
+        assert_eq!(got, vec![(1, 99)], "higher HLC wins over higher epoch");
+    }
+
+    /// REM-C §7.13: the same inversion across a frozen segment and the
+    /// active segment.
+    #[test]
+    fn hlc_inversion_across_frozen_segments() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        let early = HlcTimestamp {
+            physical_micros: 100,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let late = HlcTimestamp {
+            physical_micros: 200,
+            logical: 0,
+            node_tiebreaker: 1,
+        };
+        let mut m = Memtable::new();
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(50), early).with_column(1, Value::Int64(1)));
+        m.seal();
+        m.upsert(Row::new_with_hlc(RowId(1), Epoch(1), late).with_column(1, Value::Int64(99)));
+        let snap = Snapshot::at_hlc(Epoch(99), late);
+        let got: Vec<(u64, i64)> = m
+            .newest_visible_iter(&snap)
+            .map(|(_, epoch, row)| (epoch.0, int_of_value(&row)))
+            .collect();
+        assert_eq!(got, vec![(1, 99)], "higher HLC wins across segments");
+    }
+
+    /// REM-C §7.13: cancellation is observed while gathering a large
+    /// same-`RowId` version group, not only between groups.
+    #[test]
+    fn cancellation_during_large_same_row_group() {
+        let mut m = Memtable::new();
+        m.upsert(row(1, 1));
+        for v in 0..10_000u64 {
+            m.upsert(row(7, v + 1));
+        }
+        let snap = Snapshot::at(Epoch(20_000));
+        let mut cursor = m.newest_visible_iter(&snap);
+        let control = crate::ExecutionControl::new(None);
+        let (rid, ..) = cursor
+            .next_controlled(&control)
+            .expect("first advance")
+            .expect("row 1");
+        assert_eq!(rid, RowId(1));
+        // Row 7 has a 10,000-version group; the cancelled control must stop
+        // the gather at its 256-version checkpoint.
+        control.cancel(crate::CancellationReason::ClientRequest);
+        let err = cursor
+            .next_controlled(&control)
+            .expect_err("cancelled control must stop the gather");
+        assert!(matches!(err, crate::MongrelError::Cancelled));
     }
 }

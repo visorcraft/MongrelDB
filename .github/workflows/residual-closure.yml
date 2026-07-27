@@ -1,28 +1,25 @@
-# Residual closure — fail-closed pipeline (Spec REM-006, sections 53–58).
+# Residual closure — fail-closed pipeline (Spec REM-I §13, REM-G §11,
+# REM-H §12).
 #
-# This workflow is the structural gate that proves REM-001 through REM-006
-# close under one evidence bundle. It uses a strict fail-closed orchestrator
-# (`scripts/run-residual-closure.sh`) and a final aggregation job that parses
-# `closure-status.json` and refuses to publish when `overall != "pass"`.
+# This workflow is the structural gate that proves the residual issues close
+# under one evidence bundle. It uses a strict fail-closed orchestrator
+# (`scripts/run-residual-closure.sh`) driven by ONE evidence contract
+# (`scripts/residual-closure-contract.json`, §13.3), and a final aggregation
+# job that parses `closure-status.json` and refuses to publish when
+# `overall != "pass"` or any top-level threshold is false (§13.8).
 #
-# Per Spec §57 the minimum required jobs are:
-#   1. formatting + clippy
-#   2. point-directory structure
-#   3. HLC multi-run regressions
-#   4. persistent-cache integration/race/reopen
-#   5. controlled-scan structure
-#   6. HNSW connectivity
-#   7. 8-seed churn smoke
-#   8. HOT metrics/observability
-#   9. full core tests
-#   10. full workspace tests
-#   11. release-mode performance
-#   12. final evidence aggregation
-#   13. exact-SHA verification
+# Event split (§13.12):
+#   * pull_request      — fast structural gates + orchestrator self-tests
+#                         only. No PR artifact is ever labeled "final
+#                         closure"; the heavy evidence bundle is not built.
+#   * workflow_dispatch — everything: structural gates, release-mode
+#     schedule        — performance, exact-SHA orchestrator, exact-SHA
+#                         verification, and the nightly/weekly churn history
+#                         gate (REM-H via scripts/churn-history-check.sh).
 #
-# Each shard records the exact commit SHA before running, and the final
-# aggregation job rejects evidence stamped with any other SHA. No job uses
-# `if: always()` to mask a dependency failure.
+# Churn smoke (§11.2–§11.3): each matrix job runs exactly ONE seed from
+# MONGRELDB_ORACLE_SEED with MONGRELDB_ORACLE_OPERATIONS=500; the test
+# process must not loop all eight seeds internally.
 
 name: residual-closure
 
@@ -38,11 +35,15 @@ on:
       - "crates/mongreldb-core/**"
       - "crates/mongreldb-server/**"
       - "crates/mongreldb-core/tests/point_lookup_directory.rs"
+      - "crates/mongreldb-core/tests/point_lookup_runs.rs"
       - "crates/mongreldb-core/tests/result_cache_async_persistence.rs"
+      - "crates/mongreldb-core/tests/result_cache_production.rs"
       - "crates/mongreldb-core/tests/controlled_scan_streaming.rs"
       - "crates/mongreldb-core/tests/index_churn_oracle.rs"
       - "crates/mongreldb-core/tests/lookup_metrics.rs"
       - "scripts/run-residual-closure.sh"
+      - "scripts/residual-closure-contract.json"
+      - "scripts/fixtures/residual-closure/**"
       - ".github/workflows/residual-closure.yml"
   schedule:
     # nightly at 04:00 UTC; staggered to avoid the qualification window.
@@ -58,7 +59,7 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # 1. Formatting + clippy (Spec §57 §1).
+  # 1. Formatting + clippy (structural gate).
   # -------------------------------------------------------------------------
   formatting-clippy:
     runs-on: ubuntu-latest
@@ -71,16 +72,13 @@ jobs:
         with:
           toolchain: 1.97.1
           components: clippy, rustfmt
-      - name: Capture HEAD SHA
-        id: sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets --all-features --exclude mongreldb-perf -- -D warnings
 
   # -------------------------------------------------------------------------
-  # 2. Point-lookup directory structure (Spec REM-004).
+  # 2. Point-lookup directory structure.
   # -------------------------------------------------------------------------
   point-directory-structure:
     runs-on: ubuntu-latest
@@ -96,7 +94,8 @@ jobs:
       - run: cargo test -p mongreldb-core --lib run_lookup::tests --all-features
 
   # -------------------------------------------------------------------------
-  # 3. HLC multi-run regressions (Spec REM-001).
+  # 3. HLC multi-run regressions. Exact suites per the §13.11 checklist
+  # contract — not a proxy log from an unrelated suite.
   # -------------------------------------------------------------------------
   hlc-multirun:
     runs-on: ubuntu-latest
@@ -108,11 +107,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
-      - run: cargo test -p mongreldb-core --test point_lookup_directory --all-features
-      - run: cargo test -p mongreldb-core --test controlled_scan_streaming --all-features
+      - run: cargo test -p mongreldb-core --lib rem001_multi_run_hlc_authority --all-features
+      - run: cargo test -p mongreldb-core --test sorted_run_hlc_visibility --all-features
 
   # -------------------------------------------------------------------------
-  # 4. Persistent-cache integration / race / reopen (Spec REM-002).
+  # 4. Persistent-cache integration / race / reopen. No `--ignored` leg:
+  # the suites carry no ignored tests, so an ignored-only run would be a
+  # vacuous proof (§13.4).
   # -------------------------------------------------------------------------
   result-cache-race:
     runs-on: ubuntu-latest
@@ -125,10 +126,10 @@ jobs:
         with:
           toolchain: 1.97.1
       - run: cargo test -p mongreldb-core --test result_cache_async_persistence --all-features
-      - run: cargo test -p mongreldb-core --test result_cache_async_persistence --all-features -- --ignored
+      - run: cargo test -p mongreldb-core --test result_cache_production --all-features
 
   # -------------------------------------------------------------------------
-  # 5. Controlled-scan structure (Spec REM-003).
+  # 5. Controlled-scan structure.
   # -------------------------------------------------------------------------
   controlled-scan-structure:
     runs-on: ubuntu-latest
@@ -143,7 +144,7 @@ jobs:
       - run: cargo test -p mongreldb-core --test controlled_scan_streaming --all-features
 
   # -------------------------------------------------------------------------
-  # 6. HNSW connectivity (Spec REM-001).
+  # 6. HNSW connectivity.
   # -------------------------------------------------------------------------
   hnsw-connectivity:
     runs-on: ubuntu-latest
@@ -158,8 +159,10 @@ jobs:
       - run: cargo test -p mongreldb-core --test hnsw_connectivity --all-features
 
   # -------------------------------------------------------------------------
-  # 7. 8-seed churn smoke (Spec REM-005). Matrix runs each seed; the
-  # orchestrator's matrix loop aggregates them into one status entry.
+  # 7. 8-seed churn smoke (§11.2–§11.3). Each matrix job supplies exactly
+  # ONE seed via MONGRELDB_ORACLE_SEED and the documented 500-operation
+  # density via MONGRELDB_ORACLE_OPERATIONS; fail-fast is disabled so all
+  # seed failures are collected.
   # -------------------------------------------------------------------------
   eight-seed-churn-smoke:
     runs-on: ubuntu-latest
@@ -167,6 +170,9 @@ jobs:
       fail-fast: false
       matrix:
         seed: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      MONGRELDB_ORACLE_SEED: ${{ matrix.seed }}
+      MONGRELDB_ORACLE_OPERATIONS: "500"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -175,13 +181,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
-      - name: Churn oracle smoke seed ${{ matrix.seed }}
-        env:
-          MONGRELDB_ORACLE_SEED: ${{ matrix.seed }}
+      - name: Churn oracle smoke seed ${{ matrix.seed }} (500 ops)
         run: cargo test -p mongreldb-core --test index_churn_oracle --all-features -- --nocapture
 
   # -------------------------------------------------------------------------
-  # 8. HOT metrics / observability (Spec REM-006).
+  # 8. HOT metrics / observability.
   # -------------------------------------------------------------------------
   hot-observability:
     runs-on: ubuntu-latest
@@ -197,7 +201,7 @@ jobs:
       - run: cargo test -p mongreldb-server --test hot_metrics_export --all-features
 
   # -------------------------------------------------------------------------
-  # 9. Full core tests (Spec §57 §9) — dedicated full-suite command.
+  # 9. Full core tests — dedicated full-suite command.
   # -------------------------------------------------------------------------
   full-core-tests:
     runs-on: ubuntu-latest
@@ -212,7 +216,7 @@ jobs:
       - run: cargo test -p mongreldb-core --tests --all-features --lib
 
   # -------------------------------------------------------------------------
-  # 10. Full workspace tests (Spec §57 §10).
+  # 10. Full workspace tests.
   # -------------------------------------------------------------------------
   full-workspace-tests:
     runs-on: ubuntu-latest
@@ -227,8 +231,9 @@ jobs:
       - run: cargo test --workspace --all-features --exclude mongreldb-perf --tests
 
   # -------------------------------------------------------------------------
-  # 11. Release-mode performance (Spec §57 §11). Requires the heavy
-  # release-mode benchmarks; gated so it only runs on nightly + dispatch.
+  # 11. Release-mode performance (§13.12). Heavy release-mode benchmarks;
+  # only runs on workflow_dispatch and scheduled closure runs, never on
+  # pull requests.
   # -------------------------------------------------------------------------
   release-mode-performance:
     runs-on: ubuntu-latest
@@ -252,7 +257,38 @@ jobs:
             --test controlled_scan_streaming -- --include-ignored --nocapture
 
   # -------------------------------------------------------------------------
-  # 12. Orchestrator self-tests (Spec §59). Runs the script's helper
+  # 12. Nightly/weekly churn history (REM-H §12, required by §13.12 for
+  # final closure). scripts/churn-history-check.sh verifies the durable
+  # 30-nightly / 4-weekly success history; without it final closure must
+  # refuse to pass. Never runs on pull requests.
+  # -------------------------------------------------------------------------
+  churn-history:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.sha }}
+          fetch-depth: 0
+      - name: Capture requested SHA
+        id: sha
+        run: |
+          requested="${{ github.event.inputs.ref || github.sha }}"
+          requested="$(git rev-parse "$requested")"
+          echo "requested=$requested" >> "$GITHUB_OUTPUT"
+      - name: Verify nightly/weekly churn history
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/churn-history-check.sh \
+            --expected-sha "${{ steps.sha.outputs.requested }}"
+
+  # -------------------------------------------------------------------------
+  # 13. Orchestrator self-tests (§13.13). Runs the script's helper
   # functions through the dedicated self-test mode to prove they fail
   # closed without touching the real worktree.
   # -------------------------------------------------------------------------
@@ -266,19 +302,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
+      - name: Validate evidence contract
+        run: |
+          set -euo pipefail
+          jq -e . scripts/residual-closure-contract.json > /dev/null
+          # Every JSON fixture must parse except closure-status-malformed.json,
+          # which is intentionally invalid for the self-test battery.
+          find scripts/fixtures/residual-closure -name '*.json' \
+            ! -name 'closure-status-malformed.json' -print0 \
+            | while IFS= read -r -d '' f; do jq -e . "$f" > /dev/null; done
+          find scripts/fixtures/residual-closure -name '*.jsonl' -print0 \
+            | while IFS= read -r -d '' f; do jq -e . "$f" > /dev/null; done
       - name: Run orchestrator self-tests
         run: |
           set -euo pipefail
           bash scripts/run-residual-closure.sh self-test "${RUNNER_TEMP}/orchestrator-selftest"
 
   # -------------------------------------------------------------------------
-  # 13. Final orchestrator + exact-SHA verification (Spec §57 §12–13).
-  # Runs `scripts/run-residual-closure.sh` end-to-end with the requested
-  # SHA checked out BEFORE capturing it; uploads the bundle; the next
-  # job verifies the recorded SHA matches the workflow trigger ref.
+  # 14. Final orchestrator (§13.12). Runs
+  # `scripts/run-residual-closure.sh` end-to-end with the requested SHA
+  # checked out BEFORE capturing it. Only workflow_dispatch and scheduled
+  # runs build this bundle — pull requests never produce an artifact that
+  # could be mistaken for final closure evidence.
   # -------------------------------------------------------------------------
   run-orchestrator:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs:
       - formatting-clippy
       - point-directory-structure
@@ -291,10 +340,12 @@ jobs:
       - full-core-tests
       - full-workspace-tests
       - orchestrator-self-tests
+    env:
+      MONGRELDB_ORACLE_OPERATIONS: "500"
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.ref || github.sha }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
@@ -302,7 +353,8 @@ jobs:
       - name: Capture requested SHA
         id: sha
         run: |
-          requested="${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}"
+          requested="${{ github.event.inputs.ref || github.sha }}"
+          requested="$(git rev-parse "$requested")"
           short="${requested:0:12}"
           echo "requested=$requested" >> "$GITHUB_OUTPUT"
           echo "short=$short" >> "$GITHUB_OUTPUT"
@@ -315,32 +367,41 @@ jobs:
       - name: Upload closure evidence
         uses: actions/upload-artifact@v4
         with:
-          name: residual-closure-evidence
+          name: residual-closure-${{ steps.sha.outputs.short }}
           path: ${{ runner.temp }}/mongreldb-residual-closure/
 
+  # -------------------------------------------------------------------------
+  # 15. Exact-SHA verification (§13.12). Downloads the bundle and rejects
+  # it when the recorded SHA does not match the workflow trigger ref.
+  # -------------------------------------------------------------------------
   verify-exact-sha:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs: run-orchestrator
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Capture requested SHA
+        id: sha
+        run: |
+          requested="${{ github.event.inputs.ref || github.sha }}"
+          requested="$(git rev-parse "$requested")"
+          echo "requested=$requested" >> "$GITHUB_OUTPUT"
+          echo "short=${requested:0:12}" >> "$GITHUB_OUTPUT"
       - name: Download closure evidence
         uses: actions/download-artifact@v4
         with:
-          name: residual-closure-evidence
+          name: residual-closure-${{ steps.sha.outputs.short }}
           path: ${{ runner.temp }}/mongreldb-residual-closure/
       - name: Verify commit SHA matches trigger ref
         env:
-          EXPECTED_SHA: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ steps.sha.outputs.requested }}
         run: |
           set -euo pipefail
           bundle_sha="$(cat "${RUNNER_TEMP}/mongreldb-residual-closure/commit.txt" | tr -d '[:space:]')"
           expected="$(echo "$EXPECTED_SHA" | tr -d '[:space:]')"
-          if [[ "${#expected}" -lt 40 ]]; then
-            expected="$(git rev-parse "$expected")"
-          fi
           if [[ "$bundle_sha" != "$expected" ]]; then
             echo "FAIL: bundle sha ($bundle_sha) != trigger sha ($expected)" >&2
             exit 1
@@ -348,15 +409,20 @@ jobs:
           echo "OK: bundle sha matches trigger"
 
   # -------------------------------------------------------------------------
-  # Final aggregation (Spec §57 §12). MUST depend on every required job.
-  # Does NOT use `if: always()` to declare success when dependencies
-  # failed; only ever publishes when `overall == pass`.
+  # 16. Final aggregation (§13.12). Depends on every required job
+  # including release-mode performance, exact-SHA verification, and the
+  # nightly/weekly churn history. Does NOT use `if: always()` to declare
+  # success when dependencies failed; only ever publishes when
+  # `overall == pass` and every top-level threshold is true (§13.8).
   # -------------------------------------------------------------------------
   final-aggregate:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     needs:
       - run-orchestrator
       - verify-exact-sha
+      - release-mode-performance
+      - churn-history
       - formatting-clippy
       - point-directory-structure
       - hlc-multirun
@@ -371,16 +437,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Capture requested SHA
+        id: sha
+        run: |
+          requested="${{ github.event.inputs.ref || github.sha }}"
+          requested="$(git rev-parse "$requested")"
+          echo "requested=$requested" >> "$GITHUB_OUTPUT"
+          echo "short=${requested:0:12}" >> "$GITHUB_OUTPUT"
       - name: Download closure evidence
         uses: actions/download-artifact@v4
         with:
-          name: residual-closure-evidence
+          name: residual-closure-${{ steps.sha.outputs.short }}
           path: ${{ runner.temp }}/mongreldb-residual-closure/
       - name: Parse closure-status.json and require overall == pass
         env:
-          EXPECTED_SHA: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_SHA: ${{ steps.sha.outputs.requested }}
         run: |
           set -euo pipefail
           bundle="${RUNNER_TEMP}/mongreldb-residual-closure"
@@ -394,10 +467,22 @@ jobs:
             exit 1
           }
 
+          # §13.8: top-level thresholds must be true — a false threshold
+          # rejects the bundle even when every suite is green.
+          thresholds_verdict="$(jq -r '
+              if ((.thresholds.complete_miss_ok == 1 or .thresholds.complete_miss_ok == true)
+                  and (.thresholds.point_lookup_p95_ratio_ok == 1 or .thresholds.point_lookup_p95_ratio_ok == true))
+              then "ok" else "fail" end
+            ' "$bundle/closure-status.json")"
+          [[ "$thresholds_verdict" == "ok" ]] || {
+            echo "FAIL: closure-status.json top-level thresholds not all true" >&2
+            jq -c '.thresholds' "$bundle/closure-status.json" >&2 || true
+            exit 1
+          }
+
           # Cross-check the bundle SHA against the workflow trigger ref.
           bundle_sha="$(cat "$bundle/commit.txt" | tr -d '[:space:]')"
           expected="$(echo "$EXPECTED_SHA" | tr -d '[:space:]')"
-          [[ ${#expected} -lt 40 ]] && expected="$(git rev-parse "$expected")"
           [[ "$bundle_sha" == "$expected" ]] || {
             echo "FAIL: bundle sha ($bundle_sha) != trigger sha ($expected)" >&2
             exit 1
@@ -428,4 +513,32 @@ jobs:
             exit 1
           }
 
-          echo "OK: closure-status.json reports overall=pass; bundle sha matches; all shards stamped."
+          echo "OK: closure-status.json reports overall=pass; thresholds true; bundle sha matches; all shards stamped."
+
+  # -------------------------------------------------------------------------
+  # PR structural aggregate (§13.12). Pull requests run only the faster
+  # structural gates; this job never touches the final-closure evidence
+  # bundle and never labels anything "final closure".
+  # -------------------------------------------------------------------------
+  pr-aggregate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs:
+      - formatting-clippy
+      - point-directory-structure
+      - hlc-multirun
+      - result-cache-race
+      - controlled-scan-structure
+      - hnsw-connectivity
+      - eight-seed-churn-smoke
+      - hot-observability
+      - full-core-tests
+      - full-workspace-tests
+      - orchestrator-self-tests
+    steps:
+      - name: Structural gates passed (not a final-closure run)
+        run: |
+          echo "PR structural gates passed. This is NOT final closure evidence:"
+          echo "release-mode performance, exact-SHA orchestration, exact-SHA"
+          echo "verification, and nightly/weekly churn history only run on"
+          echo "workflow_dispatch and scheduled runs."

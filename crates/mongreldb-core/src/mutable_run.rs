@@ -134,7 +134,7 @@ impl MutableRun {
                     continue;
                 }
                 if best.as_ref().is_none_or(|current| {
-                    Snapshot::version_is_newer(
+                    crate::epoch::version_supersedes(
                         row.committed_epoch,
                         row.commit_ts,
                         current.committed_epoch,
@@ -179,7 +179,7 @@ impl MutableRun {
                 by_row
                     .entry(row.row_id)
                     .and_modify(|existing| {
-                        if Snapshot::version_is_newer(
+                        if crate::epoch::version_supersedes(
                             row.committed_epoch,
                             row.commit_ts,
                             existing.committed_epoch,
@@ -372,7 +372,7 @@ impl<'a> Iterator for MutableRunVisibleVersionCursor<'a> {
                 .snapshot
                 .observes_row(head.row.committed_epoch, head.row.commit_ts)
                 && best.is_none_or(|current| {
-                    Snapshot::version_is_newer(
+                    crate::epoch::version_supersedes(
                         head.row.committed_epoch,
                         head.row.commit_ts,
                         current.committed_epoch,

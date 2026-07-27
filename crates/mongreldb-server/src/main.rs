@@ -1808,6 +1808,26 @@ fn format_metrics_snapshot(snap: &mongreldb_core::engine::LookupMetricsSnapshot)
         "hot_checkpoint_rejected_total {}\n",
         snap.hot_checkpoint_rejected_total
     ));
+    out.push_str("# TYPE result_cache_persist_unavailable_total counter\n");
+    out.push_str(&format!(
+        "result_cache_persist_unavailable_total {}\n",
+        snap.result_cache_persist_unavailable_total
+    ));
+    out.push_str("# TYPE result_cache_persist_skipped_total counter\n");
+    out.push_str(&format!(
+        "result_cache_persist_skipped_total {}\n",
+        snap.result_cache_persist_skipped_total
+    ));
+    out.push_str("# TYPE result_cache_worker_spawn_failures_total counter\n");
+    out.push_str(&format!(
+        "result_cache_worker_spawn_failures_total {}\n",
+        snap.result_cache_worker_spawn_failures_total
+    ));
+    out.push_str("# TYPE result_cache_worker_shutdown_total counter\n");
+    out.push_str(&format!(
+        "result_cache_worker_shutdown_total {}\n",
+        snap.result_cache_worker_shutdown_total
+    ));
     out
 }
 

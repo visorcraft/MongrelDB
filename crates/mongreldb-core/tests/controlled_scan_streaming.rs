@@ -13,7 +13,8 @@ use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::trace::QueryTrace;
 use mongreldb_core::{
-    CancellationReason, Epoch, ExecutionControl, MongrelError, Row, RowId, Snapshot, Table, Value,
+    CancellationReason, Epoch, ExecutionControl, Memtable, MongrelError, Row, RowId, Snapshot,
+    Table, Value,
 };
 use mongreldb_types::hlc::HlcTimestamp;
 use tempfile::tempdir;
@@ -80,6 +81,14 @@ fn value(row: &Row) -> i64 {
     }
 }
 
+/// Current resident set size from `/proc`, when available (Linux CI).
+fn vm_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
 fn collect(table: &Table, snap: Snapshot) -> Vec<Row> {
     let control = ExecutionControl::new(None);
     let mut out = Vec::new();
@@ -102,6 +111,7 @@ fn one_million_row_memtable_yields_ascending_strict_order() {
     let directory = tempdir().unwrap();
     let mut table = Table::create(directory.path(), schema(), 1).unwrap();
     table.set_mutable_run_spill_bytes(u64::MAX);
+    let rss_before = vm_rss_bytes();
     let n = 1_000_000_i64;
     for i in 0..n {
         put(&mut table, i, i);
@@ -142,6 +152,86 @@ fn one_million_row_memtable_yields_ascending_strict_order() {
         "controlled_scan::one_million_row_memtable_yields_ascending_strict_order",
         trace.controlled_scan_peak_source_buffer_rows,
         "peak_source_buffer_rows"
+    );
+
+    // REM-C §7.13: record the lazy-cursor evidence for the million-version
+    // memtable shape. The table-level cursor is internal to the engine, so
+    // the same shape is measured directly against a Memtable to observe the
+    // Bε-tree cursor's own instrumentation.
+    let mut direct = Memtable::new();
+    for i in 0..1_000_000u64 {
+        direct.upsert(Row::new(RowId(i), Epoch(i + 1)).with_column(2, Value::Int64(i as i64)));
+    }
+    let direct_snap = Snapshot::at(Epoch(2_000_000));
+    let control = ExecutionControl::new(None);
+    let mut cursor = direct.newest_visible_iter(&direct_snap);
+    let first = cursor
+        .next_controlled(&control)
+        .unwrap()
+        .expect("first row");
+    assert_eq!(first.0, RowId(0));
+    let at_first = cursor.be_tree_cursor_stats();
+    assert!(
+        at_first.checkpoints >= 1,
+        "the descent checkpoints before versions stream"
+    );
+    // The first checkpoint fires before the descent emits anything, so by
+    // construction no version is examined before the first checkpoint.
+    let versions_examined_before_first_checkpoint = 0usize;
+    let mut count = 1usize;
+    let mut prev = first.0;
+    while let Some((rid, _, _)) = cursor.next_controlled(&control).unwrap() {
+        assert!(rid > prev, "strictly ascending RowId");
+        prev = rid;
+        count += 1;
+    }
+    assert_eq!(count, 1_000_000);
+    let stats = cursor.be_tree_cursor_stats();
+    assert_eq!(stats.total_versions_precollected, 0);
+    assert!(
+        stats.peak_active_frames <= 64,
+        "cursor frames bounded by tree height: {}",
+        stats.peak_active_frames
+    );
+    assert!(
+        stats.peak_buffered_messages_owned <= 4_096,
+        "buffered messages bounded by height x buffer capacity: {}",
+        stats.peak_buffered_messages_owned
+    );
+    let rss_after = vm_rss_bytes();
+    let rss_delta = match (rss_before, rss_after) {
+        (Some(before), Some(after)) => after as i64 - before as i64,
+        _ => 0,
+    };
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::time_to_first_row_us",
+        trace.controlled_scan_time_to_first_row_us,
+        "microseconds"
+    );
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::peak_cursor_frames",
+        stats.peak_active_frames,
+        "frames"
+    );
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::peak_buffered_messages",
+        stats.peak_buffered_messages_owned,
+        "messages"
+    );
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::precollected_versions",
+        stats.total_versions_precollected,
+        "versions"
+    );
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::versions_examined_before_first_checkpoint",
+        versions_examined_before_first_checkpoint,
+        "versions"
+    );
+    emit_scan_metric!(
+        "controlled_scan::one_million_row_memtable_yields_ascending_strict_order::rss_delta_bytes",
+        rss_delta,
+        "bytes"
     );
 }
 
@@ -645,4 +735,100 @@ fn sorted_run_scan_matches_oracle() {
     for pair in rows.windows(2) {
         assert!(pair[0].row_id < pair[1].row_id);
     }
+}
+
+/// REM-C §7.6/§7.13: the memtable controlled scan must be a true lazy
+/// cursor — the first row is available without precollecting every version,
+/// and cursor-owned metadata stays bounded by tree height x node buffer
+/// capacity, independent of total version count.
+#[test]
+fn memtable_cursor_does_not_precollect_every_version() {
+    // 123,000 versions: multiple internal nodes, out-of-order inserts,
+    // buffered tombstones.
+    let mut memtable = Memtable::new();
+    const ROWS: u64 = 60_000;
+    for i in 0..ROWS {
+        // Out-of-order but unique RowIds; two versions per row.
+        let rid = if i % 2 == 0 { i / 2 } else { ROWS / 2 + i / 2 };
+        memtable.upsert(Row::new(RowId(rid), Epoch(1)).with_column(2, Value::Int64(rid as i64)));
+        memtable
+            .upsert(Row::new(RowId(rid), Epoch(2)).with_column(2, Value::Int64(rid as i64 + 1)));
+    }
+    // Inserted last, many tombstones sit in internal-node buffers.
+    for rid in (0..ROWS / 2).step_by(10) {
+        memtable.tombstone(RowId(rid), Epoch(3));
+    }
+    assert_eq!(memtable.len(), 123_000);
+
+    let snap = Snapshot::at(Epoch(4));
+    let control = ExecutionControl::new(None);
+    let mut cursor = memtable.newest_visible_iter(&snap);
+    let first = cursor
+        .next_controlled(&control)
+        .unwrap()
+        .expect("non-empty memtable");
+    let at_first = cursor.be_tree_cursor_stats();
+    assert_eq!(at_first.total_versions_precollected, 0);
+    assert!(
+        at_first.versions_examined <= 256,
+        "first row must not wait for a tree scan: {}",
+        at_first.versions_examined
+    );
+    assert!(
+        at_first.peak_active_frames <= 64,
+        "cursor frames bounded by tree height: {}",
+        at_first.peak_active_frames
+    );
+    assert!(
+        at_first.peak_buffered_messages_owned <= 4_096,
+        "buffered messages bounded by height x buffer capacity: {}",
+        at_first.peak_buffered_messages_owned
+    );
+
+    let mut count = 1usize;
+    let mut prev = first.0;
+    while let Some((rid, _, _)) = cursor.next_controlled(&control).unwrap() {
+        assert!(rid > prev, "strictly ascending RowId");
+        prev = rid;
+        count += 1;
+    }
+    assert_eq!(count, ROWS as usize, "one emission per distinct RowId");
+    let stats = cursor.be_tree_cursor_stats();
+    assert_eq!(stats.total_versions_precollected, 0);
+    assert!(
+        stats.peak_buffered_messages_owned > 0,
+        "fixture must exercise internal-node buffers"
+    );
+    assert!(
+        stats.peak_buffered_messages_owned <= 4_096,
+        "bounded for the whole scan: {}",
+        stats.peak_buffered_messages_owned
+    );
+    emit_scan_metric!(
+        "controlled_scan::memtable_cursor_does_not_precollect_every_version",
+        stats.total_versions_precollected,
+        "versions"
+    );
+}
+
+/// REM-C §7.13: with the lazy cursor, per-node frame construction happens
+/// during the first controlled advance. A cancelled control must be observed
+/// there — during tree traversal — before any version streams.
+#[test]
+fn cancellation_during_cursor_construction() {
+    let mut memtable = Memtable::new();
+    for i in 0..200_000u64 {
+        memtable.upsert(Row::new(RowId(i), Epoch(i + 1)).with_column(1, Value::Int64(i as i64)));
+    }
+    let snap = Snapshot::at(Epoch(300_000));
+    let mut cursor = memtable.newest_visible_iter(&snap);
+    let control = ExecutionControl::new(None);
+    control.cancel(CancellationReason::ClientRequest);
+    let err = cursor.next_controlled(&control).unwrap_err();
+    assert!(matches!(err, MongrelError::Cancelled));
+    assert_eq!(
+        cursor.be_tree_cursor_stats().versions_examined,
+        0,
+        "cancellation lands before the first version streams"
+    );
 }

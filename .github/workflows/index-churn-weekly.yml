@@ -1,0 +1,403 @@
+# Index churn weekly (Spec REM-H §12.2) — long-duration weekly churn gate.
+#
+# Runs the index churn oracle in its weekly profile across 4 seeds x 9
+# families x 30,000 operations = 1,080,000 total operations (Spec requires
+# >= 1,000,000; the aggregate job recomputes the total from the shard
+# payloads and fails closed below the floor). Every shard runs with:
+#   - 100:1 stale/live candidate ratio  (MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO=100)
+#   - long hot-key histories            (MONGRELDB_ORACLE_HOT_KEY_HISTORY=512)
+#   - multiple compaction cycles        (MONGRELDB_ORACLE_COMPACTION_CYCLES=8)
+#   - multiple reopen cycles            (MONGRELDB_ORACLE_REOPEN_CYCLES=4)
+#   - candidate-cap + work-budget pressure
+#   - RSS (via /usr/bin/time -v) and latency capture
+#     (MONGRELDB_ORACLE_METRICS_JSON, per-seed path)
+# Encryption alternates per seed (off for seeds 1/3, on for seeds 2/4).
+#
+# The aggregate job only runs when every shard passes and publishes the
+# `index-churn-weekly-result` artifact that `scripts/churn-history-check.sh`
+# requires for the 4-consecutive-weekly closure gate (Spec §12.3).
+#
+# Weekly-profile env contract (honored by crates/mongreldb-core/tests/
+# index_churn_oracle.rs; see scripts/churn-history-check.sh header for the
+# full contract):
+#   MONGRELDB_ORACLE_WEEKLY_PROFILE        1 = enable weekly tuning
+#   MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO stale:live candidate ratio (100)
+#   MONGRELDB_ORACLE_HOT_KEY_HISTORY       ops of history per hot key (512)
+#   MONGRELDB_ORACLE_COMPACTION_CYCLES     explicit compaction cycles (8)
+#   MONGRELDB_ORACLE_REOPEN_CYCLES         explicit close+reopen cycles (4)
+#   MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE 1 = drive candidate caps hard
+#   MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE  1 = exhaust work budgets
+#   MONGRELDB_ORACLE_METRICS_JSON          path for RSS/latency JSON capture
+#   MONGRELDB_ORACLE_FAILURE_DIR           persist failing DB dirs + op logs
+#
+# Reruns of the same SHA do not extend the durable history; the history gate
+# deduplicates by head_sha (Spec §12.3).
+
+name: index-churn-weekly
+
+on:
+  schedule:
+    # weekly, Sunday 07:30 UTC; staggered after the Sunday 06:00 AI
+    # characterization window.
+    - cron: "30 7 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  # Never cancel an in-flight evidence run; history counts distinct SHAs.
+  group: index-churn-weekly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TOOLCHAIN: "1.97.1"
+  ORACLE_OPS: "30000"
+
+jobs:
+  churn-weekly-seed:
+    name: "weekly churn seed ${{ matrix.seed }} (encryption=${{ matrix.encryption }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    strategy:
+      # Spec §12.4: collect every shard failure; the workflow still fails
+      # if any shard fails.
+      fail-fast: false
+      matrix:
+        include:
+          - seed: 1
+            encryption: "0"
+          - seed: 2
+            encryption: "1"
+          - seed: 3
+            encryption: "0"
+          - seed: 4
+            encryption: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Run weekly churn profile (9 families x 30000 ops)
+        env:
+          MONGRELDB_ORACLE_SEED: ${{ matrix.seed }}
+          MONGRELDB_ORACLE_OPERATIONS: ${{ env.ORACLE_OPS }}
+          MONGRELDB_ORACLE_WEEKLY_PROFILE: "1"
+          MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO: "100"
+          MONGRELDB_ORACLE_HOT_KEY_HISTORY: "512"
+          MONGRELDB_ORACLE_COMPACTION_CYCLES: "8"
+          MONGRELDB_ORACLE_REOPEN_CYCLES: "4"
+          MONGRELDB_ORACLE_ENCRYPTION: ${{ matrix.encryption }}
+          MONGRELDB_ORACLE_TTL: "1"
+          MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS: "1"
+          MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE: "1"
+          MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE: "1"
+          MONGRELDB_ORACLE_LIFECYCLE_OPS: "1"
+          MONGRELDB_ORACLE_METRICS_JSON: ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/oracle-metrics.json
+          MONGRELDB_ORACLE_FAILURE_DIR: ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/failures
+        run: |
+          set -uo pipefail
+          out="$GITHUB_WORKSPACE/target/churn-weekly/seed-${{ matrix.seed }}"
+          mkdir -p "$out/failures"
+          status=0
+          # /usr/bin/time -v captures Maximum resident set size (RSS) for
+          # the whole test process tree into the log (Spec §12.2 RSS capture).
+          /usr/bin/time -v \
+            cargo test -p mongreldb-core --release --test index_churn_oracle \
+              --all-features -- --nocapture churn_oracle_ \
+              > "$out/seed-${{ matrix.seed }}.log" 2>&1
+          rc=$?
+          echo "$rc" > "$out/seed-${{ matrix.seed }}.exit"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::weekly seed ${{ matrix.seed }} failed (rc=$rc)"
+            echo "::error::replay: MONGRELDB_ORACLE_SEED=${{ matrix.seed }} MONGRELDB_ORACLE_OPERATIONS=${{ env.ORACLE_OPS }} \\"
+            echo "  MONGRELDB_ORACLE_WEEKLY_PROFILE=1 cargo test -p mongreldb-core --release \\"
+            echo "  --test index_churn_oracle --all-features -- --nocapture churn_oracle_"
+            status=1
+          fi
+          MONGRELDB_ORACLE_SEED="${{ matrix.seed }}" \
+            cargo test -p mongreldb-core --release --test index_churn_oracle \
+              --all-features -- --nocapture seed_determinism \
+              > "$out/seed-determinism.log" 2>&1
+          rc=$?
+          echo "$rc" > "$out/seed-determinism.exit"
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::seed_determinism failed (rc=$rc)"
+            status=1
+          fi
+          exit "$status"
+      - name: Build SHA-stamped shard result
+        if: always()
+        env:
+          SHARD_OUT: ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}
+          SEED: ${{ matrix.seed }}
+          ENCRYPTION: ${{ matrix.encryption }}
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          FAMILIES = [
+              "fm",
+              "learned_range",
+              "ann_hnsw_dense",
+              "ann_hnsw_binary_sign",
+              "ann_product_quantization",
+              "ann_diskann_dense",
+              "ann_ivf_dense",
+              "sparse",
+              "minhash",
+          ]
+          RECORD_RE = re.compile(r'^\{.*"test":')
+
+          out = os.environ["SHARD_OUT"]
+          seed = int(os.environ["SEED"])
+          ops = int(os.environ["ORACLE_OPS"])
+
+          log_path = os.path.join(out, f"seed-{seed}.log")
+          exit_path = os.path.join(out, f"seed-{seed}.exit")
+          exit_code = None
+          if os.path.exists(exit_path):
+              with open(exit_path, encoding="utf-8") as fh:
+                  exit_code = int(fh.read().strip())
+
+          seen = set()
+          max_rss_kb = None
+          if os.path.exists(log_path):
+              with open(log_path, encoding="utf-8") as fh:
+                  for line in fh:
+                      if "Maximum resident set size" in line:
+                          try:
+                              max_rss_kb = int(line.rsplit(":", 1)[-1].strip())
+                          except ValueError:
+                              pass
+                      if not RECORD_RE.match(line):
+                          continue
+                      try:
+                          rec = json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+                      name = rec.get("test", "")
+                      if name.startswith("index_churn_oracle::family::"):
+                          seen.add(name.rsplit("::", 1)[-1])
+
+          missing = [f for f in FAMILIES if f not in seen]
+          family_status = {f: ("pass" if f in seen else "fail") for f in FAMILIES}
+
+          det_exit_path = os.path.join(out, "seed-determinism.exit")
+          det_exit = None
+          if os.path.exists(det_exit_path):
+              with open(det_exit_path, encoding="utf-8") as fh:
+                  det_exit = int(fh.read().strip())
+
+          metrics_path = os.path.join(out, "oracle-metrics.json")
+          oracle_metrics = None
+          if os.path.exists(metrics_path):
+              with open(metrics_path, encoding="utf-8") as fh:
+                  try:
+                      oracle_metrics = json.load(fh)
+                  except json.JSONDecodeError:
+                      oracle_metrics = None
+
+          overall = "pass"
+          if exit_code != 0 or missing or det_exit != 0:
+              overall = "fail"
+
+          payload = {
+              "kind": "weekly",
+              "workflow": "index-churn-weekly.yml",
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "branch": os.environ.get("GITHUB_REF_NAME", ""),
+              "toolchain": os.environ["TOOLCHAIN"],
+              "seed": seed,
+              "encryption": os.environ["ENCRYPTION"] == "1",
+              "operations_per_family": ops,
+              "weekly_profile": {
+                  "stale_candidate_ratio": 100,
+                  "hot_key_history": 512,
+                  "compaction_cycles": 8,
+                  "reopen_cycles": 4,
+                  "candidate_cap_pressure": True,
+                  "work_budget_pressure": True,
+              },
+              "exit_code": exit_code,
+              "families_recorded": sorted(seen),
+              "missing_families": missing,
+              "family_status": family_status,
+              "seed_determinism_exit_code": det_exit,
+              "max_rss_kb": max_rss_kb,
+              "oracle_metrics": oracle_metrics,
+              "overall": overall,
+          }
+          canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+          result = {
+              "schema": "mongreldb.churn-shard-result/v1",
+              "content_sha256": digest,
+              "payload": payload,
+          }
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fh:
+              json.dump(result, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          print(
+              f"weekly seed {seed} overall={overall} "
+              f"max_rss_kb={max_rss_kb} sha256={digest}"
+          )
+          PYEOF
+        # NOTE: this step never masks a shard failure — the run step's exit
+        # code already failed the job; this step only renders evidence.
+      - name: Upload shard result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-churn-weekly-seed-${{ matrix.seed }}
+          path: |
+            ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/result.json
+            ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/oracle-metrics.json
+            ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/*.log
+            ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/*.exit
+          retention-days: 400
+      - name: Upload failure evidence (DB directories + op logs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-evidence-index-churn-weekly-seed-${{ matrix.seed }}
+          path: ${{ github.workspace }}/target/churn-weekly/seed-${{ matrix.seed }}/failures/
+          if-no-files-found: ignore
+          retention-days: 90
+
+  weekly-result:
+    name: Aggregate + stamp weekly result
+    runs-on: ubuntu-latest
+    # Only runs when every shard job succeeded (fail-closed; no if:always()).
+    needs: churn-weekly-seed
+    steps:
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: index-churn-weekly-seed-*
+          path: ${{ runner.temp }}/churn-weekly-shards
+      - name: Verify shard results and build stamped summary
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          root = os.environ["SHARDS_DIR"]
+          results = []
+          for entry in sorted(os.listdir(root)):
+              result_path = os.path.join(root, entry, "result.json")
+              if not os.path.exists(result_path):
+                  print(f"FAIL: shard artifact {entry} missing result.json", file=sys.stderr)
+                  sys.exit(1)
+              with open(result_path, encoding="utf-8") as fh:
+                  result = json.load(fh)
+              canonical = json.dumps(
+                  result["payload"], sort_keys=True, separators=(",", ":")
+              )
+              digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+              if digest != result.get("content_sha256"):
+                  print(f"FAIL: shard artifact {entry} digest mismatch", file=sys.stderr)
+                  sys.exit(1)
+              results.append(result)
+
+          if len(results) != 4:
+              print(f"FAIL: expected 4 seed results, found {len(results)}", file=sys.stderr)
+              sys.exit(1)
+
+          total_operations = 0
+          for result in results:
+              payload = result["payload"]
+              if payload.get("overall") != "pass":
+                  print(
+                      f"FAIL: seed {payload.get('seed')} reported overall != pass",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              if payload.get("sha") != os.environ["GITHUB_SHA"]:
+                  print(
+                      f"FAIL: seed {payload.get('seed')} stamped sha "
+                      f"{payload.get('sha')} != {os.environ['GITHUB_SHA']}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              if payload.get("max_rss_kb") is None:
+                  print(
+                      f"FAIL: seed {payload.get('seed')} missing RSS capture",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              total_operations += 9 * int(payload["operations_per_family"])
+
+          # Spec §12.2: at least 1,000,000 total operations, verified from
+          # the shard payloads (never assumed).
+          if total_operations < 1_000_000:
+              print(
+                  f"FAIL: total operations {total_operations} < 1,000,000 floor",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          payload = {
+              "kind": "weekly",
+              "workflow": "index-churn-weekly.yml",
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "run_number": int(os.environ["GITHUB_RUN_NUMBER"]),
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "toolchain": "1.97.1",
+              "seeds": sorted(r["payload"]["seed"] for r in results),
+              "families": 9,
+              "operations_per_family_per_seed": 30000,
+              "total_operations": total_operations,
+              "weekly_profile": {
+                  "stale_candidate_ratio": 100,
+                  "hot_key_history": 512,
+                  "compaction_cycles": 8,
+                  "reopen_cycles": 4,
+                  "candidate_cap_pressure": True,
+                  "work_budget_pressure": True,
+              },
+              "max_rss_kb_by_seed": {
+                  str(r["payload"]["seed"]): r["payload"]["max_rss_kb"] for r in results
+              },
+              "seed_digests": {
+                  str(r["payload"]["seed"]): r["content_sha256"] for r in results
+              },
+              "overall": "pass",
+          }
+          canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+          summary = {
+              "schema": "mongreldb.churn-weekly-result/v1",
+              "content_sha256": digest,
+              "payload": payload,
+          }
+          out = os.environ["SUMMARY_DIR"]
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "weekly-summary.json"), "w", encoding="utf-8") as fh:
+              json.dump(summary, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          print(f"weekly summary overall=pass total_ops={total_operations} sha256={digest}")
+          PYEOF
+        env:
+          SHARDS_DIR: ${{ runner.temp }}/churn-weekly-shards
+          SUMMARY_DIR: ${{ runner.temp }}/churn-weekly-summary
+      - name: Upload weekly result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-churn-weekly-result
+          path: ${{ runner.temp }}/churn-weekly-summary/
+          retention-days: 400

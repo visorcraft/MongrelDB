@@ -1,0 +1,4 @@
+{"test":"controlled_scan::one_million_row_memtable_yields_ascending_strict_order","metric":42,"unit":"peak_source_buffer_rows"}
+{"test":"controlled_scan::one_million_row_mutable_run_yields_ascending_strict_order","metric":42,"unit":"peak_source_buffer_rows"}
+{"test":"controlled_scan::dense_single_row_history_streams","metric":64,"unit":"peak_same_row_versions"}
+{"test":"controlled_scan::memtable_cursor_does_not_precollect_every_version","metric":128,"unit":"precollected_versions"}

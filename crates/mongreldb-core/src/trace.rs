@@ -180,6 +180,14 @@ pub struct QueryTrace {
     pub learned_range_used: bool,
     /// Whether the result cache returned a hit (no re-decode / re-resolve).
     pub result_cache_hit: bool,
+    /// Whether persistent result-cache publication was skipped because the
+    /// background writer was unavailable (REM-D §8.5). The in-memory entry
+    /// was still cached; only the durable-tier write was skipped.
+    pub result_cache_persist_skipped: bool,
+    /// Why persistent publication was skipped (stable label from
+    /// `PersistenceDisabledReason::label`). `Some` only when
+    /// `result_cache_persist_skipped` is `true`.
+    pub result_cache_persist_skip_reason: Option<&'static str>,
     /// Whether rows were materialized as `Row { HashMap }` (the slow path).
     pub row_materialized: bool,
     /// Number of pages decoded (lazily filled by cursors when capturing).
@@ -497,6 +505,14 @@ impl fmt::Display for QueryTrace {
         f.write_str(idx)?;
         if self.result_cache_hit {
             f.write_str(" cache=hit")?;
+        }
+        if self.result_cache_persist_skipped {
+            write!(
+                f,
+                " cache-persist=skipped({})",
+                self.result_cache_persist_skip_reason
+                    .unwrap_or("unspecified")
+            )?;
         }
         if self.learned_range_used {
             f.write_str(" learned-range")?;

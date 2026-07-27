@@ -19,24 +19,63 @@
 //!
 //! The PR smoke test runs every family through 8 fixed seeds × 500 ops and
 //! fails closed on any divergence.
+//!
+//! # Coverage-axis env contract (REM-H; see scripts/churn-history-check.sh)
+//!
+//! The nightly/weekly churn workflows compose coverage axes through
+//! environment variables. Every axis defaults to the historical PR-smoke
+//! mix (byte-identical op stream when nothing is set); `"1"` enables the
+//! axis' enhanced coverage and `"0"` removes the axis from the mix entirely
+//! — including when the weekly profile would otherwise imply it.
+//!
+//! - `MONGRELDB_ORACLE_ENCRYPTION`: `"1"` creates the churn table itself
+//!   with AES-256-GCM (`Table::create_encrypted`/`open_encrypted`); `"0"`
+//!   also removes the encrypted-sibling lifecycle ops.
+//! - `MONGRELDB_ORACLE_TTL`: `"1"` adds an expire-everything TTL op to the
+//!   mix; `"0"` removes the TTL ops.
+//! - `MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS`: `"1"` adds pinned historical
+//!   snapshot reads (re-read a pinned epoch and assert it never gains
+//!   rows); `"0"` removes the snapshot-pin ops.
+//! - `MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE`: `"1"` adds a capped
+//!   retrieval probe (`max_fused_candidates = 1`) so ANN queries exceed
+//!   candidate caps; `"0"` removes the pressure op.
+//! - `MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE`: `"1"` adds a work-budget
+//!   probe (zero budget must fail explicitly or charge nothing; a generous
+//!   budget must succeed). Only retriever families expose a work budget
+//!   through `Table`; the probe is inert for FM/LearnedRange.
+//! - `MONGRELDB_ORACLE_LIFECYCLE_OPS`: `"1"` raises reopen/flush/compaction
+//!   to full op-matrix weight; `"0"` removes lifecycle ops.
+//! - `MONGRELDB_ORACLE_WEEKLY_PROFILE=1` implies `"1"` for every axis above
+//!   except encryption (the weekly workflow sets that per seed), biases the
+//!   mix toward hot-key churn (`MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO`,
+//!   default 100; `MONGRELDB_ORACLE_HOT_KEY_HISTORY`, default 512), and
+//!   schedules explicit compaction (`MONGRELDB_ORACLE_COMPACTION_CYCLES`,
+//!   default 8) and close+reopen (`MONGRELDB_ORACLE_REOPEN_CYCLES`,
+//!   default 4) cycles across the run.
+//! - `MONGRELDB_ORACLE_METRICS_JSON`: path for a JSON object (keyed by
+//!   record name) with op/query latency percentiles, op counts, and RSS.
+//! - `MONGRELDB_ORACLE_FAILURE_DIR`: directory into which the failing
+//!   database dir, full op log, and panic context are copied on failure.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(dead_code)]
 
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
+    AiExecutionContext, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
+    SearchRequest, SetMember,
 };
 use mongreldb_core::schema::{
     AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind,
     IndexOptions, Schema, TypeId,
 };
 use mongreldb_core::{
-    Database, Epoch, OwnedSnapshotGuard, PinGuard, PinSource, RowId, Snapshot, Table, TtlPolicy,
-    Value,
+    Database, Epoch, MongrelError, OwnedSnapshotGuard, PinGuard, PinSource, QueryTrace, RowId,
+    Snapshot, Table, TtlPolicy, Value,
 };
 use mongreldb_types::hlc::HlcTimestamp;
 use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{tempdir, TempDir};
 
@@ -73,6 +112,168 @@ mod support {
             .ok()
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(default)
+    }
+
+    /// Coverage-axis state resolved from the churn-oracle env contract (see
+    /// the file header and `scripts/churn-history-check.sh`). `Default`
+    /// reproduces the historical PR-smoke mix byte-for-byte; `On` adds the
+    /// axis' enhanced coverage; `Off` removes the axis from the op mix
+    /// entirely — including when the weekly profile would otherwise imply
+    /// it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Axis {
+        Default,
+        On,
+        Off,
+    }
+
+    impl Axis {
+        pub fn on(self) -> bool {
+            self == Axis::On
+        }
+
+        pub fn off(self) -> bool {
+            self == Axis::Off
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct OracleConfig {
+        pub encryption: Axis,
+        pub ttl: Axis,
+        pub historical_snapshots: Axis,
+        pub candidate_cap_pressure: Axis,
+        pub work_budget_pressure: Axis,
+        pub lifecycle_ops: Axis,
+        pub weekly_profile: bool,
+        pub stale_candidate_ratio: usize,
+        pub hot_key_history: usize,
+        pub compaction_cycles: usize,
+        pub reopen_cycles: usize,
+        pub metrics_json: Option<PathBuf>,
+        pub failure_dir: Option<PathBuf>,
+    }
+
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name).ok().as_deref() == Some("1")
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_path(name: &str) -> Option<PathBuf> {
+        std::env::var(name)
+            .ok()
+            .filter(|raw| !raw.is_empty())
+            .map(PathBuf::from)
+    }
+
+    impl OracleConfig {
+        pub fn from_env() -> Self {
+            let weekly_profile = env_flag("MONGRELDB_ORACLE_WEEKLY_PROFILE");
+            // The weekly profile implies every axis except encryption (the
+            // weekly workflow sets encryption explicitly per seed). An
+            // explicit "0" always wins over the profile.
+            let axis = |name: &str| match std::env::var(name).ok().as_deref() {
+                Some("1") => Axis::On,
+                Some("0") => Axis::Off,
+                _ if weekly_profile => Axis::On,
+                _ => Axis::Default,
+            };
+            Self {
+                encryption: match std::env::var("MONGRELDB_ORACLE_ENCRYPTION").ok().as_deref() {
+                    Some("1") => Axis::On,
+                    Some("0") => Axis::Off,
+                    _ => Axis::Default,
+                },
+                ttl: axis("MONGRELDB_ORACLE_TTL"),
+                historical_snapshots: axis("MONGRELDB_ORACLE_HISTORICAL_SNAPSHOTS"),
+                candidate_cap_pressure: axis("MONGRELDB_ORACLE_CANDIDATE_CAP_PRESSURE"),
+                work_budget_pressure: axis("MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE"),
+                lifecycle_ops: axis("MONGRELDB_ORACLE_LIFECYCLE_OPS"),
+                weekly_profile,
+                stale_candidate_ratio: env_usize("MONGRELDB_ORACLE_STALE_CANDIDATE_RATIO", 100),
+                hot_key_history: env_usize("MONGRELDB_ORACLE_HOT_KEY_HISTORY", 512),
+                compaction_cycles: env_usize("MONGRELDB_ORACLE_COMPACTION_CYCLES", 8),
+                reopen_cycles: env_usize("MONGRELDB_ORACLE_REOPEN_CYCLES", 4),
+                metrics_json: env_path("MONGRELDB_ORACLE_METRICS_JSON"),
+                failure_dir: env_path("MONGRELDB_ORACLE_FAILURE_DIR"),
+            }
+        }
+    }
+
+    /// Nearest-rank percentile over an already-sorted sample.
+    pub fn percentile(sorted: &[u64], p: usize) -> u64 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let idx = ((p as f64 / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    pub fn latency_stats(samples: &[u64]) -> serde_json::Value {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        serde_json::json!({
+            "count": sorted.len(),
+            "p50": percentile(&sorted, 50),
+            "p95": percentile(&sorted, 95),
+            "p99": percentile(&sorted, 99),
+            "max": sorted.last().copied().unwrap_or(0),
+        })
+    }
+
+    /// Peak RSS of the test process (VmHWM), cheaply readable on Linux.
+    pub fn peak_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    static METRICS_REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<String, serde_json::Value>>,
+    > = std::sync::OnceLock::new();
+
+    /// Merge one entry into the shared metrics JSON document. Family tests
+    /// run as threads inside one test process, so every writer merges under
+    /// a lock and rewrites the whole document atomically.
+    pub fn write_metrics_json(path: &Path, key: &str, entry: serde_json::Value) {
+        let registry = METRICS_REGISTRY.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
+        guard.insert(key.to_string(), entry);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
+        if let Ok(body) = serde_json::to_string_pretty(&*guard) {
+            if std::fs::write(&tmp, body).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let target = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_recursive(&entry.path(), &target)?;
+            } else if file_type.is_file() {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
     }
 
     /// Linear-congruential RNG. Same shape as the previous session's
@@ -164,6 +365,10 @@ mod support {
         HardFilter,
         AuthAllowedSet,
         CandidateCapPressure,
+        HistoricalSnapshotRead {
+            epoch: u64,
+        },
+        WorkBudgetProbe,
     }
 
     impl fmt::Display for Op {
@@ -202,6 +407,10 @@ mod support {
                 Op::HardFilter => write!(f, "HardFilter"),
                 Op::AuthAllowedSet => write!(f, "AuthAllowedSet"),
                 Op::CandidateCapPressure => write!(f, "CandidateCapPressure"),
+                Op::HistoricalSnapshotRead { epoch } => {
+                    write!(f, "HistoricalSnapshotRead(epoch={epoch})")
+                }
+                Op::WorkBudgetProbe => write!(f, "WorkBudgetProbe"),
             }
         }
     }
@@ -645,6 +854,24 @@ mod harness {
         pub pin_guards: Vec<PinGuard>,
         pub local_pinned: Option<Snapshot>,
         pub snapshot_guards: Vec<OwnedSnapshotGuard>,
+        /// Pinned snapshot + the engine rid set captured at pin time + the
+        /// TTL state version at pin time. Historical snapshot reads re-read
+        /// the pinned epoch and assert it never gains rows; a TTL state
+        /// change forces a re-pin instead (TTL expiry is evaluated at query
+        /// time, so a changed policy legitimately alters a historical view).
+        pub historical_pin: Option<(Snapshot, HashSet<u64>, u64)>,
+        pub ttl_version: u64,
+        /// Versions written per weekly-profile hot key.
+        pub hot_versions: BTreeMap<i64, u64>,
+        /// Per-op and per-checkpoint-query wall-clock samples (micros) for
+        /// the metrics JSON.
+        pub op_latencies: Vec<u64>,
+        pub query_latencies: Vec<u64>,
+        pub cap_hits: u64,
+        pub budget_trips: u64,
+        pub historical_reads: u64,
+        pub compactions: u64,
+        pub reopens: u64,
     }
 
     impl Harness {
@@ -656,6 +883,16 @@ mod harness {
                 pin_guards: Vec::new(),
                 local_pinned: None,
                 snapshot_guards: Vec::new(),
+                historical_pin: None,
+                ttl_version: 0,
+                hot_versions: BTreeMap::new(),
+                op_latencies: Vec::new(),
+                query_latencies: Vec::new(),
+                cap_hits: 0,
+                budget_trips: 0,
+                historical_reads: 0,
+                compactions: 0,
+                reopens: 0,
             }
         }
 
@@ -944,6 +1181,17 @@ mod family_mod {
 
         fn recall_floor(&self) -> f32 {
             1.0
+        }
+
+        /// Retriever used by the candidate-cap and work-budget pressure
+        /// probes. `None` for exact query-path families (FM, LearnedRange):
+        /// the engine's candidate cap and work budget are only reachable
+        /// through the scored-retrieval surface on `Table`, so those probes
+        /// are engine-inert for query-path families (documented in
+        /// docs/06-indexes.md).
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            let _ = rng;
+            None
         }
 
         /// Extract rids + scores from an `Expected` (top-k style).
@@ -1437,6 +1685,14 @@ mod families {
         fn name(&self) -> &'static str {
             "ANN/HNSW/Dense"
         }
+
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Ann {
+                column_id: self.indexed_column(),
+                query: random_embedding(rng, 8),
+                k: 4,
+            })
+        }
         fn schema(&self) -> Schema {
             ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Hnsw)
         }
@@ -1556,6 +1812,14 @@ mod families {
 
         fn name(&self) -> &'static str {
             "ANN/HNSW/BinarySign"
+        }
+
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Ann {
+                column_id: self.indexed_column(),
+                query: random_embedding(rng, 8),
+                k: 4,
+            })
         }
         fn schema(&self) -> Schema {
             ann_dense_schema(AnnQuantization::BinarySign, AnnAlgorithm::Hnsw)
@@ -1688,6 +1952,14 @@ mod families {
         fn name(&self) -> &'static str {
             "ANN/HNSW/PQ"
         }
+
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Ann {
+                column_id: self.indexed_column(),
+                query: random_embedding(rng, 8),
+                k: 4,
+            })
+        }
         fn schema(&self) -> Schema {
             ann_dense_schema(
                 AnnQuantization::Product {
@@ -1806,6 +2078,14 @@ mod families {
         fn name(&self) -> &'static str {
             "ANN/DiskANN/Dense"
         }
+
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Ann {
+                column_id: self.indexed_column(),
+                query: random_embedding(rng, 8),
+                k: 4,
+            })
+        }
         fn schema(&self) -> Schema {
             ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::DiskAnn)
         }
@@ -1917,6 +2197,14 @@ mod families {
 
         fn name(&self) -> &'static str {
             "ANN/IVF/Dense"
+        }
+
+        fn probe_retriever(&self, rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Ann {
+                column_id: self.indexed_column(),
+                query: random_embedding(rng, 8),
+                k: 4,
+            })
         }
         fn schema(&self) -> Schema {
             ann_dense_schema(AnnQuantization::Dense, AnnAlgorithm::Ivf)
@@ -2084,6 +2372,14 @@ mod families {
 
         fn name(&self) -> &'static str {
             "Sparse"
+        }
+
+        fn probe_retriever(&self, _rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::Sparse {
+                column_id: self.indexed_column(),
+                query: vec![(1u32, 1.0), (3u32, 2.0)],
+                k: 4,
+            })
         }
         fn schema(&self) -> Schema {
             Self::schema()
@@ -2277,6 +2573,19 @@ mod families {
         fn name(&self) -> &'static str {
             "MinHash"
         }
+
+        fn probe_retriever(&self, _rng: &mut Lcg) -> Option<Retriever> {
+            Some(Retriever::MinHash {
+                column_id: self.indexed_column(),
+                members: vec![
+                    SetMember::String("a".into()),
+                    SetMember::String("b".into()),
+                    SetMember::String("c".into()),
+                    SetMember::String("d".into()),
+                ],
+                k: 4,
+            })
+        }
         fn schema(&self) -> Schema {
             Self::schema()
         }
@@ -2438,6 +2747,77 @@ use families::{
 mod replay {
     use super::*;
 
+    /// Passphrase for the main churn table when
+    /// `MONGRELDB_ORACLE_ENCRYPTION=1` (same value the encrypted-sibling op
+    /// has always used).
+    const ENCRYPTION_PASSPHRASE: &str = "oracle-encryption-passphrase";
+
+    /// Weekly-profile hot-key churn: a small set of PKs outside every
+    /// random PK range gets the bulk of update/delete-bucket ops, so each
+    /// hot key accumulates a long version history and the secondary indexes
+    /// accumulate stale candidates.
+    const HOT_PK_BASE: i64 = 500_000;
+    const HOT_KEY_COUNT: usize = 8;
+
+    /// Commit + close + reopen the churn table, then re-stamp the model so
+    /// the oracle observes the same view the engine does. Shared by the
+    /// close+reopen op and the weekly profile's scheduled reopen cycles.
+    fn close_reopen(
+        table: &mut Table,
+        table_dir: &Path,
+        harness: &mut Harness,
+        config: &OracleConfig,
+        op_index: usize,
+    ) {
+        table
+            .commit()
+            .unwrap_or_else(|e| panic!("commit pre-close {op_index}: {e}"));
+        table
+            .close()
+            .unwrap_or_else(|e| panic!("close op {op_index}: {e}"));
+        *table = if config.encryption.on() {
+            Table::open_encrypted(table_dir, ENCRYPTION_PASSPHRASE)
+                .unwrap_or_else(|e| panic!("reopen op {op_index}: {e}"))
+        } else {
+            Table::open(table_dir).unwrap_or_else(|e| panic!("reopen op {op_index}: {e}"))
+        };
+        // Re-stamp every model row's commit_epoch below the engine's
+        // new visible epoch so the oracle observes the same view the
+        // engine does. Tombstoned rows keep their delete_epoch.
+        let snap_after = table.snapshot();
+        harness.model.reset_for_close_reopen(snap_after.epoch);
+        // Pinned epochs from before the reopen are no longer meaningful.
+        harness.historical_pin = None;
+        harness.reopens += 1;
+        harness.record(Op::CloseReopen);
+    }
+
+    /// Extract the requested k from a probe retriever.
+    fn retriever_k(retriever: &Retriever) -> usize {
+        match retriever {
+            Retriever::Ann { k, .. }
+            | Retriever::Sparse { k, .. }
+            | Retriever::MinHash { k, .. } => *k,
+        }
+    }
+
+    /// Weekly profile: write a fresh version of a hot key's indexed column.
+    /// Every churn allocates a new rid and leaves the previous version
+    /// stale, so the hot keys build the long version histories and the
+    /// stale-candidate backlog the weekly profile targets.
+    fn hot_churn<F: ChurnOracleFamily>(
+        table: &mut Table,
+        harness: &mut Harness,
+        family: &F,
+        rng: &mut Lcg,
+        op_index: usize,
+    ) {
+        let pk = HOT_PK_BASE + rng.gen_range(0, HOT_KEY_COUNT) as i64;
+        let cols = family.make_values(rng, pk, harness);
+        apply_update_indexed(table, harness, pk, cols, op_index);
+        *harness.hot_versions.entry(pk).or_insert(0) += 1;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply_one_op<F: ChurnOracleFamily>(
         choice: usize,
@@ -2449,7 +2829,13 @@ mod replay {
         family: &F,
         rng: &mut Lcg,
         op_index: usize,
+        config: &OracleConfig,
     ) {
+        // Weekly profile: probability that an update/delete-bucket op is
+        // redirected at a hot key, derived from the target stale:live
+        // candidate ratio.
+        let hot_p =
+            config.stale_candidate_ratio as f64 / (config.stale_candidate_ratio as f64 + 1.0);
         match choice {
             // 0..=9: insert new PK (10%)
             0..=9 => {
@@ -2457,9 +2843,12 @@ mod replay {
                 let cols = family.make_values(rng, pk, harness);
                 apply_put(table, harness, pk, cols, op_index);
             }
-            // 10..=17: update existing PK's indexed column (8%)
+            // 10..=17: update existing PK's indexed column (8%); the weekly
+            // profile redirects most of these at the hot keys.
             10..=17 => {
-                if let Some(pk) = pick_existing_pk(harness, rng) {
+                if config.weekly_profile && rng.gen_bool(hot_p) {
+                    hot_churn(table, harness, family, rng, op_index);
+                } else if let Some(pk) = pick_existing_pk(harness, rng) {
                     let cols = family.make_values(rng, pk, harness);
                     apply_update_indexed(table, harness, pk, cols, op_index);
                 }
@@ -2471,9 +2860,13 @@ mod replay {
                     apply_update_non_indexed(table, harness, pk, Value::Int64(nonce), op_index);
                 }
             }
-            // 22..=28: delete existing PK (7%)
+            // 22..=28: delete existing PK (7%); the weekly profile turns
+            // most of these into hot-key churn (an update keeps the hot key
+            // live while still leaving a stale version behind).
             22..=28 => {
-                if let Some(pk) = pick_existing_pk(harness, rng) {
+                if config.weekly_profile && rng.gen_bool(hot_p) {
+                    hot_churn(table, harness, family, rng, op_index);
+                } else if let Some(pk) = pick_existing_pk(harness, rng) {
                     apply_delete(table, harness, pk, op_index);
                 }
             }
@@ -2507,59 +2900,58 @@ mod replay {
                     .unwrap_or_else(|e| panic!("commit op {op_index}: {e}"));
                 harness.record(Op::Commit);
             }
-            // 44..=47: flush no-spill (4%)
-            44..=47 => {
+            // 44..=47: flush no-spill (4%; removed when lifecycle ops are off)
+            44..=47 if !config.lifecycle_ops.off() => {
                 table
                     .flush()
                     .unwrap_or_else(|e| panic!("flush op {op_index}: {e}"));
                 harness.record(Op::Flush);
             }
             // 48: force_flush (1%)
-            48 => {
+            48 if !config.lifecycle_ops.off() => {
                 table
                     .force_flush()
                     .unwrap_or_else(|e| panic!("force_flush op {op_index}: {e}"));
                 harness.record(Op::ForceFlush);
             }
             // 49: compact (1%)
-            49 => {
+            49 if !config.lifecycle_ops.off() => {
                 table
                     .compact()
                     .unwrap_or_else(|e| panic!("compact op {op_index}: {e}"));
+                harness.compactions += 1;
                 harness.record(Op::Compact);
             }
             // 50: rebuild_indexes (1%)
-            50 => {
+            50 if !config.lifecycle_ops.off() => {
                 table
                     .rebuild_indexes()
                     .unwrap_or_else(|e| panic!("rebuild_indexes op {op_index}: {e}"));
                 harness.record(Op::RebuildIndexes);
             }
             // 51: close + reopen (1%)
-            51 => {
-                table
-                    .commit()
-                    .unwrap_or_else(|e| panic!("commit pre-close {op_index}: {e}"));
-                table
-                    .close()
-                    .unwrap_or_else(|e| panic!("close op {op_index}: {e}"));
-                *table =
-                    Table::open(table_dir).unwrap_or_else(|e| panic!("reopen op {op_index}: {e}"));
-                // Re-stamp every model row's commit_epoch below the engine's
-                // new visible epoch so the oracle observes the same view the
-                // engine does. Tombstoned rows keep their delete_epoch.
-                let snap_after = table.snapshot();
-                harness.model.reset_for_close_reopen(snap_after.epoch);
-                harness.record(Op::CloseReopen);
+            51 if !config.lifecycle_ops.off() => {
+                close_reopen(table, table_dir, harness, config, op_index);
             }
-            // 52: local snapshot pin (1%)
-            52 => {
+            // 52: local snapshot pin (1%; removed when historical snapshots
+            // are off). When the axis is on, the pin also captures the
+            // engine's visible rid set for later historical reads.
+            52 if !config.historical_snapshots.off() => {
                 let snap = table.pin_snapshot();
                 harness.local_pinned = Some(snap);
+                if config.historical_snapshots.on() {
+                    let captured: HashSet<u64> = table
+                        .query(&Query::new())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| r.row_id.0)
+                        .collect();
+                    harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                }
                 harness.record(Op::PinLocalSnapshot);
             }
             // 53: Database::snapshot registry pin (1%)
-            53 => {
+            53 if !config.historical_snapshots.off() => {
                 if let Some(db) = database.as_ref() {
                     let (_snap, guard) = db.snapshot_owned();
                     harness.snapshot_guards.push(guard);
@@ -2569,11 +2961,20 @@ mod replay {
                 } else {
                     let snap = table.pin_snapshot();
                     harness.local_pinned = Some(snap);
+                    if config.historical_snapshots.on() {
+                        let captured: HashSet<u64> = table
+                            .query(&Query::new())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|r| r.row_id.0)
+                            .collect();
+                        harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                    }
                     harness.record(Op::PinLocalSnapshot);
                 }
             }
             // 54..=59: PinRegistry pin (one of six sources) (6%)
-            54..=59 => {
+            54..=59 if !config.historical_snapshots.off() => {
                 let idx = choice - 54;
                 let source = [
                     PinSource::TransactionSnapshot,
@@ -2588,8 +2989,8 @@ mod replay {
                 harness.pin_guards.push(guard);
                 harness.record(Op::PinRegistry { source });
             }
-            // 60..=62: TTL enable (3%)
-            60..=62 => {
+            // 60..=62: TTL enable (3%; removed when TTL is off)
+            60..=62 if !config.ttl.off() => {
                 // 1-hour TTL — long enough that the rows are not expired
                 // during a multi-second test run; the `set_ttl` path is
                 // exercised end-to-end. Per-row TTL expiry semantics are
@@ -2600,21 +3001,24 @@ mod replay {
                 harness
                     .model
                     .set_ttl(family.non_indexed_column(), 3_600_000_000_000);
+                harness.ttl_version += 1;
                 harness.record(Op::SetTtl {
                     column_id: family.non_indexed_column(),
                     duration_nanos: 3_600_000_000_000,
                 });
             }
             // 63: clear TTL (1%)
-            63 => {
+            63 if !config.ttl.off() => {
                 table
                     .clear_ttl()
                     .unwrap_or_else(|e| panic!("clear_ttl op {op_index}: {e}"));
                 harness.model.clear_ttl();
+                harness.ttl_version += 1;
                 harness.record(Op::ClearTtl);
             }
-            // 64..=66: encrypted table lifecycle (3%)
-            64..=66 => {
+            // 64..=66: encrypted table lifecycle (3%; removed when
+            // encryption is off)
+            64..=66 if !config.encryption.off() => {
                 if let Some(dir) = encrypted_dir {
                     let pk = rng.gen_i64(10_000, 19_999);
                     let _ = std::fs::remove_dir_all(dir);
@@ -2686,7 +3090,20 @@ mod replay {
                     if allowed.contains(&RowId(pk1_rid)) {
                         oracle.insert(pk1_rid);
                     }
-                    assert_eq!(engine_hits, oracle, "auth allowed-set op {op_index}");
+                    // The security property is directional: the engine must
+                    // never return a row outside the allowed set. Exact
+                    // equality is too strong here for the same reason the
+                    // final-consistency check is soft — compaction (and
+                    // close+reopen) physically reclaim TTL-expired rows
+                    // (compaction.rs `select_keep`), while the model treats
+                    // TTL as a query-time filter that `clear_ttl` fully
+                    // reverses, so a model-live row can be legitimately
+                    // absent from the engine after a TTL + compaction cycle.
+                    assert!(
+                        engine_hits.is_subset(&oracle),
+                        "auth allowed-set op {op_index}: engine returned rows outside the \
+                         allowed set: {engine_hits:?} vs {oracle:?}"
+                    );
                     // Note: do NOT mutate the model's auth_allowed — the
                     // engine's auth is per-query and not persistent, so the
                     // model should keep its full eligibility view.
@@ -2694,19 +3111,228 @@ mod replay {
                 harness.record(Op::AuthAllowedSet);
             }
             // 70: candidate-cap pressure (1%)
-            70 => {
+            70 if !config.candidate_cap_pressure.off() => {
                 let to_delete: Vec<i64> = harness.model.live_pks.keys().copied().take(5).collect();
                 for pk in to_delete {
                     apply_delete(table, harness, pk, op_index);
                 }
+                if config.candidate_cap_pressure.on() {
+                    if let Some(retriever) = family.probe_retriever(rng) {
+                        let k = retriever_k(&retriever);
+                        let snap = table.snapshot();
+                        // max_fused_candidates = 1 makes the engine's hard
+                        // candidate cap bind whenever the index holds more
+                        // than one candidate. The cap is enforced on the ANN
+                        // retrieval path only (docs/06-indexes.md); Sparse
+                        // and MinHash still run the probe so their retrieval
+                        // path sees a constrained execution context, and
+                        // FM/LearnedRange keep the delete-based pressure
+                        // above (no retriever surface — documented).
+                        let capped = AiExecutionContext::with_limits(
+                            std::time::Duration::from_secs(30),
+                            usize::MAX,
+                            1,
+                        );
+                        let (result, trace) = QueryTrace::capture(|| {
+                            table.retrieve_at_with_allowed_and_context(
+                                &retriever,
+                                snap,
+                                None,
+                                Some(&capped),
+                            )
+                        });
+                        let hits = result
+                            .unwrap_or_else(|e| panic!("candidate-cap probe op {op_index}: {e}"));
+                        assert!(
+                            hits.len() <= k,
+                            "candidate-cap probe op {op_index}: {} hits > k={k}",
+                            hits.len()
+                        );
+                        if trace.candidate_cap_hit {
+                            harness.cap_hits += 1;
+                        }
+                    }
+                }
                 harness.record(Op::CandidateCapPressure);
             }
-            // 71..=99: default insert (29%)
+            // 71: expire-everything TTL (only when the TTL axis is on).
+            // A 1µs TTL expires every row deterministically: the `nonce`
+            // column holds either a small rng value (<= 1ms after the
+            // epoch) or a wall-clock put timestamp, and both sit more than
+            // 1µs in the past by the next checkpoint, so the model and the
+            // engine always agree on the expired set.
+            71 if config.ttl.on() => {
+                table
+                    .set_ttl("nonce", 1_000)
+                    .unwrap_or_else(|e| panic!("set_ttl (expire-all) op {op_index}: {e}"));
+                harness.model.set_ttl(family.non_indexed_column(), 1_000);
+                harness.ttl_version += 1;
+                harness.record(Op::SetTtl {
+                    column_id: family.non_indexed_column(),
+                    duration_nanos: 1_000,
+                });
+            }
+            // 72..=73: pinned historical snapshot read (only when the
+            // historical-snapshots axis is on). Re-read the pinned epoch and
+            // assert it never gains rows it did not have at pin time (TTL
+            // expiry can only shrink the view; a TTL policy change forces a
+            // re-pin instead).
+            72..=73 if config.historical_snapshots.on() => {
+                let pin = harness.historical_pin.take();
+                match pin {
+                    Some((snap, captured, ttl_version)) if ttl_version == harness.ttl_version => {
+                        let reread: HashSet<u64> = table
+                            .query_at_with_allowed(&Query::new(), snap, None)
+                            .unwrap_or_else(|e| {
+                                panic!("historical snapshot read op {op_index}: {e}")
+                            })
+                            .into_iter()
+                            .map(|r| r.row_id.0)
+                            .collect();
+                        assert!(
+                            reread.is_subset(&captured),
+                            "historical snapshot read op {op_index}: pinned epoch {} gained \
+                             rows not visible at pin time: {:?}",
+                            snap.epoch.0,
+                            reread.difference(&captured).collect::<Vec<_>>()
+                        );
+                        harness.historical_reads += 1;
+                        harness.historical_pin = Some((snap, captured, ttl_version));
+                        harness.record(Op::HistoricalSnapshotRead {
+                            epoch: snap.epoch.0,
+                        });
+                    }
+                    _ => {
+                        let snap = table.pin_snapshot();
+                        harness.local_pinned = Some(snap);
+                        let captured: HashSet<u64> = table
+                            .query(&Query::new())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|r| r.row_id.0)
+                            .collect();
+                        harness.historical_pin = Some((snap, captured, harness.ttl_version));
+                        harness.record(Op::PinLocalSnapshot);
+                    }
+                }
+            }
+            // 74: work-budget probe (only when the work-budget axis is on).
+            // A zero budget must either fail explicitly with
+            // WorkBudgetExceeded (never silently truncate) or charge nothing
+            // on an empty index; a generous budget must always succeed.
+            // Only retriever families expose a work budget through `Table`;
+            // the probe is engine-inert for FM/LearnedRange (documented in
+            // docs/06-indexes.md).
+            74 if config.work_budget_pressure.on() => {
+                if let Some(retriever) = family.probe_retriever(rng) {
+                    let snap = table.snapshot();
+                    let tight = AiExecutionContext::new(None, 0);
+                    match table.retrieve_at_with_allowed_and_context(
+                        &retriever,
+                        snap,
+                        None,
+                        Some(&tight),
+                    ) {
+                        Err(MongrelError::WorkBudgetExceeded) => harness.budget_trips += 1,
+                        Err(e) => panic!("work-budget probe op {op_index}: unexpected error {e}"),
+                        Ok(_) => {}
+                    }
+                    let generous = AiExecutionContext::new(None, usize::MAX);
+                    table
+                        .retrieve_at_with_allowed_and_context(
+                            &retriever,
+                            snap,
+                            None,
+                            Some(&generous),
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("work-budget probe (generous budget) op {op_index}: {e}")
+                        });
+                }
+                harness.record(Op::WorkBudgetProbe);
+            }
+            // 75..=80: extra lifecycle weight (only when the lifecycle axis
+            // is explicitly on): reopen/rebuild/compaction at full
+            // op-matrix weight.
+            75..=76 if config.lifecycle_ops.on() => {
+                table
+                    .flush()
+                    .unwrap_or_else(|e| panic!("flush op {op_index}: {e}"));
+                harness.record(Op::Flush);
+            }
+            77..=78 if config.lifecycle_ops.on() => {
+                table
+                    .compact()
+                    .unwrap_or_else(|e| panic!("compact op {op_index}: {e}"));
+                harness.compactions += 1;
+                harness.record(Op::Compact);
+            }
+            79 if config.lifecycle_ops.on() => {
+                table
+                    .rebuild_indexes()
+                    .unwrap_or_else(|e| panic!("rebuild_indexes op {op_index}: {e}"));
+                harness.record(Op::RebuildIndexes);
+            }
+            80 if config.lifecycle_ops.on() => {
+                close_reopen(table, table_dir, harness, config, op_index);
+            }
+            // 71..=99 (remaining): default insert (29%)
             _ => {
                 let pk = rng.gen_i64(1, 5_000);
                 let cols = family.make_values(rng, pk, harness);
                 apply_put(table, harness, pk, cols, op_index);
             }
+        }
+    }
+
+    /// Copy the failing database dir, the full op log, and the panic
+    /// context into `MONGRELDB_ORACLE_FAILURE_DIR` (when set) so CI can
+    /// upload them as failure evidence. Best-effort: evidence persistence
+    /// must never mask the original panic.
+    pub fn persist_failure_evidence(
+        config: &OracleConfig,
+        dir: &TempDir,
+        harness: &Harness,
+        payload: &(dyn std::any::Any + Send),
+        family: &str,
+        seed: u64,
+    ) {
+        let Some(base) = &config.failure_dir else {
+            return;
+        };
+        let slug: String = family
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let out = base.join(format!("{slug}-seed-{seed}"));
+        if let Err(e) = std::fs::create_dir_all(&out) {
+            eprintln!("failure-dir: could not create {}: {e}", out.display());
+            return;
+        }
+        if let Err(e) = copy_dir_recursive(dir.path(), &out.join("db")) {
+            eprintln!("failure-dir: could not copy database dir: {e}");
+        }
+        let op_log = harness
+            .log
+            .iter()
+            .map(|op| format!("{op}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Err(e) = std::fs::write(out.join("op-log.txt"), format!("{op_log}\n")) {
+            eprintln!("failure-dir: could not write op log: {e}");
+        }
+        let panic_msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let context = format!(
+            "family: {family}\nseed: {seed}\nops_completed: {}\nconfig: {config:?}\n\
+             panic:\n{panic_msg}\n",
+            harness.op_count,
+        );
+        if let Err(e) = std::fs::write(out.join("failure.txt"), context) {
+            eprintln!("failure-dir: could not write failure context: {e}");
         }
     }
 
@@ -2719,28 +3345,103 @@ mod replay {
         dir: &TempDir,
         database: Option<&Database>,
         encrypted_dir: Option<&std::path::Path>,
+        config: &OracleConfig,
+        metrics_key: &str,
+    ) -> ReplaySummary {
+        let family_name = family.name();
+        let mut harness = Harness::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_replay_inner(
+                &family,
+                seed,
+                total_ops,
+                checkpoint_every,
+                dir,
+                database,
+                encrypted_dir,
+                config,
+                metrics_key,
+                &mut harness,
+            )
+        }));
+        match result {
+            Ok(summary) => summary,
+            Err(payload) => {
+                persist_failure_evidence(
+                    config,
+                    dir,
+                    &harness,
+                    payload.as_ref(),
+                    family_name,
+                    seed,
+                );
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_replay_inner<F: ChurnOracleFamily>(
+        family: &F,
+        seed: u64,
+        total_ops: usize,
+        checkpoint_every: usize,
+        dir: &TempDir,
+        database: Option<&Database>,
+        encrypted_dir: Option<&std::path::Path>,
+        config: &OracleConfig,
+        metrics_key: &str,
+        harness: &mut Harness,
     ) -> ReplaySummary {
         let table_dir = dir.path().to_path_buf();
-        let mut table = Table::create(&table_dir, family.schema(), 1)
-            .unwrap_or_else(|e| panic!("table create for family {}: {e}", family.name()));
+        let mut table = if config.encryption.on() {
+            Table::create_encrypted(&table_dir, family.schema(), 1, ENCRYPTION_PASSPHRASE)
+                .unwrap_or_else(|e| panic!("table create for family {}: {e}", family.name()))
+        } else {
+            Table::create(&table_dir, family.schema(), 1)
+                .unwrap_or_else(|e| panic!("table create for family {}: {e}", family.name()))
+        };
         table.set_mutable_run_spill_bytes(1);
-        let mut harness = Harness::new();
         let mut rng = Lcg::new(seed);
 
         let start = Instant::now();
         for step in 0..total_ops {
+            // Weekly profile: explicit compaction and close+reopen cycles
+            // spread deterministically across the run (step-index driven,
+            // no RNG), in addition to the random lifecycle ops in the mix.
+            if config.weekly_profile && !config.lifecycle_ops.off() && step > 0 {
+                if let Some(every) = total_ops.checked_div(config.compaction_cycles) {
+                    if step % every.max(1) == 0 {
+                        table
+                            .compact()
+                            .unwrap_or_else(|e| panic!("scheduled compact at step {step}: {e}"));
+                        harness.compactions += 1;
+                        harness.record(Op::Compact);
+                    }
+                }
+                if let Some(every) = total_ops.checked_div(config.reopen_cycles) {
+                    if step % every.max(1) == 0 {
+                        close_reopen(&mut table, &table_dir, harness, config, step);
+                    }
+                }
+            }
             let choice = rng.gen_range(0, 100);
+            let op_start = Instant::now();
             apply_one_op(
                 choice,
                 &mut table,
                 &table_dir,
-                &mut harness,
+                harness,
                 database,
                 encrypted_dir,
-                &family,
+                family,
                 &mut rng,
                 step,
+                config,
             );
+            harness
+                .op_latencies
+                .push(op_start.elapsed().as_micros() as u64);
             if step % checkpoint_every == checkpoint_every.saturating_sub(1) {
                 table
                     .flush()
@@ -2748,10 +3449,14 @@ mod replay {
                 let snap = table.snapshot();
                 let query = family.make_query(&mut rng);
                 let expected = family.expected(&harness.model, snap, &query);
+                let query_start = Instant::now();
                 let actual = match family.actual(&mut table, snap, &query) {
                     Ok(a) => a,
                     Err(e) => panic!("family {} actual() at step {step}: {e}", family.name()),
                 };
+                harness
+                    .query_latencies
+                    .push(query_start.elapsed().as_micros() as u64);
                 let last = harness.tail(50);
                 let (exp_rids, exp_scores) = family.expected_rids_scores(&expected);
                 let (act_rids, act_scores) = family.actual_rids_scores(&actual);
@@ -2814,6 +3519,35 @@ mod replay {
             );
         }
 
+        if let Some(path) = &config.metrics_json {
+            let stale = harness.model.tombstones.len();
+            let live = engine_rids.len();
+            write_metrics_json(
+                path,
+                metrics_key,
+                serde_json::json!({
+                    "family": family.name(),
+                    "seed": seed,
+                    "ops": harness.op_count,
+                    "checkpoints": harness.query_latencies.len(),
+                    "op_latency_us": latency_stats(&harness.op_latencies),
+                    "query_latency_us": latency_stats(&harness.query_latencies),
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "live_rids": live,
+                    "stale_candidates": stale,
+                    "stale_live_ratio": if live == 0 { stale as f64 } else { stale as f64 / live as f64 },
+                    "max_hot_key_versions": harness.hot_versions.values().copied().max().unwrap_or(0),
+                    "candidate_cap_hits": harness.cap_hits,
+                    "work_budget_trips": harness.budget_trips,
+                    "historical_reads": harness.historical_reads,
+                    "compactions": harness.compactions,
+                    "reopens": harness.reopens,
+                    "peak_rss_kb": peak_rss_kb(),
+                    "weekly_profile": config.weekly_profile,
+                }),
+            );
+        }
+
         ReplaySummary {
             family: family.name().to_string(),
             seed,
@@ -2855,6 +3589,7 @@ use replay::run_replay;
 // ---------------------------------------------------------------------------
 
 fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
+    let config = OracleConfig::from_env();
     let dir = tempdir().expect("tempdir");
     let enc_dir = dir.path().join("enc_sibling");
     let summary = run_replay(
@@ -2865,6 +3600,8 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
         &dir,
         None,
         Some(&enc_dir),
+        &config,
+        &format!("index_churn_oracle::family::{name}"),
     );
     summary.emit_metric();
     emit_oracle_metric(
@@ -3128,6 +3865,35 @@ fn churn_oracle_seed_determinism() {
 }
 
 // ---------------------------------------------------------------------------
+// Failure evidence: MONGRELDB_ORACLE_FAILURE_DIR capture (synthetic panic).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn churn_oracle_failure_evidence_persisted() {
+    let db_dir = tempdir().expect("tempdir");
+    std::fs::write(db_dir.path().join("marker.txt"), b"db").expect("write marker");
+    let failure_root = tempdir().expect("tempdir");
+    let config = OracleConfig {
+        failure_dir: Some(failure_root.path().to_path_buf()),
+        ..OracleConfig::from_env()
+    };
+    let mut harness = Harness::new();
+    harness.record(Op::Commit);
+    let payload: &(dyn std::any::Any + Send) = &"synthetic divergence";
+    replay::persist_failure_evidence(&config, &db_dir, &harness, payload, "Synthetic/Family", 7);
+    let out = failure_root.path().join("Synthetic_Family-seed-7");
+    assert!(
+        out.join("db/marker.txt").exists(),
+        "database dir must be copied into the failure dir"
+    );
+    let op_log = std::fs::read_to_string(out.join("op-log.txt")).expect("op log");
+    assert!(op_log.contains("Commit"), "op log must list every op");
+    let failure = std::fs::read_to_string(out.join("failure.txt")).expect("failure context");
+    assert!(failure.contains("synthetic divergence"));
+    assert!(failure.contains("seed: 7"));
+}
+
+// ---------------------------------------------------------------------------
 // PR smoke: every family × every PR_SMOKE_SEED seed. Fails closed on any
 // divergence. (spec §47.1).
 // ---------------------------------------------------------------------------
@@ -3139,41 +3905,141 @@ fn churn_oracle_pr_smoke_all_families() {
     // the spec's 500-op density is exercised by the per-family tests via
     // `MONGRELDB_ORACLE_OPERATIONS=500 cargo test ...`. Fails closed on any
     // recall-floor divergence.
+    let config = OracleConfig::from_env();
     for &seed in &PR_SMOKE_SEEDS {
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(FmFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            FmFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::fm",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(LearnedRangeFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            LearnedRangeFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::learned_range",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(AnnDenseFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            AnnDenseFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::ann_hnsw_dense",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(AnnBinarySignFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            AnnBinarySignFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::ann_hnsw_binary_sign",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(AnnPqFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            AnnPqFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::ann_product_quantization",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(DiskAnnFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            DiskAnnFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::ann_diskann_dense",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(IvfFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            IvfFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::ann_ivf_dense",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(SparseFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            SparseFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::sparse",
+        )
+        .emit_metric();
 
         let d = tempdir().expect("tempdir");
         let enc = d.path().join("enc");
-        run_replay(MinHashFamily, seed, 75, 25, &d, None, Some(&enc)).emit_metric();
+        run_replay(
+            MinHashFamily,
+            seed,
+            75,
+            25,
+            &d,
+            None,
+            Some(&enc),
+            &config,
+            "index_churn_oracle::pr_smoke::minhash",
+        )
+        .emit_metric();
     }
 }

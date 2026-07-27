@@ -20,7 +20,10 @@ use crate::index::{
 use crate::manifest::{self, Manifest, RunRef, TtlPolicy};
 use crate::memtable::{Memtable, MemtableVisibleVersionCursor, Row, Value};
 use crate::mutable_run::{MutableRun, MutableRunVisibleVersionCursor};
-use crate::result_cache::{DrainOutcome, PersistContext, PersistentCacheIdentity, FRAME_MAGIC};
+use crate::result_cache::{
+    DrainOutcome, PersistContext, PersistenceDisabledReason, PersistentCacheIdentity,
+    PersistentPublicationState, FRAME_MAGIC,
+};
 use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
@@ -289,8 +292,11 @@ impl<'a> ControlledVisibleSource<'a> {
             }
             ControlledVisibleCursor::Memtable(iter) => {
                 let prev_peak = iter.peak_examined;
+                // REM-C: the memtable cursor (and the lazy Bε-tree cursors
+                // beneath it) observe cooperative cancellation during
+                // traversal and large same-row gathers.
                 let next = iter
-                    .next()
+                    .next_controlled(control)?
                     .map(|(rid, epoch, row)| ControlledVisibleCandidate::Memtable(rid, epoch, row));
                 if let Some(peak) = iter.peak_examined.checked_sub(prev_peak) {
                     crate::trace::QueryTrace::record(|t| {
@@ -1530,6 +1536,13 @@ impl LookupMetrics {
             result_cache_persist_queue_depth: self
                 .result_cache_persist_queue_depth
                 .load(std::sync::atomic::Ordering::Relaxed),
+            // REM-D §8.7: publication-availability counters live on the
+            // `ResultCache` itself (not on the writer's metrics), so they
+            // are filled in by `Table::lookup_metrics_snapshot`.
+            result_cache_persist_unavailable_total: 0,
+            result_cache_persist_skipped_total: 0,
+            result_cache_worker_spawn_failures_total: 0,
+            result_cache_worker_shutdown_total: 0,
             hot_fallback_reasons: [
                 self.hot_fallback_reasons[0].load(std::sync::atomic::Ordering::Relaxed),
                 self.hot_fallback_reasons[1].load(std::sync::atomic::Ordering::Relaxed),
@@ -1602,6 +1615,17 @@ pub struct LookupMetricsSnapshot {
     pub result_cache_persist_errors_total: u64,
     pub result_cache_persist_shutdown_abandoned_total: u64,
     pub result_cache_persist_queue_depth: u64,
+    // ---- REM-D §8.7: publication-availability counters ----
+    /// Number of times persistent publication transitioned to unavailable
+    /// (worker spawn failure, worker shutdown, queue unavailable).
+    pub result_cache_persist_unavailable_total: u64,
+    /// Number of query-path persist operations skipped because publication
+    /// was unavailable (the in-memory entry is kept; nothing hits disk).
+    pub result_cache_persist_skipped_total: u64,
+    /// Number of background-worker spawn / I/O-setup failures.
+    pub result_cache_worker_spawn_failures_total: u64,
+    /// Number of background-worker shutdowns while the cache was live.
+    pub result_cache_worker_shutdown_total: u64,
     // ---- TODO §5 ----
     pub hot_fallback_reasons: [u64; 9],
     pub hot_fallback_overlay_versions_total: u64,
@@ -1696,8 +1720,10 @@ impl CachedEntry {
 ///
 /// Hardening (b): an optional on-disk persistent tier (`dir = Some(_)`). On a
 /// memory miss, the cache tries disk before falling through to re-resolution.
-/// On `insert`, the entry is also written to disk atomically (write + fsync +
-/// rename). On `invalidate`/`clear`, the matching disk files are deleted. On
+/// On `insert`, the caller publishes the entry through `persist_entry`, which
+/// enqueues the atomic write (temp + fsync + rename) onto the background
+/// worker — never synchronously on the query thread (REM-D §8.5). On
+/// `invalidate`/`clear`, the matching disk files are deleted. On
 /// `Table::open`, existing disk entries are pre-loaded so fine-grained invalidation
 /// resumes across restart.
 struct ResultCache {
@@ -1728,12 +1754,13 @@ struct ResultCache {
     /// pay atomic filesystem publish. 0 disables the threshold (always persist
     /// when `dir` is set). Default: 4 KiB.
     persist_min_bytes: u64,
-    /// Persistent-publication writer. `Some` once the table has been wired to
-    /// a background worker (`install_persistent_writer`); `None` until then
-    /// (the early-test path that constructs a `ResultCache` directly without
-    /// going through `Table::open` keeps using the legacy synchronous
-    /// `store_to_disk`).
-    writer: Option<std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>>,
+    /// Explicit persistent-publication state (REM-D §8.6). `Async` once the
+    /// table has been wired to a background worker (`install_persistent_writer`);
+    /// `Disabled(reason)` before then, after a spawn failure, or after worker
+    /// shutdown. The query path never performs synchronous disk publication:
+    /// when the state is `Disabled`, `persist_entry` keeps the in-memory entry,
+    /// skips publication, and increments the skip metric.
+    persistence: PersistentPublicationState,
     /// Worker join handle, kept on the cache so `shutdown_persistent_cache`
     /// can wait for drain to finish.
     worker_handle: Option<std::thread::JoinHandle<()>>,
@@ -1746,6 +1773,16 @@ struct ResultCache {
     /// wrapper). Stored separately from the cache writer so the same cipher
     /// can be reused for both async and sync encode/decode paths.
     cache_payload_cipher: Option<std::sync::Arc<crate::encryption::AesCipher>>,
+    // ---- REM-D §8.7: publication-availability counters ----
+    /// Transitions of `persistence` to a `Disabled` state while the cache
+    /// was expected to publish.
+    persist_unavailable_total: std::sync::atomic::AtomicU64,
+    /// Query-path persist operations skipped because publication was disabled.
+    persist_skipped_total: std::sync::atomic::AtomicU64,
+    /// Worker spawn / I/O-setup failures observed at wiring time.
+    worker_spawn_failures_total: std::sync::atomic::AtomicU64,
+    /// Worker shutdowns observed while the cache was live.
+    worker_shutdown_total: std::sync::atomic::AtomicU64,
 }
 
 /// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
@@ -1838,16 +1875,29 @@ impl ResultCache {
             // Skip synchronous disk publish for tiny results (one-row point
             // queries). Larger analytical results still hit the durable tier.
             persist_min_bytes: 4 * 1024,
-            writer: None,
+            persistence: PersistentPublicationState::Disabled(
+                PersistenceDisabledReason::NoDirectory,
+            ),
             worker_handle: None,
             completion_rx: None,
             cache_payload_cipher: None,
+            persist_unavailable_total: std::sync::atomic::AtomicU64::new(0),
+            persist_skipped_total: std::sync::atomic::AtomicU64::new(0),
+            worker_spawn_failures_total: std::sync::atomic::AtomicU64::new(0),
+            worker_shutdown_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     fn with_dir(mut self, dir: std::path::PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         self.dir = Some(dir);
+        if matches!(
+            self.persistence,
+            PersistentPublicationState::Disabled(PersistenceDisabledReason::NoDirectory)
+        ) {
+            self.persistence =
+                PersistentPublicationState::Disabled(PersistenceDisabledReason::QueueUnavailable);
+        }
         self
     }
 
@@ -1876,9 +1926,22 @@ impl ResultCache {
         worker_handle: std::thread::JoinHandle<()>,
         completion_rx: std::sync::mpsc::Receiver<()>,
     ) {
-        self.writer = Some(writer);
+        self.persistence = PersistentPublicationState::Async(writer);
         self.worker_handle = Some(worker_handle);
         self.completion_rx = Some(completion_rx);
+    }
+
+    /// Record that the background worker (or its I/O setup) failed to start.
+    /// Publication transitions to `Disabled(WorkerSpawnFailed)`; subsequent
+    /// query-path persists are skipped with a metric instead of falling back
+    /// to synchronous query-thread I/O (REM-D §8.5).
+    fn note_worker_spawn_failure(&mut self) {
+        self.worker_spawn_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.persist_unavailable_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.persistence =
+            PersistentPublicationState::Disabled(PersistenceDisabledReason::WorkerSpawnFailed);
     }
 
     /// Take the worker handle so the caller can join it after shutdown.
@@ -1898,20 +1961,32 @@ impl ResultCache {
     fn persistent_writer(
         &self,
     ) -> Option<&std::sync::Arc<crate::result_cache::PersistentResultCacheWriter>> {
-        self.writer.as_ref()
+        match &self.persistence {
+            PersistentPublicationState::Async(writer) => Some(writer),
+            PersistentPublicationState::Disabled(_) => None,
+        }
     }
 
     fn disk_path(&self, key: u64) -> Option<std::path::PathBuf> {
         self.dir.as_ref().map(|d| d.join(format!("{key:016x}.bin")))
     }
 
-    /// Persist `entry` to the on-disk tier using the MLCP frame format
-    /// (REM-002). The encoding is shared with the async worker — both
-    /// paths produce the same frame layout, identity validation, and
+    /// Persist `entry` to the on-disk tier **synchronously** using the MLCP
+    /// frame format (REM-002). The encoding is shared with the async worker —
+    /// both paths produce the same frame layout, identity validation, and
     /// payload encryption. Best-effort: silently ignores I/O errors (the
     /// in-memory cache is authoritative; the cache is disposable —
     /// missing/stale files fall through to re-resolution).
-    fn store_to_disk(&self, context: PersistContext, entry: &CachedEntry) {
+    ///
+    /// Maintenance-only entry point (REM-D §8.6): migration tools, explicit
+    /// administrative flushes, and focused format-parity tests. Never called
+    /// from `query_cached` / `query_columns_native_cached` — the query path
+    /// uses [`ResultCache::persist_entry`], which never blocks on disk I/O.
+    fn persist_entry_synchronously_for_maintenance(
+        &self,
+        context: PersistContext,
+        entry: &CachedEntry,
+    ) {
         let Some(path) = self.disk_path(context.key) else {
             return;
         };
@@ -2193,8 +2268,9 @@ impl ResultCache {
     }
 
     /// Persist `entry` using the MLCP frame format (REM-002 §18.3). When
-    /// the async writer is installed the op is enqueued; otherwise the
-    /// shared-format synchronous write fires on the calling thread.
+    /// the async writer is installed the op is enqueued; when publication is
+    /// unavailable the entry stays in the in-memory tier and the skip is
+    /// counted (REM-D §8.5). The query thread never performs disk I/O here.
     /// No-op when the entry is below the persistence threshold.
     fn persist_entry(&self, context: PersistContext, entry: &CachedEntry) {
         let approx = entry.data.approx_bytes();
@@ -2204,36 +2280,43 @@ impl ResultCache {
         if self.persist_min_bytes > 0 && approx < self.persist_min_bytes {
             return;
         }
-        if let Some(writer) = self.writer.as_ref() {
-            // Async path: enqueue a `PersistableEntry`. The worker calls
-            // the same `encode_persisted_entry` helper so the on-disk
-            // format is byte-for-byte identical to the sync path.
-            let entry_clone = entry.clone_for_persist();
-            let payload_factory: Box<dyn FnOnce() -> Option<Vec<u8>> + Send + 'static> =
-                Box::new(move || {
-                    bincode::serialize(&SerializedEntryRef::from_entry(&entry_clone)).ok()
+        match &self.persistence {
+            PersistentPublicationState::Async(writer) => {
+                // Async path: enqueue a `PersistableEntry`. The worker calls
+                // the same `encode_persisted_entry` helper so the on-disk
+                // format is byte-for-byte identical to the sync path.
+                let entry_clone = entry.clone_for_persist();
+                let payload_factory: Box<dyn FnOnce() -> Option<Vec<u8>> + Send + 'static> =
+                    Box::new(move || {
+                        bincode::serialize(&SerializedEntryRef::from_entry(&entry_clone)).ok()
+                    });
+                let persistable = crate::result_cache::PersistableEntry {
+                    key: context.key,
+                    table_id: context.identity.table_id,
+                    schema_id: context.identity.schema_id,
+                    run_generation: context.identity.logical_generation,
+                    entry_generation: context.entry_generation,
+                    bytes: approx as usize,
+                    payload_factory,
+                };
+                let write_start = std::time::Instant::now();
+                writer.enqueue_store(persistable);
+                let write_us = write_start.elapsed().as_micros() as u64;
+                self.persistent_write_us
+                    .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+            }
+            PersistentPublicationState::Disabled(reason) => {
+                // Publication unavailable: keep the in-memory entry, skip the
+                // persistent write, and make the skip observable (REM-D
+                // §8.5). The persistent cache is disposable optimization
+                // state; the next miss simply recomputes.
+                self.persist_skipped_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::trace::QueryTrace::record(|trace| {
+                    trace.result_cache_persist_skipped = true;
+                    trace.result_cache_persist_skip_reason = Some(reason.label());
                 });
-            let persistable = crate::result_cache::PersistableEntry {
-                key: context.key,
-                table_id: context.identity.table_id,
-                schema_id: context.identity.schema_id,
-                run_generation: context.identity.logical_generation,
-                entry_generation: context.entry_generation,
-                bytes: approx as usize,
-                payload_factory,
-            };
-            let write_start = std::time::Instant::now();
-            writer.enqueue_store(persistable);
-            let write_us = write_start.elapsed().as_micros() as u64;
-            self.persistent_write_us
-                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            // Sync fallback: write directly using the shared encoder.
-            let write_start = std::time::Instant::now();
-            self.store_to_disk(context, entry);
-            let write_us = write_start.elapsed().as_micros() as u64;
-            self.persistent_write_us
-                .fetch_add(write_us, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -2242,7 +2325,7 @@ impl ResultCache {
     /// store is still current. A newer invalidation that arrives after the
     /// generation was issued supersedes the queued store.
     fn allocate_persist_generation(&mut self, key: u64) -> u64 {
-        if let Some(writer) = self.writer.as_ref() {
+        if let Some(writer) = self.persistent_writer() {
             // Bump the global per-key generation on the writer so a
             // subsequent store for the same key is observed as fresh.
             let _ = key; // the writer tracks per-key generations internally
@@ -2255,7 +2338,7 @@ impl ResultCache {
     /// Enqueue a `Remove` to the background writer. No-op when no writer is
     /// installed.
     fn enqueue_persist_remove(&self, key: u64) {
-        if let Some(writer) = self.writer.as_ref() {
+        if let Some(writer) = self.persistent_writer() {
             writer.enqueue_remove(key);
         }
     }
@@ -2267,7 +2350,7 @@ impl ResultCache {
     /// observed as stale and dropped instead of becoming a late durable
     /// entry.
     fn enqueue_persist_clear(&self) {
-        if let Some(writer) = self.writer.as_ref() {
+        if let Some(writer) = self.persistent_writer() {
             writer.enqueue_clear();
         }
     }
@@ -2306,9 +2389,9 @@ impl ResultCache {
     /// *remaining* deadline (REM-002 §18.6) — if it does not arrive in
     /// time, the timeout counter is bumped and the worker is detached
     /// (its `Arc`-shared state keeps it safe to outlive this method).
-    /// The writer reference is dropped so subsequent `persist_entry` calls
-    /// take the synchronous fallback path (used by tests and by
-    /// `Database::close`).
+    /// Publication transitions to `Disabled(WorkerShutdown)` so subsequent
+    /// `persist_entry` calls skip persistent publication with a metric
+    /// instead of falling back to synchronous query-thread I/O (REM-D §8.5).
     fn shutdown_persistent_cache(&mut self, deadline: std::time::Duration) {
         let start = Instant::now();
         // Phase 1: wait for the queue to drain or the deadline to expire.
@@ -2360,10 +2443,17 @@ impl ResultCache {
             }
             self.take_persistent_worker(); // drop the handle, do not join
         }
-        // Drop the writer so `persist_entry` takes the synchronous path
-        // for any subsequent inserts (Database::close, post-shutdown
-        // activity, tests that explicitly want the sync fallback).
-        self.writer = None;
+        // Transition publication to `Disabled(WorkerShutdown)`: subsequent
+        // inserts keep their in-memory entry and skip persistent publication
+        // (REM-D §8.5). The transition and the shutdown are both counted.
+        if matches!(self.persistence, PersistentPublicationState::Async(_)) {
+            self.worker_shutdown_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.persist_unavailable_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.persistence =
+                PersistentPublicationState::Disabled(PersistenceDisabledReason::WorkerShutdown);
+        }
     }
 
     /// Set the minimum entry size (approx bytes) before the persistent tier
@@ -2391,10 +2481,26 @@ impl ResultCache {
         )
     }
 
+    /// Read the REM-D §8.7 publication-availability counters. Returned as
+    /// `(persist_unavailable_total, persist_skipped_total,
+    /// worker_spawn_failures_total, worker_shutdown_total)`.
+    fn publication_counters(&self) -> (u64, u64, u64, u64) {
+        (
+            self.persist_unavailable_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.persist_skipped_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.worker_spawn_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.worker_shutdown_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// Snapshot of the writer's persist counters. `None` when no writer is
-    /// installed (early test paths).
+    /// installed (publication disabled).
     fn persist_snapshot(&self) -> Option<LookupMetricsSnapshot> {
-        self.writer.as_ref().map(|w| w.persist_snapshot())
+        self.persistent_writer().map(|w| w.persist_snapshot())
     }
 
     /// Fine-grained invalidation (hardening (c)). Drop only entries that are
@@ -2449,7 +2555,7 @@ impl ResultCache {
             // removed asynchronously by the worker; otherwise, fall back to
             // the legacy synchronous `remove_from_disk` so early test paths
             // (which build a `ResultCache` directly) keep working.
-            if self.writer.is_some() {
+            if self.persistent_writer().is_some() {
                 self.enqueue_persist_remove(key);
             } else {
                 self.remove_from_disk(key);
@@ -2463,7 +2569,7 @@ impl ResultCache {
         // installed, the on-disk files are removed asynchronously by the
         // worker; otherwise, fall back to the legacy synchronous scan.
         if self.dir.is_some() {
-            if self.writer.is_some() {
+            if self.persistent_writer().is_some() {
                 self.enqueue_persist_clear();
             } else if let Some(dir) = &self.dir {
                 if let Ok(entries) = std::fs::read_dir(dir) {
@@ -2526,6 +2632,14 @@ fn spawn_persistent_cache_worker(
         spawn_persistent_cache_worker as spawn, RealPersistentCacheIo, StalenessGuard,
         WorkerConfig, WriterStalenessGuard,
     };
+    // Test seam (REM-D §8.8): force worker startup failure through the real
+    // `Table::create` / `Table::open` wiring. Thread-local so parallel tests
+    // in the same process are unaffected.
+    if PERSISTENT_WORKER_SPAWN_FAILURE.with(|flag| flag.get()) {
+        return Err(std::io::Error::other(
+            "persistent-cache worker spawn failure forced by test seam",
+        ));
+    }
     let io: std::sync::Arc<dyn crate::result_cache::PersistentCacheIo> =
         std::sync::Arc::new(RealPersistentCacheIo::new(dir)?);
     let cipher = match cache_dek {
@@ -2553,6 +2667,17 @@ fn spawn_persistent_cache_worker(
     };
     let handle = spawn(config);
     Ok((writer, handle, completion_rx))
+}
+
+thread_local! {
+    /// Thread-local test seam (REM-D §8.8): when set,
+    /// [`spawn_persistent_cache_worker`] fails deterministically so tests can
+    /// exercise the "worker startup failure" path through the real
+    /// `Table::create` / `Table::open` wiring. Thread-local so concurrently
+    /// running tests are unaffected. Reset by
+    /// [`Table::_force_persistent_worker_spawn_failure_for_test`].
+    static PERSISTENT_WORKER_SPAWN_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -3261,8 +3386,10 @@ impl Table {
             commit_lock: ctx.commit_lock,
             // Build the persistent-cache result cache. We attempt to spawn a
             // background writer; if that fails (e.g. the OS won't let us
-            // create the temp file), we fall back to the legacy synchronous
-            // `store_to_disk` path so the table can still open.
+            // create the temp file), publication is marked
+            // `Disabled(WorkerSpawnFailed)` — the table still opens and
+            // query-path persists are skipped with a metric, never performed
+            // synchronously on the query thread (REM-D §8.5).
             result_cache: {
                 let cache = ResultCache::new()
                     .with_dir(rcache_dir.clone())
@@ -3272,14 +3399,17 @@ impl Table {
                 // `Table::lookup_metrics_snapshot`.
                 let metrics = Arc::new(LookupMetrics::default());
                 let cache_arc = Arc::new(parking_lot::Mutex::new(cache));
-                if let Ok((writer, handle, completion_rx)) = spawn_persistent_cache_worker(
+                match spawn_persistent_cache_worker(
                     rcache_dir.clone(),
                     cache_dek.clone(),
                     (*metrics).clone(),
                 ) {
-                    cache_arc
-                        .lock()
-                        .install_persistent_writer(writer, handle, completion_rx);
+                    Ok((writer, handle, completion_rx)) => {
+                        cache_arc
+                            .lock()
+                            .install_persistent_writer(writer, handle, completion_rx);
+                    }
+                    Err(_) => cache_arc.lock().note_worker_spawn_failure(),
                 }
                 cache_arc
             },
@@ -3604,12 +3734,17 @@ impl Table {
                     .with_cache_dek(cache_dek.clone());
                 let metrics = LookupMetrics::default();
                 let cache_arc = Arc::new(parking_lot::Mutex::new(cache));
-                if let Ok((writer, handle, completion_rx)) =
-                    spawn_persistent_cache_worker(rcache_dir.clone(), cache_dek.clone(), metrics)
+                match spawn_persistent_cache_worker(rcache_dir.clone(), cache_dek.clone(), metrics)
                 {
-                    cache_arc
-                        .lock()
-                        .install_persistent_writer(writer, handle, completion_rx);
+                    Ok((writer, handle, completion_rx)) => {
+                        cache_arc
+                            .lock()
+                            .install_persistent_writer(writer, handle, completion_rx);
+                    }
+                    // Spawn / I/O-setup failure: publication is disabled and
+                    // query-path persists are skipped with a metric (REM-D
+                    // §8.5) — never a synchronous query-thread write.
+                    Err(_) => cache_arc.lock().note_worker_spawn_failure(),
                 }
                 cache_arc
             },
@@ -3881,6 +4016,63 @@ impl Table {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Test-only seam: write `rows` as a synthetic immutable run and link it
+    /// into the active run set so point-directory tests can control exact
+    /// (epoch, HLC) stamps and run topology — the public write path stamps
+    /// every commit with `hlc.now()`, so neither is injectable otherwise.
+    /// Rows are sorted by `(RowId, epoch)` before writing (sorted-run layout
+    /// requires ascending `RowId`); returns the allocated run id.
+    pub fn __install_run_for_test(&mut self, rows: &[Row]) -> Result<u128> {
+        let mut rows = rows.to_vec();
+        rows.sort_by_key(|r| (r.row_id, r.committed_epoch));
+        let epoch = rows
+            .iter()
+            .map(|r| r.committed_epoch)
+            .max()
+            .unwrap_or(Epoch::ZERO);
+        let run_id = self.alloc_run_id()?;
+        let path = self.run_path(run_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MongrelError::Other(format!("create runs dir: {e}")))?;
+        }
+        let mut writer = RunWriter::new(&self.schema, run_id as u128, epoch, 0);
+        if let Some(kek) = &self.kek {
+            writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
+        }
+        let header = match self.create_run_file(run_id)? {
+            Some(file) => writer.write_file(file, &rows)?,
+            None => writer.write(&path, &rows)?,
+        };
+        self.run_refs.push(RunRef {
+            run_id: run_id as u128,
+            level: 0,
+            epoch_created: epoch.0,
+            row_count: header.row_count,
+        });
+        self.run_row_id_ranges
+            .insert(run_id as u128, (header.min_row_id, header.max_row_id));
+        Ok(run_id as u128)
+    }
+
+    /// Test-only seam: rebuild and publish the run-lookup directory over the
+    /// current active run set so directory-assisted `Table::get` tests can
+    /// drive the synthetic topologies installed via
+    /// [`Self::__install_run_for_test`].
+    pub fn __rebuild_run_lookup_for_test(&mut self) -> Result<()> {
+        self.publish_run_lookup_directory()
+    }
+
+    /// Test-only seam: toggle the directory-assisted point-lookup path. With
+    /// `complete == false`, `Table::get` takes the `UnavailableOrStale`
+    /// branch and opens every active run — the forced full-run oracle the
+    /// point-directory correctness tests compare against. The installed
+    /// directory is kept, so `complete == true` restores the
+    /// directory-assisted path.
+    pub fn __set_run_lookup_complete_for_test(&mut self, complete: bool) {
+        self.run_lookup.complete = complete;
+    }
+
     pub(crate) fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.rebuild_indexes_from_runs_inner(None)
     }
@@ -4083,9 +4275,17 @@ impl Table {
         // iteration order. For every RowId we collect the candidate from each
         // run + the overlay tiers, select the winner using full version
         // authority (HLC when both sides are stamped), and index the winner
-        // exactly once. Tombstones and TTL-expired rows drop the entry
-        // entirely. Physical run order is no longer a substitute for HLC
-        // authority.
+        // exactly once. Tombstones drop the entry entirely. Physical run
+        // order is no longer a substitute for HLC authority.
+        //
+        // TTL-expired rows ARE indexed (HOT and every secondary), matching
+        // what incremental maintenance would have produced had the rows been
+        // written after the rebuild: expiry is a query-time eligibility
+        // filter ([`Self::row_expired_at`]), not an index-content rule.
+        // Skipping them here would lose the HOT entry a later same-PK put
+        // needs to tombstone the old row, and would strand the row's
+        // secondary postings if the TTL policy is ever cleared or relaxed —
+        // both observed as stale rows resurfacing after `clear_ttl`.
         //
         // Visibility spans every epoch — a row just upserted in the memtable
         // lives at `pending_epoch = visible + 1` (no commit yet) so a snapshot
@@ -4155,6 +4355,21 @@ impl Table {
             }
             fold(row, &mut winners, &mut scanned);
         }
+        // Partial-index predicates filter the rebuild the same way they
+        // filter incremental puts (`index_row`): a winner row enters only
+        // the indexes whose predicate it matches. The HOT map is the
+        // primary-key map, not a partial index, and is always populated.
+        let any_predicate = self
+            .schema
+            .indexes
+            .iter()
+            .any(|idx| idx.predicate.is_some());
+        let name_to_id: HashMap<&str, u16> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.id))
+            .collect();
         for (_rid, (stamp, row)) in winners.drain() {
             if row.deleted {
                 // Tombstone: nothing to index. Anything that was about to be
@@ -4162,20 +4377,47 @@ impl Table {
                 let _ = stamp;
                 continue;
             }
-            if self.row_expired_at(&row, ttl_now) {
+            // See the rebuild comment above: TTL-expired winners are indexed
+            // on purpose; expiry is applied at query time.
+            let tok_row = self.tokenized_for_indexes(&row);
+            if !any_predicate {
+                index_into(
+                    &self.schema,
+                    &tok_row,
+                    &mut self.hot,
+                    &mut self.bitmap,
+                    &mut self.ann,
+                    &mut self.fm,
+                    &mut self.sparse,
+                    &mut self.minhash,
+                );
                 continue;
             }
-            let tok_row = self.tokenized_for_indexes(&row);
-            index_into(
-                &self.schema,
-                &tok_row,
-                &mut self.hot,
-                &mut self.bitmap,
-                &mut self.ann,
-                &mut self.fm,
-                &mut self.sparse,
-                &mut self.minhash,
-            );
+            if let Some(pk_col) = self.schema.primary_key() {
+                if let Some(pk_val) = tok_row.columns.get(&pk_col.id) {
+                    self.hot.insert(pk_val.encode_key(), tok_row.row_id);
+                }
+            }
+            let columns_map: HashMap<u16, &Value> =
+                row.columns.iter().map(|(k, v)| (*k, v)).collect();
+            for idef in &self.schema.indexes {
+                if let Some(pred) = &idef.predicate {
+                    if !eval_partial_predicate(pred, &columns_map, &name_to_id) {
+                        continue;
+                    }
+                }
+                index_into_single(
+                    idef,
+                    &self.schema,
+                    &tok_row,
+                    &mut self.hot,
+                    &mut self.bitmap,
+                    &mut self.ann,
+                    &mut self.fm,
+                    &mut self.sparse,
+                    &mut self.minhash,
+                );
+            }
         }
         // Pin-aware historical discovery for EVERY active pin source that
         // compact honors via min_active_snapshot — local pin_snapshot pins,
@@ -6443,6 +6685,50 @@ impl Table {
         self.result_cache.lock().set_persist_min_bytes(min);
     }
 
+    /// Test seam (REM-D §8.8): when `enabled`, the next
+    /// `Table::create` / `Table::open` on **this thread** fails its
+    /// persistent-cache worker spawn and marks publication
+    /// `Disabled(WorkerSpawnFailed)`. Thread-local, so concurrently running
+    /// tests are unaffected. Callers should reset it with
+    /// `_force_persistent_worker_spawn_failure_for_test(false)` after use.
+    #[doc(hidden)]
+    pub fn _force_persistent_worker_spawn_failure_for_test(enabled: bool) {
+        PERSISTENT_WORKER_SPAWN_FAILURE.with(|flag| flag.set(enabled));
+    }
+
+    /// Explicit administrative flush (REM-D §8.6): synchronously persist the
+    /// in-memory cached entry for `q` through the maintenance path
+    /// (`persist_entry_synchronously_for_maintenance`), even when the
+    /// background writer is unavailable. Returns `true` when an in-memory
+    /// entry existed and a frame write was attempted. Never used by the
+    /// query path; intended for migration tools and format-parity tests.
+    #[doc(hidden)]
+    pub fn _persist_cached_entry_synchronously_for_maintenance(
+        &mut self,
+        q: &crate::query::Query,
+    ) -> bool {
+        let key = crate::query::canonical_query_key(&q.conditions, None, 0)
+            ^ (q.limit.unwrap_or(usize::MAX) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (q.offset as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        let identity = PersistentCacheIdentity {
+            table_id: self.table_id(),
+            schema_id: self.schema.schema_id,
+            logical_generation: self.current_epoch().0,
+        };
+        let mut cache = self.result_cache.lock();
+        let Some(entry) = cache.entries.get(&key).map(|e| e.clone_for_persist()) else {
+            return false;
+        };
+        let entry_generation = cache.allocate_persist_generation(key);
+        let context = PersistContext {
+            identity,
+            key,
+            entry_generation,
+        };
+        cache.persist_entry_synchronously_for_maintenance(context, &entry);
+        true
+    }
+
     /// Drop every cached result (used by compaction, schema evolution, and bulk
     /// load — paths that change run layout or data without going through the
     /// fine-grained `pending_*` tracking).
@@ -6962,7 +7248,24 @@ impl Table {
                     .directory_complete_miss_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            crate::run_lookup::DirectoryLookupDecision::Candidates(locators) => {
+            crate::run_lookup::DirectoryLookupDecision::Candidates(mut locators) => {
+                // Snapshot-aware candidate ordering (REM-B §6.13): an
+                // HLC-authoritative snapshot considers fully stamped
+                // locators by newest possible visible HLC first; an
+                // epoch-only snapshot stays epoch-first. Ordering is a
+                // performance hint only — early-stop correctness never
+                // depends on it.
+                locators.sort_by(|a, b| {
+                    if snapshot.uses_hlc_authority() {
+                        b.max_hlc
+                            .cmp(&a.max_hlc)
+                            .then_with(|| b.max_epoch.cmp(&a.max_epoch))
+                    } else {
+                        b.max_epoch
+                            .cmp(&a.max_epoch)
+                            .then_with(|| b.max_hlc.cmp(&a.max_hlc))
+                    }
+                });
                 // Apply the conservative snapshot filter and the safe
                 // early-stop proof — locators that provably cannot contain a
                 // visible version, or whose maximum visible version is
@@ -7273,6 +7576,12 @@ impl Table {
         snap.result_cache_disk_hit = disk;
         snap.result_cache_miss = miss;
         snap.result_cache_persistent_write_us = write_us;
+        // REM-D §8.7: publication-availability counters live on the cache.
+        let (unavailable, skipped, spawn_failures, worker_shutdowns) = cache.publication_counters();
+        snap.result_cache_persist_unavailable_total = unavailable;
+        snap.result_cache_persist_skipped_total = skipped;
+        snap.result_cache_worker_spawn_failures_total = spawn_failures;
+        snap.result_cache_worker_shutdown_total = worker_shutdowns;
         // Merge the writer's persist counters so tests and observability
         // surfaces see the full picture.
         if let Some(writer_snap) = cache.persist_snapshot() {
@@ -7827,10 +8136,6 @@ impl Table {
                         context.checkpoint()?;
                     }
                     let raw = index.search_with_context(query, breadth, context)?;
-                    eprintln!(
-                        "MASTER DEBUG ANN raw candidates: {:?}",
-                        raw.iter().map(|(r, _)| r.0).collect::<Vec<_>>()
-                    );
                     crate::trace::QueryTrace::record(|trace| {
                         trace.raw_candidates = raw.len();
                         let unique = raw
@@ -7966,11 +8271,24 @@ impl Table {
                 .map(|index| -> Result<Vec<_>> {
                     let mut breadth = (*k).max(1);
                     let mut eligibility = std::collections::HashMap::new();
-                    loop {
+                    // Cumulative trace counters across widening iterations
+                    // (same §7.5 accounting as the ANN branch above).
+                    let mut raw_candidates_total: usize = 0;
+                    let mut visibility_rejected_total: usize = 0;
+                    let mut authorization_rejected_total: usize = 0;
+                    let filtered = loop {
                         if let Some(context) = context {
                             context.checkpoint()?;
                         }
                         let raw = index.search_with_context(query, breadth, context)?;
+                        raw_candidates_total = raw_candidates_total.saturating_add(raw.len());
+                        authorization_rejected_total = authorization_rejected_total.saturating_add(
+                            raw.iter()
+                                .filter(|(row_id, _)| {
+                                    allowed.is_some_and(|allowed| !allowed.contains(row_id))
+                                })
+                                .count(),
+                        );
                         let unchecked: Vec<_> = raw
                             .iter()
                             .map(|(row_id, _)| *row_id)
@@ -7987,6 +8305,12 @@ impl Table {
                             candidate_authorization,
                             context,
                         )?;
+                        visibility_rejected_total = visibility_rejected_total.saturating_add(
+                            unchecked
+                                .iter()
+                                .filter(|row_id| !eligible.contains(row_id))
+                                .count(),
+                        );
                         for row_id in unchecked {
                             eligibility.insert(row_id, eligible.contains(&row_id));
                         }
@@ -7999,14 +8323,25 @@ impl Table {
                             })
                             .collect();
                         if filtered.len() >= *k || raw.len() < breadth {
-                            break Ok(filtered);
+                            break filtered;
                         }
                         let next = breadth.saturating_mul(2);
                         if next == breadth {
-                            break Ok(filtered);
+                            break filtered;
                         }
                         breadth = next;
-                    }
+                    };
+                    crate::trace::QueryTrace::record(|trace| {
+                        trace.raw_candidates =
+                            trace.raw_candidates.saturating_add(raw_candidates_total);
+                        trace.visibility_rejected = trace
+                            .visibility_rejected
+                            .saturating_add(visibility_rejected_total);
+                        trace.authorization_rejected = trace
+                            .authorization_rejected
+                            .saturating_add(authorization_rejected_total);
+                    });
+                    Ok(filtered)
                 })
                 .transpose()?
                 .unwrap_or_default(),
@@ -8030,11 +8365,22 @@ impl Table {
                     }
                     let mut breadth = (*k).max(1);
                     let mut eligibility = std::collections::HashMap::new();
-                    loop {
+                    let mut raw_candidates_total: usize = 0;
+                    let mut visibility_rejected_total: usize = 0;
+                    let mut authorization_rejected_total: usize = 0;
+                    let filtered = loop {
                         if let Some(context) = context {
                             context.checkpoint()?;
                         }
                         let raw = index.search_with_context(&hashes, breadth, context)?;
+                        raw_candidates_total = raw_candidates_total.saturating_add(raw.len());
+                        authorization_rejected_total = authorization_rejected_total.saturating_add(
+                            raw.iter()
+                                .filter(|(row_id, _)| {
+                                    allowed.is_some_and(|allowed| !allowed.contains(row_id))
+                                })
+                                .count(),
+                        );
                         let unchecked: Vec<_> = raw
                             .iter()
                             .map(|(row_id, _)| *row_id)
@@ -8051,6 +8397,12 @@ impl Table {
                             candidate_authorization,
                             context,
                         )?;
+                        visibility_rejected_total = visibility_rejected_total.saturating_add(
+                            unchecked
+                                .iter()
+                                .filter(|row_id| !eligible.contains(row_id))
+                                .count(),
+                        );
                         for row_id in unchecked {
                             eligibility.insert(row_id, eligible.contains(&row_id));
                         }
@@ -8063,14 +8415,25 @@ impl Table {
                             })
                             .collect();
                         if filtered.len() >= *k || raw.len() < breadth {
-                            break Ok(filtered);
+                            break filtered;
                         }
                         let next = breadth.saturating_mul(2);
                         if next == breadth {
-                            break Ok(filtered);
+                            break filtered;
                         }
                         breadth = next;
-                    }
+                    };
+                    crate::trace::QueryTrace::record(|trace| {
+                        trace.raw_candidates =
+                            trace.raw_candidates.saturating_add(raw_candidates_total);
+                        trace.visibility_rejected = trace
+                            .visibility_rejected
+                            .saturating_add(visibility_rejected_total);
+                        trace.authorization_rejected = trace
+                            .authorization_rejected
+                            .saturating_add(authorization_rejected_total);
+                    });
+                    Ok(filtered)
                 })
                 .transpose()?
                 .unwrap_or_default(),
@@ -8132,23 +8495,18 @@ impl Table {
         snapshot: Snapshot,
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<std::collections::HashSet<RowId>> {
-        // Private WAL: the in-flight batch lands in the memtable at
-        // `pending_epoch = visible + 1` (puts and matching tombstones). The
-        // caller's `snapshot` was pinned at the start of the read, so its
-        // epoch predates every pending write and MVCC hides them. Advance the
-        // lookup snapshot to `pending_epoch` so the batch participates in
-        // eligibility — read-your-writes for the in-flight private-WAL batch.
-        // Shared WAL tables keep the original snapshot because their pending
-        // rows live in `pending_rows` and haven't been materialised into the
-        // memtable yet.
-        let lookup_snapshot = if self.is_shared()
-            || (self.pending_put_cols.is_empty() && self.pending_delete_rids.is_empty())
-            || snapshot.epoch.0 >= self.pending_epoch().0
-        {
-            snapshot
-        } else {
-            Snapshot::at(self.pending_epoch())
-        };
+        // Candidate eligibility is a pure snapshot read — the same
+        // visibility rule point lookups (`get`) use. The in-flight
+        // private-WAL batch lands in the memtable at `pending_epoch =
+        // visible + 1` (puts and matching tombstones), above every reader
+        // snapshot, so the un-advanced snapshot already hides it. Unlike
+        // `resolve_pk_with_hot_fallback`, retrievers must NOT advance to
+        // `pending_epoch`: an uncommitted row whose embedding is the exact
+        // query match would outrank every committed row and leak into the
+        // hits (see tests/retriever_uncommitted.rs). Committed versions
+        // remain eligible under the caller snapshot, including HLC-stamped
+        // winners admitted by `observes_row` (REM-001).
+        let lookup_snapshot = snapshot;
         let mut readers: Vec<_> = self
             .run_refs
             .iter()
@@ -9992,6 +10350,26 @@ impl Table {
         lookup: &[u8],
         snapshot: Snapshot,
     ) -> Result<RowIdSet> {
+        // Private WAL: the in-flight batch lands in the memtable at
+        // `pending_epoch = visible + 1` (puts and matching tombstones). A
+        // caller snapshot pinned at the *current* visible epoch predates
+        // every pending write, so a PK lookup would resolve a just-replaced
+        // PK to the stale pre-image (or resurrect a just-deleted row).
+        // Advance to `pending_epoch` and let the batch participate — the
+        // same read-your-writes rule as `eligible_candidate_ids` and
+        // `range_scan_i64`. A strictly *historical* pinned snapshot is
+        // honored as-is: the pending batch is uncommitted and must stay
+        // invisible to it. Shared WAL tables keep the original snapshot
+        // because their pending rows live in `pending_rows` and haven't
+        // been materialised into the memtable yet.
+        let snapshot = if self.is_shared()
+            || (self.pending_put_cols.is_empty() && self.pending_delete_rids.is_empty())
+            || snapshot.epoch.0 != self.epoch.visible().0
+        {
+            snapshot
+        } else {
+            Snapshot::at(self.pending_epoch())
+        };
         // Indexes incomplete: record `IndexIncomplete` and run the scanner
         // directly. The HOT map may be stale or absent, but the scanner's
         // result is still correct because it reads durable runs.
@@ -10416,13 +10794,27 @@ impl Table {
                 tomb_rids.insert(rid);
             }
         }
+        // Overlay tombstones strip matching run preimages. Collect them
+        // under the same read-your-writes rule as
+        // `eligible_candidate_ids`: a snapshot pinned at the current
+        // visible epoch advances over the in-flight batch; a strictly
+        // historical pinned snapshot must NOT see pending (uncommitted)
+        // tombstones.
+        let overlay_tombstone_snapshot = if self.is_shared()
+            || (self.pending_put_cols.is_empty() && self.pending_delete_rids.is_empty())
+            || snapshot.epoch.0 != self.epoch.visible().0
+        {
+            snapshot
+        } else {
+            Snapshot::at(self.pending_epoch())
+        };
         for row in self
             .memtable
-            .visible_versions_at(Snapshot::at(self.pending_epoch()))
+            .visible_versions_at(overlay_tombstone_snapshot)
             .into_iter()
             .chain(
                 self.mutable_run
-                    .visible_versions_at(Snapshot::at(self.pending_epoch())),
+                    .visible_versions_at(overlay_tombstone_snapshot),
             )
         {
             if row.deleted {
@@ -11620,8 +12012,8 @@ impl Table {
             // Compute everything we need, then take the lock once. The
             // `ResultCache` lock is a non-reentrant `parking_lot::Mutex` so
             // `persist_entry` + `insert` must run in the same critical
-            // section. `persist_entry` picks the async or sync path
-            // internally based on whether a worker is installed.
+            // section. `persist_entry` enqueues onto the background writer
+            // or skips publication with a metric — never query-thread I/O.
             let mut cache = self.result_cache.lock();
             let entry_generation = cache.allocate_persist_generation(key);
             let context = PersistContext {
@@ -11671,6 +12063,8 @@ impl Table {
         };
         // Take the lock once: persist_entry + insert must run atomically
         // because `ResultCache` uses a non-reentrant `parking_lot::Mutex`.
+        // `persist_entry` enqueues onto the background writer or skips
+        // publication with a metric — never query-thread I/O (REM-D §8.5).
         let mut cache = self.result_cache.lock();
         let entry_generation = cache.allocate_persist_generation(key);
         let context = PersistContext {
@@ -14949,9 +15343,6 @@ fn index_into(
     sparse: &mut HashMap<u16, SparseIndex>,
     minhash: &mut HashMap<u16, MinHashIndex>,
 ) {
-    if row.row_id.0 == 70 || row.row_id.0 == 117 {
-        eprintln!("DEBUG index_into rid={}", row.row_id.0);
-    }
     for idef in &schema.indexes {
         let Some(val) = row.columns.get(&idef.column_id) else {
             continue;
@@ -14964,9 +15355,6 @@ fn index_into(
             }
             IndexKind::Ann => {
                 if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
-                    if row.row_id.0 == 70 || row.row_id.0 == 117 {
-                        eprintln!("DEBUG index_into ANN index rid={}", row.row_id.0);
-                    }
                     if let Some(meta) = val.generated_embedding_metadata() {
                         // P1.5-T3: pending/failed generated vectors stay out of ANN.
                         if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
@@ -14979,13 +15367,6 @@ fn index_into(
                         }
                     }
                     a.insert_validated(v, row.row_id);
-                } else if row.row_id.0 == 70 || row.row_id.0 == 117 {
-                    eprintln!(
-                        "DEBUG index_into ANN skip rid={} ann_has={} val_is_embed={}",
-                        row.row_id.0,
-                        ann.get_mut(&idef.column_id).is_some(),
-                        val.as_embedding().is_some(),
-                    );
                 }
             }
             IndexKind::FmIndex => {
@@ -15034,15 +15415,6 @@ fn index_into_single(
     sparse: &mut HashMap<u16, SparseIndex>,
     minhash: &mut HashMap<u16, MinHashIndex>,
 ) {
-    if row.row_id.0 == 70 || row.row_id.0 == 117 {
-        eprintln!(
-            "DEBUG index_into_single rid={} kind={:?} col_id={} has_col={}",
-            row.row_id.0,
-            idef.kind,
-            idef.column_id,
-            row.columns.contains_key(&idef.column_id),
-        );
-    }
     let Some(val) = row.columns.get(&idef.column_id) else {
         return;
     };
@@ -15054,9 +15426,6 @@ fn index_into_single(
         }
         IndexKind::Ann => {
             if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
-                if row.row_id.0 == 70 || row.row_id.0 == 117 {
-                    eprintln!("DEBUG index_into ANN rid={}", row.row_id.0);
-                }
                 if let Some(meta) = val.generated_embedding_metadata() {
                     // P1.5-T3: pending/failed generated vectors stay out of ANN.
                     if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {

@@ -199,30 +199,38 @@ with five-repetition medians on a fixed runner. The structural bounds
 themselves (the 1.5× scaling rule for run count, the 256-row discard
 buffer cap, the 1ms time-to-first-row budget) are enforced by the test
 suite itself; the gate runs in `scripts/run-residual-closure.sh` and the
-resulting JSON is harvested into the per-topic `*-results.jsonl` files
-under the `residual-closure-evidence` artifact.
+resulting JSON is harvested into the per-topic `*.jsonl` files
+under the `residual-closure-<short-sha>` artifact. The suites, proof modes
+(exit-code vs JSONL), required records, and thresholds the gate enforces are
+declared in one evidence contract, `scripts/residual-closure-contract.json`;
+the orchestrator self-tests (`bash scripts/run-residual-closure.sh self-test
+<dir>`) cover the failure modes of that contract.
 
 ### PR B — point-lookup directory (TODO §1.1)
 
-| Run count | Layout | Warm p50 | Warm p95 | Warm p99 | Open runs |
-|---:|---|---:|---:|---:|---:|
-| 1 | disjoint | (≤ 256-run / 1-run × 1.5×) | | | 1 |
-| 64 | disjoint | (≤ 1-run × 1.5×) | | | 64 |
-| 64 | overlapping | (≤ 1-run × 1.5×) | | | 64 |
-| 256 | disjoint | (≤ 1-run × 1.5×) | | | 256 |
-| 256 | overlapping | (≤ 1-run × 1.5×) | | | 256 |
-| 256 | hot-key history | (locator interval only) | | | ≤ 256 |
-| 256 | wide-miss | (≥ hot-key; ≤ 1-run + α) | | | 0 |
+Measured on the exact-SHA working tree (rustc 1.97.1, release,
+`--all-features`, quiet 16-core runner, NVMe tempdirs) via
+`cargo test -p mongreldb-core --test point_lookup_runs --release -- --ignored -- --nocapture`;
+latencies in µs, 1,000 queries for the scaling pair and 10,000 per layout:
 
-`open runs` = immutable run readers opened per lookup. Disjoint + overlapping
-fixtures must not scale with active run count (gate: ≤ 1.5× of the 1-run
-warm p95). Hot-key history opens only the locator interval for the requested
-snapshot (gate: ≤ 16 readers per lookup, even when 256 runs are active).
-Wide-miss opens zero readers (gate: 0).
+| Run count | Layout | Warm p50 | Warm p95 | Warm p99 |
+|---:|---|---:|---:|---:|
+| 1 | mixed | 37.7 | 40.9 | 117.4 |
+| 256 | mixed | 52.2 | 56.1 | 66.4 |
+| 256 | disjoint | 51.0 | 54.8 | 142.6 |
+| 256 | overlapping | 69.8 | 74.2 | 77.9 |
+| 256 | hot-key history | 9.9 | 18.8 | 20.5 |
+| 256 | wide-miss | 50.0 | 53.9 | 146.1 |
 
-Five-repetition medians on the fixed runner replace the parenthetical
-bounds above; the `point-lookup-results.jsonl` evidence artifact records
-the raw p50/p95/p99 per layout per run count.
+The scaling gate compares the 1-run against the 256-run warm p95:
+56.1 / 40.9 = **1.37 ≤ 1.4** (`POINT_LOOKUP_MAX_P95_RATIO`), recorded in the
+`point-lookup-runs.jsonl` evidence artifact as the
+`point_lookup_scaling_256_to_1` record; exceeding the ratio fails `overall`
+in the closure status. Layout counters (`directory_lookup_hit`,
+`directory_run_readers_opened`, `directory_early_stop_total`,
+`directory_lookup_fallback`, `directory_incomplete`) are recorded per layout
+in the same artifact; `directory_lookup_fallback` and
+`directory_incomplete` stay at 0 across every layout.
 
 Memory budget: published under
 `docs/06-indexes.md → per-family recall floors` once the directory is
@@ -276,9 +284,14 @@ buffer gate are the two `#[ignore]`-d follow-ups (Spec §12.3 + ADR-0014).
 
 Gate: 30 consecutive nightly passes (100 seeds × 10,000 ops) + 4
 consecutive weekly passes (≥ 1M total churn ops). Wall-clock: 30 days.
-The 8-seed smoke (`index-churn-oracle-smoke` workflow job + per-seed log
-in `index-oracle-results.jsonl`) is the per-PR signal; the wall-clock
-nightly is owned by the schedule trigger.
+The nightly and weekly schedules live in
+`.github/workflows/index-churn-nightly.yml` and
+`.github/workflows/index-churn-weekly.yml`; `scripts/churn-history-check.sh`
+is the durable-history gate that refuses final closure without 30/4
+consecutive passing runs on the expected SHA lineage. The per-PR signal is
+the churn matrix in `residual-closure.yml`: one seed per matrix job (seeds
+1–8 via `MONGRELDB_ORACLE_SEED`), 500 operations per family per seed
+(`MONGRELDB_ORACLE_OPERATIONS`), `fail-fast: false`.
 
 ### PR F — HOT fallback observability (TODO §5.7)
 
@@ -294,11 +307,14 @@ the full Prometheus text export of every HOT series asserted in
 
 The single command below runs the entire pipeline and writes every
 artifact to `${RUNNER_TEMP:-/tmp}/mongreldb-residual-closure/` (the
-`residual-closure-evidence` GitHub Actions artifact). Each
-`*-results.jsonl` is a JSONL stream harvested from per-test JSON emits
+`residual-closure-<short-sha>` GitHub Actions artifact). Each
+`*.jsonl` is a JSONL stream harvested from per-test JSON emits
 (`--nocapture`); `commit.txt`, `toolchain.txt`, and `environment.txt`
 record the exact SHA, rustup version, and host fingerprint so any
-measurement is reproducible from the same inputs.
+measurement is reproducible from the same inputs. The artifact gate reads
+`scripts/residual-closure-contract.json`; a missing required file, a stale
+record name, or a false top-level threshold fails the run — evidence is
+never synthesized.
 
 ```bash
 bash scripts/run-residual-closure.sh
@@ -338,25 +354,75 @@ above once the closure PR lands.
 
 ## Residual closure evidence
 
-Captured on `ca3d0b2..72cc43e` of master (rustc 1.97.1). The runner
+Captured on the post-`dc596e6` master working tree carrying the REM-A
+through REM-I fixes (HEAD `b5d7980`, rustc 1.97.1). The runner
 fingerprint and five-repetition medians replace the placeholder bounds above
 when the closure PR lands on a clean runner. The exact-SHA gate
 (`verify-exact-sha` workflow job) reads `commit.txt` from the
-`residual-closure-evidence` artifact and refuses to claim closure unless
+`residual-closure-<short-sha>` artifact and refuses to claim closure unless
 the recorded SHA matches the release SHA passed to `workflow_dispatch`.
+Final closure additionally requires the durable churn history
+(`scripts/churn-history-check.sh`: 30 consecutive nightly + 4 consecutive
+weekly passes); pull requests run only the structural gates and never
+label their artifact "final closure".
 
 | Surface | Pass | RED / Ignored |
 |---|---:|---:|
 | core lib | 709 / 709 | 0 |
 | result_cache_async_persistence | 15 / 15 | 0 |
 | controlled_scan_streaming | 7 / 9 | 2 ignored |
-| lookup_metrics | 6 / 6 | 0 |
+| lookup_metrics | 14 / 14 | 0 |
 | hot_metrics_export (server) | 1 / 1 | 0 |
-| index_churn_oracle | 1 / 4 | 3 RED |
-| run_lookup::tests | 5 / 5 | 0 |
-| trace::tests | 5 / 5 | 0 |
+| index_churn_oracle (seed 1) | 13 / 13 | 0 |
+| point_lookup_directory | 28 / 28 | 0 |
+| run_lookup::tests | 26 / 26 | 0 |
+| be_tree / memtable / epoch lib tests | 46 / 46 | 0 |
 | result_cache::tests | 10 / 10 | 0 |
-| server (all suites) | 289 / 289 | 0 |
+| server (all suites) | 86 / 86 | 0 |
+
+## REM-J exact-SHA P0/P2 measurements
+
+`scripts/run-p0-p2-measurements.sh OUT_DIR` runs the split benchmarks in
+release mode for both feature gates and writes `p0-results.jsonl`,
+`p2-standalone-results.jsonl`, and `p2-full-feature-results.jsonl`, one
+record per invocation (repeat invocations append, so multi-repetition
+medians are computed across records). Every record carries the spec §14.2
+envelope: p50/p95/p99/min/max/MAD plus SHA, tree state, toolchain, runner,
+kernel, CPU, filesystem, and features. P0 components stay separated (table
+creation, first put, steady-state put on a reused table, 1,000-row batch,
+durable commit); the P2 standalone gate is the embedded warm point query
+plus the default-build loopback server point query, and the P2 full-feature
+gate is the same loopback benchmark against a server built with
+`cluster,oidc,vault-kms`. PGO artifacts are not applicable to this build
+pipeline (`scripts/pgo-build.sh` remains opt-in); the numbers below are the
+non-PGO release artifacts. The current exact-SHA capture lives under
+`target/bench-results/rem-j-<short-sha>/` and is harvested into the
+closure bundle on runner runs.
+
+Captured 2026-07-27 on HEAD `b5d7980` + the REM working tree (rustc 1.97.1,
+runner `nighthawk`, Intel Core Ultra 9 386H, Linux 7.2.0-rc3, ext4 on NVMe),
+release profile. P0 write-path components (µs unless noted):
+
+| Component | p50 | p95 | p99 | min | max | MAD |
+|---|---:|---:|---:|---:|---:|---:|
+| table_create_only | 8,362 | 146,161 | 146,161 | 7,500 | 146,161 | 795 |
+| first_put_after_create | 13,812 | 17,601 | 17,601 | 11,864 | 17,601 | 1,023 |
+| put_steady_state_on_reused_table | 0.78 | 5.48 | 9.92 | 0.55 | 19.40 | 0.09 |
+| put_batch_1000 | 6.44 ms total (6.44 µs/put amortized, single sample) | | | | | |
+| commit_fsync | 5,057 | 6,521 | 6,942 | 4,524 | 6,942 | 302 |
+
+P2 point query (µs, client-observed for the loopback rows):
+
+| Gate | Benchmark | p50 | p95 | p99 | min | max | MAD |
+|---|---|---:|---:|---:|---:|---:|---:|
+| standalone | warm_point_query (embedded, 100k rows × 10k queries) | 1.15 | 1.50 | 1.80 | 0.64 | 7.44 | 0.13 |
+| standalone | loopback_point_query (10k rows × 1k queries) | 118.2 | 183.7 | 470.8 | 59.5 | 1,200.9 | 10.3 |
+| full-feature (`cluster,oidc,vault-kms`) | loopback_point_query (10k rows × 1k queries) | 75.9 | 139.1 | 206.9 | 53.5 | 1,169.5 | 3.3 |
+
+The two loopback gates stay within run-to-run variance of each other (both
+far under the 250 ms tripwire); the full-feature build carries no point-query
+penalty on this path. Single-invocation captures; repeat invocations of the
+harvester append records for multi-repetition medians.
 
 ## Closure status
 
@@ -366,17 +432,19 @@ the recorded SHA matches the release SHA passed to `workflow_dispatch`.
 | C | Async persistent result cache | DONE (15/15 contract tests) |
 | D | True streaming cursors | test surface DONE (7/9; 2 ignored with explicit gap notes) |
 | F | HOT fallback observability | DONE (6/6 lookup + 1/1 hot_metrics + 289/289 server) |
-| B | Point lookup directory | foundation + 17 tests + 256-run benchmark ship; on-disk checkpoint + L0 bounds in follow-up |
-| E | Non-Bitmap churn oracle | oracle + 1/4 tests ship; 3 RED tests catch real engine bugs in LearnedRange, FmIndex, ANN-Dense; 30-day nightly cadence + engine fixes remain |
-| Final | Closure workflow + docs | `scripts/run-residual-closure.sh` + 5-job workflow + 8-seed matrix + `verify-exact-sha` gate + ADR-0014 + hot metrics export all shipped |
+| B | Point lookup directory | DONE (28/28 directory tests; 256-run scaling gate 1.37 ≤ 1.4 measured on the exact-SHA tree) |
+| E | Non-Bitmap churn oracle | oracle + strict snapshot-aware model DONE (13/13 on seed 1, all nine families); 30-night / 4-week durable history accumulates in CI |
+| Final | Closure workflow + docs | `scripts/run-residual-closure.sh` + contract-driven workflow (`residual-closure-contract.json`) + one-seed-per-job 8-seed churn matrix + `verify-exact-sha` + churn-history gate + ADR-0014 + hot metrics export + REM-J P0/P2 harvester all shipped |
 
 ## Reproducing
 
 ```bash
 bash scripts/run-residual-closure.sh                                              # full bundle
-cargo test -p mongreldb-core                                                       # 709 lib + 7 controlled_scan + 15 cache_async + 6 lookup + 1 churn seed
-cargo test -p mongreldb-server                                                     # 289 / 289
-cargo test -p mongreldb-core --test index_churn_oracle -- --include-ignored         # 1 pass, 3 fail (intentional RED — engine bugs documented)
+cargo test -p mongreldb-core                                                       # lib + controlled_scan + cache_async + lookup_metrics
+cargo test -p mongreldb-server                                                     # server suites
+MONGRELDB_ORACLE_SEED=1 \
+  cargo test -p mongreldb-core --test index_churn_oracle --all-features             # 13 / 13
+scripts/run-p0-p2-measurements.sh target/bench-results/rem-j                        # P0/P2 evidence
 ```
 
 
