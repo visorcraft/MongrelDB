@@ -112,3 +112,57 @@ fn upsert_by_replace_survives_reopen() {
     assert_eq!(visible.len(), 1, "more than one live row for the same PK");
     assert_eq!(visible[0].row_id, new_rid);
 }
+
+/// Regression: a row created and deleted inside one commit span (both versions
+/// share the pending epoch) must stay dead through commit, flush, and reopen.
+/// Previously the same-stamp fold was unstable — the live version could win,
+/// resurrecting the row once the pair left the memtable.
+#[test]
+fn same_span_create_delete_stays_dead() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    let rid = put(&mut db, 1, 10);
+    db.delete(rid).unwrap();
+    db.commit().unwrap();
+    assert!(db.get(rid, db.snapshot()).is_none());
+    assert!(db.visible_rows(db.snapshot()).unwrap().is_empty());
+
+    db.flush().unwrap();
+    assert!(db.get(rid, db.snapshot()).is_none());
+    assert!(db.visible_rows(db.snapshot()).unwrap().is_empty());
+
+    db.close().unwrap();
+    let db = Table::open(dir.path()).unwrap();
+    assert!(db.get(rid, db.snapshot()).is_none());
+    assert!(db.visible_rows(db.snapshot()).unwrap().is_empty());
+}
+
+/// Same-span PK-replace: the replaced row shares the pending epoch with its
+/// successor and must stay dead; the successor is the only live row.
+#[test]
+fn same_span_pk_replace_keeps_only_the_new_row() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    let old = put(&mut db, 1, 10);
+    let new = put(&mut db, 1, 20);
+    assert_ne!(old, new);
+    db.commit().unwrap();
+    db.flush().unwrap();
+
+    let snap = db.snapshot();
+    assert!(db.get(old, snap).is_none());
+    assert!(db.get(new, snap).is_some());
+    let live: Vec<RowId> = db
+        .visible_rows(snap)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.row_id)
+        .collect();
+    assert_eq!(live, vec![new]);
+
+    db.close().unwrap();
+    let db = Table::open(dir.path()).unwrap();
+    let snap = db.snapshot();
+    assert!(db.get(old, snap).is_none());
+    assert!(db.get(new, snap).is_some());
+}

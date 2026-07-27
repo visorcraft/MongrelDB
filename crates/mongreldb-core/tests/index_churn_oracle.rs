@@ -2563,6 +2563,18 @@ mod families {
                 .map(|_| VOCAB[rng.gen_range(0, VOCAB.len())])
                 .collect()
         }
+
+        /// Canonical query set. Near-duplicate corpus rows overlap it
+        /// heavily, which is the workload MinHash serves (near-duplicate
+        /// detection); background rows exercise the disjoint case.
+        pub const QUERY_SET: [&'static str; 4] = ["a", "b", "c", "d"];
+
+        pub fn query_set_members() -> Vec<SetMember> {
+            Self::QUERY_SET
+                .iter()
+                .map(|s| SetMember::String((*s).to_string()))
+                .collect()
+        }
     }
 
     impl ChurnOracleFamily for MinHashFamily {
@@ -4042,4 +4054,376 @@ fn churn_oracle_pr_smoke_all_families() {
         )
         .emit_metric();
     }
+}
+
+// ---------------------------------------------------------------------------
+// REM-F §10.7: snapshot-aware Sparse/MinHash retrieval — historical tests.
+// The engine must answer a pinned historical snapshot through
+// `Table::retrieve_at` across update, delete, flush, compaction, and
+// close+reopen, while the current snapshot reflects the latest state.
+// ---------------------------------------------------------------------------
+
+fn sparse_hits(table: &mut Table, snap: Snapshot) -> Vec<(u64, f64)> {
+    let hits = table
+        .retrieve_at(
+            &Retriever::Sparse {
+                column_id: 2,
+                query: vec![(1u32, 1.0), (3u32, 2.0)],
+                k: 10,
+            },
+            snap,
+            None,
+        )
+        .expect("sparse retrieve_at");
+    hits.into_iter()
+        .map(|h| match h.score {
+            RetrieverScore::SparseDotProduct(d) => (h.row_id.0, d),
+            _ => (h.row_id.0, 0.0),
+        })
+        .collect()
+}
+
+fn assert_sparse_hits(actual: &[(u64, f64)], expected: &[(u64, f64)], what: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{what}: hit count {actual:?} != {expected:?}"
+    );
+    for (rank, (a, e)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(a.0, e.0, "{what}: rid mismatch at rank {rank}");
+        assert!(
+            (a.1 - e.1).abs() <= 1e-5,
+            "{what}: score mismatch at rank {rank}: expected {}, got {}",
+            e.1,
+            a.1
+        );
+    }
+}
+
+#[test]
+fn churn_oracle_sparse_snapshot_history() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), SparseFamily::schema(), 1).expect("create");
+    let rid_a = table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Bytes(pack_sparse_bytes(&[(1, 1.0), (3, 1.0)]))),
+            (3, Value::Int64(0)),
+        ])
+        .expect("put a")
+        .0;
+    let rid_b = table
+        .put(vec![
+            (1, Value::Int64(2)),
+            (2, Value::Bytes(pack_sparse_bytes(&[(1, 0.5)]))),
+            (3, Value::Int64(0)),
+        ])
+        .expect("put b")
+        .0;
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+    // rid_a scores 1*1 + 1*2 = 3.0; rid_b scores 0.5.
+    let baseline = [(rid_a, 3.0), (rid_b, 0.5)];
+
+    let pinned = table.pin_snapshot();
+    assert_sparse_hits(&sparse_hits(&mut table, pinned), &baseline, "baseline");
+
+    // Update pk=1 (fresh rid, old rid tombstoned). New terms score 2.0.
+    let rid_c = table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Bytes(pack_sparse_bytes(&[(1, 2.0)]))),
+            (3, Value::Int64(0)),
+        ])
+        .expect("update a")
+        .0;
+    table.commit().expect("commit update");
+
+    // Pinned snapshot before the update still sees the old row; the
+    // current snapshot sees the new one.
+    assert_sparse_hits(
+        &sparse_hits(&mut table, pinned),
+        &baseline,
+        "pinned before update",
+    );
+    let after_update = [(rid_c, 2.0), (rid_b, 0.5)];
+    let current = table.snapshot();
+    assert_sparse_hits(
+        &sparse_hits(&mut table, current),
+        &after_update,
+        "current after update",
+    );
+
+    // Pin again, then delete rid_b.
+    let pinned2 = table.pin_snapshot();
+    table.delete(RowId(rid_b)).expect("delete b");
+    table.commit().expect("commit delete");
+
+    assert_sparse_hits(
+        &sparse_hits(&mut table, pinned2),
+        &after_update,
+        "pinned before delete",
+    );
+    let after_delete = [(rid_c, 2.0)];
+    let current = table.snapshot();
+    assert_sparse_hits(
+        &sparse_hits(&mut table, current),
+        &after_delete,
+        "current after delete",
+    );
+
+    // Flush + compaction must not disturb the pinned historical answer
+    // (the local pin holds the GC floor).
+    table.flush().expect("flush");
+    table.compact().expect("compact");
+    assert_sparse_hits(
+        &sparse_hits(&mut table, pinned2),
+        &after_update,
+        "pinned across flush+compaction",
+    );
+
+    // Close + reopen: no GC runs after reopen, so the pinned snapshot must
+    // still answer from the on-disk runs.
+    table.close().expect("close");
+    let mut table = Table::open(dir.path()).expect("reopen");
+    assert_sparse_hits(
+        &sparse_hits(&mut table, pinned2),
+        &after_update,
+        "pinned across reopen",
+    );
+    let current = table.snapshot();
+    assert_sparse_hits(
+        &sparse_hits(&mut table, current),
+        &after_delete,
+        "current after reopen",
+    );
+    emit_oracle_metric(
+        "index_churn_oracle::sparse_snapshot_history",
+        serde_json::json!(1),
+        "pass",
+    );
+}
+
+fn minhash_hits(table: &mut Table, snap: Snapshot, k: usize) -> Vec<(u64, f32)> {
+    let hits = table
+        .retrieve_at(
+            &Retriever::MinHash {
+                column_id: 2,
+                members: MinHashFamily::query_set_members(),
+                k,
+            },
+            snap,
+            None,
+        )
+        .expect("minhash retrieve_at");
+    hits.into_iter()
+        .map(|h| match h.score {
+            RetrieverScore::MinHashEstimatedJaccard(d) => (h.row_id.0, d),
+            _ => (h.row_id.0, 0.0),
+        })
+        .collect()
+}
+
+#[test]
+fn churn_oracle_minhash_snapshot_history() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), MinHashFamily::schema(), 1).expect("create");
+    let dup = || minhash_members(&["a", "b", "c", "d"]);
+    let rid_a = table
+        .put(vec![(1, Value::Int64(1)), (2, dup()), (3, Value::Int64(0))])
+        .expect("put a")
+        .0;
+    let rid_b = table
+        .put(vec![(1, Value::Int64(2)), (2, dup()), (3, Value::Int64(0))])
+        .expect("put b")
+        .0;
+    let rid_c = table
+        .put(vec![(1, Value::Int64(3)), (2, dup()), (3, Value::Int64(0))])
+        .expect("put c")
+        .0;
+    // A disjoint row: never an LSH candidate for the query set.
+    table
+        .put(vec![
+            (1, Value::Int64(4)),
+            (2, minhash_members(&["x", "y", "z", "w"])),
+            (3, Value::Int64(0)),
+        ])
+        .expect("put noise");
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+
+    let pinned = table.pin_snapshot();
+    let baseline = minhash_hits(&mut table, pinned, 10);
+    assert_eq!(
+        baseline.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        vec![rid_a, rid_b, rid_c],
+        "baseline: exact duplicates ranked by rid tie-break"
+    );
+    for (_, est) in &baseline {
+        assert_eq!(*est, 1.0, "exact duplicate must estimate Jaccard 1.0");
+    }
+
+    // Update pk=1 to a non-duplicate set (J = 2/6 with the query).
+    let rid_a2 = table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, minhash_members(&["a", "b", "x", "y"])),
+            (3, Value::Int64(0)),
+        ])
+        .expect("update a")
+        .0;
+    table.commit().expect("commit update");
+
+    // Pinned snapshot before the update: the old duplicate row is still
+    // ranked; the new rid is invisible.
+    let at_pinned = minhash_hits(&mut table, pinned, 10);
+    assert!(
+        at_pinned.iter().any(|(r, est)| *r == rid_a && *est == 1.0),
+        "pinned before update must still contain the old duplicate: {at_pinned:?}"
+    );
+    assert!(
+        !at_pinned.iter().any(|(r, _)| *r == rid_a2),
+        "pinned before update must hide the post-update rid: {at_pinned:?}"
+    );
+    // Current snapshot: old duplicate gone, remaining duplicates present.
+    let current = table.snapshot();
+    let at_current = minhash_hits(&mut table, current, 10);
+    assert!(
+        !at_current.iter().any(|(r, _)| *r == rid_a),
+        "current after update must drop the stale duplicate: {at_current:?}"
+    );
+    for live in [rid_b, rid_c] {
+        assert!(
+            at_current.iter().any(|(r, est)| *r == live && *est == 1.0),
+            "current after update must contain duplicate {live}: {at_current:?}"
+        );
+    }
+
+    // Pin, delete one duplicate, and check both snapshots.
+    let pinned2 = table.pin_snapshot();
+    table.delete(RowId(rid_b)).expect("delete b");
+    table.commit().expect("commit delete");
+
+    let at_pinned2 = minhash_hits(&mut table, pinned2, 10);
+    assert!(
+        at_pinned2.iter().any(|(r, est)| *r == rid_b && *est == 1.0),
+        "pinned before delete must still contain the duplicate: {at_pinned2:?}"
+    );
+    let current = table.snapshot();
+    let at_current = minhash_hits(&mut table, current, 10);
+    assert!(
+        !at_current.iter().any(|(r, _)| *r == rid_b),
+        "current after delete must drop the duplicate: {at_current:?}"
+    );
+
+    // Flush + compaction with the pin held, then close + reopen.
+    table.flush().expect("flush");
+    table.compact().expect("compact");
+    let at_pinned2 = minhash_hits(&mut table, pinned2, 10);
+    assert!(
+        at_pinned2.iter().any(|(r, est)| *r == rid_b && *est == 1.0),
+        "pinned across flush+compaction must still contain the duplicate: {at_pinned2:?}"
+    );
+    table.close().expect("close");
+    let mut table = Table::open(dir.path()).expect("reopen");
+    let at_pinned2 = minhash_hits(&mut table, pinned2, 10);
+    assert!(
+        at_pinned2.iter().any(|(r, est)| *r == rid_b && *est == 1.0),
+        "pinned across reopen must still contain the duplicate: {at_pinned2:?}"
+    );
+    let current = table.snapshot();
+    let at_current = minhash_hits(&mut table, current, 10);
+    assert!(
+        !at_current.iter().any(|(r, _)| *r == rid_b),
+        "current after reopen must not resurrect the deleted duplicate: {at_current:?}"
+    );
+    assert!(
+        at_current.iter().any(|(r, est)| *r == rid_c && *est == 1.0),
+        "current after reopen must contain the live duplicate: {at_current:?}"
+    );
+    emit_oracle_metric(
+        "index_churn_oracle::minhash_snapshot_history",
+        serde_json::json!(1),
+        "pass",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REM-F §10.6 exact-duplicate MinHash gate: at least k live rows whose
+// stored set equals the query set must ALL be returned with estimated
+// Jaccard 1.0, in stable RowId order, with no stale/deleted/expired row.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn churn_oracle_minhash_exact_duplicate_gate() {
+    let dir = tempdir().expect("tempdir");
+    let mut table = Table::create(dir.path(), MinHashFamily::schema(), 1).expect("create");
+    let dup = || minhash_members(&["a", "b", "c", "d"]);
+    let mut dup_rids = Vec::new();
+    for i in 0..6 {
+        let rid = table
+            .put(vec![
+                (1, Value::Int64(100 + i)),
+                (2, dup()),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put dup")
+            .0;
+        dup_rids.push(rid);
+    }
+    // Near-duplicates (J = 0.5) and disjoint rows as ranking competition.
+    for i in 0..4 {
+        table
+            .put(vec![
+                (1, Value::Int64(200 + i)),
+                (2, minhash_members(&["a", "b", "c", "x"])),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put near");
+        table
+            .put(vec![
+                (1, Value::Int64(300 + i)),
+                (2, minhash_members(&["x", "y", "z", "w"])),
+                (3, Value::Int64(0)),
+            ])
+            .expect("put noise");
+    }
+    table.commit().expect("commit");
+    table.flush().expect("flush");
+
+    let k = dup_rids.len();
+    let current = table.snapshot();
+    let hits = minhash_hits(&mut table, current, k);
+    assert_eq!(
+        hits.len(),
+        k,
+        "all {k} exact duplicates must be returned: {hits:?}"
+    );
+    // Stable tie-break: equal estimated Jaccard ranks by ascending RowId.
+    dup_rids.sort_unstable();
+    for (hit, expected_rid) in hits.iter().zip(&dup_rids) {
+        assert_eq!(hit.0, *expected_rid, "tie-break order violated: {hits:?}");
+        assert_eq!(hit.1, 1.0, "exact duplicate must estimate Jaccard 1.0");
+    }
+
+    // Delete one duplicate: the stale row must never be returned again.
+    let victim = dup_rids[2];
+    table.delete(RowId(victim)).expect("delete dup");
+    table.commit().expect("commit delete");
+    let current = table.snapshot();
+    let hits = minhash_hits(&mut table, current, k);
+    assert!(
+        !hits.iter().any(|(r, _)| *r == victim),
+        "deleted duplicate must not be returned: {hits:?}"
+    );
+    let remaining: Vec<u64> = dup_rids.iter().copied().filter(|r| *r != victim).collect();
+    for (hit, expected_rid) in hits.iter().zip(&remaining) {
+        assert_eq!(hit.0, *expected_rid, "post-delete order: {hits:?}");
+        assert_eq!(hit.1, 1.0);
+    }
+    emit_oracle_metric(
+        "index_churn_oracle::minhash_exact_duplicate_gate",
+        serde_json::json!(1.0),
+        "recall",
+    );
 }

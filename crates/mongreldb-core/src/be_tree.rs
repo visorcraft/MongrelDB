@@ -883,6 +883,53 @@ mod tests {
         assert!(t.get_visible(RowId(3), Epoch(3)).is_some());
     }
 
+    /// Same `(row_id, epoch)` live+tombstone pair (a create+delete inside one
+    /// commit span): the later physical write — the tombstone — must win the
+    /// fold no matter where the pair sits (leaf or internal buffer).
+    #[test]
+    fn same_epoch_live_tombstone_pair_resolves_to_last_write() {
+        // Small tree: pair lands in one leaf.
+        let mut t = BeTree::new();
+        t.insert_row(val_row(5, 2, 1));
+        t.delete(RowId(5), Epoch(2));
+        let (_, winner) = t.get_version(RowId(5), Epoch(2)).expect("version");
+        assert!(winner.deleted, "tombstone must win the same-epoch tie");
+
+        // Same span, delete then re-put: the live row is the later write.
+        let mut t = BeTree::new();
+        t.delete(RowId(5), Epoch(2));
+        t.insert_row(val_row(5, 2, 1));
+        let (_, winner) = t.get_version(RowId(5), Epoch(2)).expect("version");
+        assert!(!winner.deleted, "later live write must win the tie");
+
+        // Force internal buffering above the pair so the fold crosses a
+        // buffer/leaf boundary.
+        let mut t = BeTree::new();
+        t.insert_row(val_row(7, 1, 1));
+        for i in 0..3_000u64 {
+            t.insert_row(val_row(10_000 + i, 1, i as i64));
+        }
+        t.delete(RowId(7), Epoch(1));
+        let (_, winner) = t.get_version(RowId(7), Epoch(1)).expect("version");
+        assert!(winner.deleted, "tombstone must win across buffer/leaf");
+
+        // `versions()` must preserve physical write order for the pair so
+        // stable downstream consumers (run writer) keep it too.
+        let mut t = BeTree::new();
+        t.insert_row(val_row(9, 3, 1));
+        for i in 0..3_000u64 {
+            t.insert_row(val_row(20_000 + i, 1, i as i64));
+        }
+        t.delete(RowId(9), Epoch(3));
+        let pair: Vec<bool> = t
+            .versions()
+            .into_iter()
+            .filter(|r| r.row_id == RowId(9))
+            .map(|r| r.deleted)
+            .collect();
+        assert_eq!(pair, vec![false, true], "live first, tombstone second");
+    }
+
     #[test]
     fn into_sorted_rows_is_keyed_by_row_then_epoch() {
         let mut t = BeTree::new();

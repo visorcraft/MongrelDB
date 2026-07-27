@@ -141,3 +141,52 @@ fn ttl_ddl_replicates_incrementally() {
     let policy = follower.table("events").unwrap().lock().ttl().unwrap();
     assert_eq!(policy.duration_nanos, 3_600_000_000_000);
 }
+
+/// Regression: a from-runs index rebuild taken while a TTL policy is active
+/// must still index TTL-expired rows (HOT and secondaries). Expiry is a
+/// query-time eligibility filter, not an index-content rule: skipping
+/// expired rows at rebuild time loses the HOT entry a later same-PK put
+/// needs to tombstone the old row, so `clear_ttl` would resurrect it.
+#[test]
+fn rebuild_under_active_ttl_keeps_expired_rows_replaceable() {
+    use mongreldb_core::Query;
+
+    let dir = tempdir().unwrap();
+    let now = now_nanos();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    table.set_mutable_run_spill_bytes(1);
+    let old_rid = table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Int64(now - 7_200_000_000_000)),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    table.flush().unwrap();
+
+    // The row is immediately expired under a 1-hour TTL (its timestamp is
+    // two hours old). Rebuild the indexes in this state.
+    table.set_ttl("created_at", 3_600_000_000_000).unwrap();
+    table.rebuild_indexes().unwrap();
+
+    // Replace the PK while the old row is expired: the old row must still
+    // be tombstoned through the rebuilt HOT entry.
+    let new_rid = table
+        .put(vec![(1, Value::Int64(1)), (2, Value::Int64(now))])
+        .unwrap();
+    assert_ne!(old_rid, new_rid);
+    table.commit().unwrap();
+
+    // Clearing TTL must not resurrect the replaced row.
+    table.clear_ttl().unwrap();
+    let snap = table.snapshot();
+    assert!(table.get(old_rid, snap).is_none());
+    assert!(table.get(new_rid, snap).is_some());
+    let live: Vec<u64> = table
+        .query(&Query::new())
+        .unwrap()
+        .into_iter()
+        .map(|row| row.row_id.0)
+        .collect();
+    assert_eq!(live, vec![new_rid.0]);
+}
