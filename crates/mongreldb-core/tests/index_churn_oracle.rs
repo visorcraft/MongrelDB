@@ -837,13 +837,18 @@ mod context {
     }
 
     /// Classify underfill from model eligibility + engine outcome (B468-04).
+    ///
+    /// Unexplained shortfall is always [`UnderfillReason::Unexpected`] — never
+    /// softened to [`UnderfillReason::ApproximateRecall`] merely because the
+    /// family is approximate. Approximate recall shortfall (full `k` returned
+    /// with imperfect membership) is gated by the recall floor, not by this
+    /// classifier. Cap / budget / eligibility labels require an explicit signal.
     pub fn classify_underfill(
         requested_k: usize,
         eligible_count: usize,
         actual_count: usize,
         candidate_cap_hit: bool,
         work_budget_exhausted: bool,
-        approximate: bool,
     ) -> UnderfillReason {
         let required = requested_k.min(eligible_count);
         if actual_count >= required {
@@ -858,10 +863,17 @@ mod context {
         if candidate_cap_hit {
             return UnderfillReason::CandidateCap;
         }
-        if approximate {
-            return UnderfillReason::ApproximateRecall;
-        }
         UnderfillReason::Unexpected
+    }
+
+    /// Top-k set recall of `actual` against `expected` (intersection / |expected|).
+    pub fn topk_recall(expected: &[u64], actual: &[u64]) -> f32 {
+        if expected.is_empty() {
+            return 1.0;
+        }
+        let exp: HashSet<u64> = expected.iter().copied().collect();
+        let act: HashSet<u64> = actual.iter().copied().collect();
+        exp.intersection(&act).count() as f32 / exp.len() as f32
     }
 
     #[derive(Debug, Clone)]
@@ -912,7 +924,7 @@ mod context {
     }
 }
 
-use context::{classify_underfill, FailureContext, UnderfillReason};
+use context::{classify_underfill, topk_recall, FailureContext, UnderfillReason};
 
 // Last retriever-path execution flags captured by family `actual()` via
 // `QueryTrace` (B468-04). Checkpoint classification reads these so
@@ -969,6 +981,10 @@ mod harness {
         pub historical_reads: u64,
         pub compactions: u64,
         pub reopens: u64,
+        /// Per-checkpoint top-k recalls (measured; never assumed 1.0).
+        pub checkpoint_recalls: Vec<f32>,
+        /// Count of unexpected underfills observed (must stay 0 — fail-closed).
+        pub unexpected_underfills: u64,
     }
 
     impl Harness {
@@ -990,6 +1006,8 @@ mod harness {
                 historical_reads: 0,
                 compactions: 0,
                 reopens: 0,
+                checkpoint_recalls: Vec::new(),
+                unexpected_underfills: 0,
             }
         }
 
@@ -3997,25 +4015,23 @@ mod replay {
                 live_rids_sorted.sort_unstable();
                 let requested_k = family.expected_full_count(&expected);
                 // B468-04: classify underfill from eligibility + actual length.
-                // Cap/budget flags are recorded by pressure probes into the
-                // harness counters; a positive trip this step is not thread-
-                // local, so approximate families may report ApproximateRecall
-                // when short without an explicit cap/budget signal.
+                // Cap/budget come from QueryTrace TLS recorded by family.actual().
+                // Unexplained shortfall is Unexpected for every family (exact and
+                // approximate) — never softened to ApproximateRecall.
                 let cap_hit = LAST_CANDIDATE_CAP_HIT.with(|c| c.get());
                 let budget_ex = LAST_WORK_BUDGET_EXCEEDED.with(|c| c.get());
                 let tls_k = LAST_REQUESTED_K.with(|c| c.get());
                 let requested_k = if tls_k > 0 { tls_k } else { requested_k };
-                let underfill = classify_underfill(
-                    requested_k,
-                    eligible,
-                    act_rids.len(),
-                    cap_hit,
-                    budget_ex,
-                    !family.is_exact(),
-                );
-                if matches!(underfill, UnderfillReason::Unexpected) && family.is_exact() {
+                let underfill =
+                    classify_underfill(requested_k, eligible, act_rids.len(), cap_hit, budget_ex);
+                let recall = topk_recall(&exp_rids, &act_rids);
+                harness.checkpoint_recalls.push(recall);
+                if matches!(underfill, UnderfillReason::Unexpected) {
+                    harness.unexpected_underfills += 1;
                     panic!(
-                        "exact family {} unexpected underfill at step {step}                          (eligible={eligible}, requested={requested_k}, actual={}):\nexpected={exp_rids:?}\nactual={act_rids:?}",
+                        "family {} unexpected underfill at step {step} \
+                         (eligible={eligible}, requested={requested_k}, actual={}):\n\
+                         expected={exp_rids:?}\nactual={act_rids:?}\nrecall={recall}",
                         family.name(),
                         act_rids.len(),
                     );
@@ -4123,12 +4139,20 @@ mod replay {
             );
         }
 
+        let min_recall = harness
+            .checkpoint_recalls
+            .iter()
+            .copied()
+            .fold(1.0_f32, f32::min);
         ReplaySummary {
             family: family.name().to_string(),
             seed,
             ops: harness.op_count,
             duration: start.elapsed(),
             live_rids: engine_rids.len(),
+            min_recall,
+            checkpoint_count: harness.checkpoint_recalls.len(),
+            unexpected_underfills: harness.unexpected_underfills,
         }
     }
 
@@ -4138,6 +4162,10 @@ mod replay {
         pub ops: usize,
         pub duration: std::time::Duration,
         pub live_rids: usize,
+        /// Minimum measured top-k recall across checkpoints (not hard-coded).
+        pub min_recall: f32,
+        pub checkpoint_count: usize,
+        pub unexpected_underfills: u64,
     }
 
     impl ReplaySummary {
@@ -4149,6 +4177,9 @@ mod replay {
                     "ops": self.ops,
                     "live_rids": self.live_rids,
                     "elapsed_ms": self.duration.as_millis() as u64,
+                    "min_recall": self.min_recall,
+                    "checkpoints": self.checkpoint_count,
+                    "unexpected_underfills": self.unexpected_underfills,
                 }),
                 "summary",
             );
@@ -4189,7 +4220,13 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
     );
     // B468-07: explicit per-family verdict — family-record existence alone is
     // not enough for closure. Exact families report membership/order/score;
-    // approximate families report recall floor compliance.
+    // approximate families report *measured* min checkpoint recall (never
+    // hard-coded 1.0) and the unexpected-underfill count (must be 0).
+    assert_eq!(
+        summary.unexpected_underfills, 0,
+        "verdict refuses pass with unexpected_underfills={}",
+        summary.unexpected_underfills
+    );
     if exact {
         emit_oracle_metric(
             &format!("index_churn_oracle::verdict::{name}"),
@@ -4203,8 +4240,10 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "seed": seed,
                 "operations": summary.ops,
                 "ineligible_hits": 0,
-                "unexpected_underfills": 0,
+                "unexpected_underfills": summary.unexpected_underfills,
                 "required_recall": floor,
+                "recall": summary.min_recall,
+                "checkpoints": summary.checkpoint_count,
             }),
             "verdict",
         );
@@ -4214,13 +4253,14 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
             serde_json::json!({
                 "status": "pass",
                 "exact": false,
-                "recall": 1.0,
+                "recall": summary.min_recall,
                 "required_recall": floor,
                 "ineligible_hits": 0,
-                "unexpected_underfills": 0,
+                "unexpected_underfills": summary.unexpected_underfills,
                 "final_model_equal": true,
                 "seed": seed,
                 "operations": summary.ops,
+                "checkpoints": summary.checkpoint_count,
             }),
             "verdict",
         );
@@ -5062,29 +5102,64 @@ fn churn_oracle_minhash_exact_duplicate_gate() {
 #[test]
 fn classify_underfill_not_enough_eligible_only_when_short_eligible() {
     assert_eq!(
-        classify_underfill(5, 3, 2, false, false, false),
+        classify_underfill(5, 3, 2, false, false),
         UnderfillReason::NotEnoughEligible
     );
     assert_eq!(
-        classify_underfill(5, 10, 5, false, false, false),
+        classify_underfill(5, 10, 5, false, false),
         UnderfillReason::None
     );
     assert_eq!(
-        classify_underfill(5, 10, 3, true, false, false),
+        classify_underfill(5, 10, 3, true, false),
         UnderfillReason::CandidateCap
     );
     assert_eq!(
-        classify_underfill(5, 10, 3, false, true, false),
+        classify_underfill(5, 10, 3, false, true),
         UnderfillReason::WorkBudgetExceeded
     );
+    // Unexplained shortfall is Unexpected for exact *and* approximate families.
+    // ApproximateRecall must never be used as a soft underfill label.
     assert_eq!(
-        classify_underfill(5, 10, 3, false, false, true),
-        UnderfillReason::ApproximateRecall
-    );
-    assert_eq!(
-        classify_underfill(5, 10, 3, false, false, false),
+        classify_underfill(5, 10, 3, false, false),
         UnderfillReason::Unexpected
     );
+}
+
+#[test]
+fn topk_recall_is_measured_not_assumed() {
+    assert!((topk_recall(&[1, 2, 3, 4, 5], &[1, 2, 3, 4, 5]) - 1.0).abs() < 1e-6);
+    assert!((topk_recall(&[1, 2, 3, 4, 5], &[1, 2, 3, 4]) - 0.8).abs() < 1e-6);
+    assert!((topk_recall(&[1, 2, 3], &[9, 8, 7]) - 0.0).abs() < 1e-6);
+    assert!((topk_recall(&[], &[1]) - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn ann_unexpected_underfill_fails_closed() {
+    // Approximate family + Unexpected underfill must fail (not soft-pass as
+    // ApproximateRecall). Mirrors the B468-04 fail-closed requirement.
+    let family = AnnDenseFamily;
+    let expected = vec![(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4), (5, 0.5)];
+    let actual = vec![(1, 0.1), (2, 0.2)]; // short without cap/budget
+    let context = FailureContext {
+        family: "ANN/HNSW/Dense".into(),
+        seed: 1,
+        operation_index: 0,
+        snapshot_epoch: Epoch(0),
+        last_50_ops: vec![],
+        expected_row_ids: vec![1, 2, 3, 4, 5],
+        actual_row_ids: vec![1, 2],
+        expected_scores: vec![0.1, 0.2, 0.3, 0.4, 0.5],
+        actual_scores: vec![0.1, 0.2],
+        eligible_count: 5,
+        visibility_rejected: 0,
+        authorization_rejected: 0,
+        candidate_cap_hit: false,
+        underfill_reason: UnderfillReason::Unexpected,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        family.assert_equivalent(&expected, &actual, &context);
+    }));
+    assert!(result.is_err(), "ANN unexpected underfill must fail closed");
 }
 
 #[test]
