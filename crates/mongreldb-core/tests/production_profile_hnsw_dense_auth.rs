@@ -128,10 +128,7 @@ fn production_profile_hnsw_dense_auth() {
         for id in 0..5i64 {
             tx.put(
                 "documents",
-                vec![
-                    (1, Value::Int64(id)),
-                    (2, unit_embedding(id as usize)),
-                ],
+                vec![(1, Value::Int64(id)), (2, unit_embedding(id as usize))],
             )
             .unwrap();
         }
@@ -189,12 +186,7 @@ fn production_profile_hnsw_dense_auth() {
                 true,
                 |table, snapshot, allowed, effective_principal| {
                     db_require_embedding_select(&admin, "documents", effective_principal)?;
-                    table.retrieve_at_with_allowed_and_context(
-                        &retriever,
-                        snapshot,
-                        allowed,
-                        None,
-                    )
+                    table.retrieve_at_with_allowed_and_context(&retriever, snapshot, allowed, None)
                 },
             )
             .unwrap();
@@ -246,5 +238,10 @@ fn db_require_embedding_select(
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
 ) -> mongreldb_core::Result<()> {
-    db.require_columns_for(table, mongreldb_core::ColumnOperation::Select, &[2], principal)
+    db.require_columns_for(
+        table,
+        mongreldb_core::ColumnOperation::Select,
+        &[2],
+        principal,
+    )
 }
