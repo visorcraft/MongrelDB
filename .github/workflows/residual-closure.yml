@@ -63,11 +63,26 @@ jobs:
   # -------------------------------------------------------------------------
   formatting-clippy:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
@@ -221,22 +236,50 @@ jobs:
       - run: cargo test -p mongreldb-core --tests --all-features --lib
 
   # -------------------------------------------------------------------------
-  # 10. Full workspace tests.
+  # 10. Full workspace tests (non-core). Core is covered by full-core-tests;
+  # mongreldb-perf is excluded because its bundled DuckDB/SQLite debug build
+  # exhausts GitHub-hosted runner disks ("No space left on device").
   # -------------------------------------------------------------------------
   full-workspace-tests:
     runs-on: ubuntu-latest
+    env:
+      # Shrink debug artifacts so workspace+all-features fits on GHA disks.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          # Same reclaim set as release-qualification.yml — full workspace
+          # debug builds otherwise hit "No space left on device" mid-compile.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
       # Workspace scope pulls in mongreldb-protocol; its build script
       # needs protoc.
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --workspace --all-features --exclude mongreldb-perf --tests
+      - name: cargo test (workspace, exclude core+perf)
+        run: |
+          set -euo pipefail
+          cargo test --workspace --all-features \
+            --exclude mongreldb-core \
+            --exclude mongreldb-perf \
+            --tests
+          df -h
 
   # -------------------------------------------------------------------------
   # 11. Release-mode performance (§13.12). Heavy release-mode benchmarks;
@@ -350,11 +393,26 @@ jobs:
       - orchestrator-self-tests
     env:
       MONGRELDB_ORACLE_OPERATIONS: "500"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.sha }}
           fetch-depth: 0
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
