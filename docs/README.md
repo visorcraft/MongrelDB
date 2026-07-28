@@ -65,6 +65,10 @@ vector similarity, range queries, and more.
 22. **[Embeddings and Retrieval](22-embeddings-and-retrieval.md)** -
     pluggable `EmbeddingSource` / provider registry; ANN on real vectors
     only; sparse retrieval with no embedding model
+23. **[Native RPC and MySQL Compatibility](23-native-rpc-and-mysql-compatibility.md)** -
+    wire protocol and compatibility notes
+24. **[Production: single-node HNSW Dense + auth](24-production-single-node-hnsw-auth.md)** -
+    recommended first production profile (daemon, Dense HNSW, catalog auth)
 
 ## Quick Reference
 

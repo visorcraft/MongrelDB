@@ -192,3 +192,8 @@ If no real model is available:
 - `Database::embedding_providers()`
 - Server: `SHOW RESOURCE GROUPS` includes registered `embedding_providers`
 - Server CLI: `--embedding-provider <path>`
+
+## See also
+
+Recommended single-node production recipe (HNSW Dense + auth):
+[Production: single-node HNSW Dense + auth](24-production-single-node-hnsw-auth.md).

@@ -147,6 +147,8 @@ including ANN, MinHash, learned-range, partial-index options, and portable
 `mongreldb_schema_set_embedding_source_json`. Applications may supply vectors
 from any model, or the server can materialize them through a registered
 `EmbeddingProvider`. See [embeddings and retrieval policy](docs/22-embeddings-and-retrieval.md).
+Recommended first production profile (single-node, HNSW Dense, catalog auth):
+[docs/24-production-single-node-hnsw-auth.md](docs/24-production-single-node-hnsw-auth.md).
 
 ## Performance profile
 

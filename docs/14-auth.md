@@ -315,3 +315,9 @@ recovery procedures, see
 - **Performance.** `verify_user` runs one deliberately expensive Argon2id hash
   comparison. The daemon caches the resolved `Principal` for one request. Use
   Bearer token mode when its shared-secret model fits the deployment.
+
+## See also
+
+For the recommended single-node production profile that combines catalog
+auth with HNSW Dense ANN, see
+[Production: single-node HNSW Dense + auth](24-production-single-node-hnsw-auth.md).

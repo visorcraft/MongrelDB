@@ -247,7 +247,8 @@ Condition::Ann { column_id: 6, query: vec![0.1, 0.45, 0.78, ...], k: 10 }
 ```
 
 ```sql
--- HNSW + Dense (default algorithm)
+-- HNSW + Dense (recommended production quality path; see
+-- docs/24-production-single-node-hnsw-auth.md)
 CREATE INDEX idx_prompts_embed_ann
 ON prompts USING ann (embedding)
 WITH (quantization = 'dense', m = 16, ef_construction = 64, ef_search = 64);

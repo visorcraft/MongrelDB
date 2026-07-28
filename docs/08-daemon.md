@@ -983,3 +983,6 @@ The daemon listens on `127.0.0.1` by default. For production:
    per-identity credentials (see **[Users, Roles & Permissions](14-auth.md)**).
 2. Use `--max-connections` to prevent resource exhaustion.
 3. Put a TLS-terminating reverse proxy (nginx, Caddy) in front for HTTPS.
+
+For the recommended single-node + HNSW Dense + auth deployment recipe, see
+**[Production: single-node HNSW Dense + auth](24-production-single-node-hnsw-auth.md)**.
