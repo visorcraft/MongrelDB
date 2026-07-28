@@ -221,19 +221,47 @@ jobs:
       - run: cargo test -p mongreldb-server --test hot_metrics_export --all-features
 
   # -------------------------------------------------------------------------
-  # 9. Full core tests — dedicated full-suite command.
+  # 9. Full core tests — lib + integration suite.
+  # index_churn_oracle is intentionally skipped here: the eight-seed-churn-smoke
+  # matrix already runs that binary once per seed (500 ops). Re-running all
+  # family replays inside full-core multiplies wall time past 1h+ and has
+  # repeatedly left residual-closure blocked with no logs while cargo test
+  # still "runs".
   # -------------------------------------------------------------------------
   full-core-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
-      - run: cargo test -p mongreldb-core --tests --all-features --lib
+      - name: cargo test (lib)
+        run: cargo test -p mongreldb-core --lib --all-features
+      - name: cargo test (integration, skip index_churn_oracle)
+        run: |
+          set -euo pipefail
+          cargo test -p mongreldb-core --tests --all-features \
+            -- --skip index_churn_oracle
 
   # -------------------------------------------------------------------------
   # 10. Full workspace tests (non-core). Core is covered by full-core-tests;
