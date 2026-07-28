@@ -336,8 +336,8 @@
     "verdict_minhash_measured": {
       "jsonl": "churn-oracle.jsonl",
       "record": "index_churn_oracle::verdict::minhash",
-      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::minhash\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.minimum_recall // .metric.recall // 0) >= (.metric.required_recall // 0.8)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
-      "label": "minhash measured verdict"
+      "jq": "any(.[]; .test==\"index_churn_oracle::verdict::minhash\" and .metric.status==\"pass\" and (.metric.checkpoints // 0) > 0 and ((.metric.median_recall // .metric.recall // 0) >= (.metric.required_recall // 0.8)) and (.metric.unexpected_underfills // 0) == 0 and .metric.final_model_equal==true)",
+      "label": "minhash measured median-recall verdict (REM-F §10.6)"
     },
     "verdict_fm_exact": {
       "jsonl": "churn-oracle.jsonl",

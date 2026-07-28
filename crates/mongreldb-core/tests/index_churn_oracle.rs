@@ -1492,6 +1492,13 @@ mod family_mod {
             1.0
         }
 
+        /// When true, `family_test` gates on **median** checkpoint recall
+        /// (MinHash REM-F §10.6). When false, every-checkpoint **min**
+        /// recall must meet the floor (ANN families).
+        fn floor_uses_median_recall(&self) -> bool {
+            false
+        }
+
         /// End-of-replay family gate (e.g. the MinHash median-recall
         /// floor). Called once per replay with the final failure context so
         /// a violation renders the full §11.5 artifact.
@@ -3367,6 +3374,10 @@ mod families {
             MINHASH_GENERAL_RECALL_FLOOR
         }
 
+        fn floor_uses_median_recall(&self) -> bool {
+            true
+        }
+
         fn finish(&self, context: &FailureContext) {
             let samples = self.recall_samples.borrow();
             if samples.is_empty() {
@@ -4449,6 +4460,7 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
     let seed = seed_from_env();
     let exact = family.is_exact();
     let floor = family.recall_floor();
+    let floor_uses_median = family.floor_uses_median_recall();
     let summary = run_replay(
         family,
         seed,
@@ -4505,11 +4517,25 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
             "verdict",
         );
     } else {
+        // ANN: every-checkpoint min ≥ floor. MinHash: median ≥ floor
+        // (REM-F §10.6; finish() already enforced the family samples).
+        let measured = if floor_uses_median {
+            summary.median_recall
+        } else {
+            summary.min_recall
+        };
         assert!(
-            summary.min_recall + 1e-6 >= floor,
-            "min_recall {} below floor {}",
+            measured + 1e-6 >= floor,
+            "{} {} below floor {} (min={}, median={})",
+            if floor_uses_median {
+                "median_recall"
+            } else {
+                "min_recall"
+            },
+            measured,
+            floor,
             summary.min_recall,
-            floor
+            summary.median_recall,
         );
         emit_oracle_metric(
             &format!("index_churn_oracle::verdict::{name}"),
@@ -4519,8 +4545,11 @@ fn family_test<F: ChurnOracleFamily>(family: F, total_ops: usize, name: &str) {
                 "minimum_recall": summary.min_recall,
                 "median_recall": summary.median_recall,
                 "maximum_recall": summary.max_recall,
-                "recall": summary.min_recall,
+                // For median-gated families the contractual "recall" field
+                // is the median; for min-gated families it is the min.
+                "recall": measured,
                 "required_recall": floor,
+                "floor_statistic": if floor_uses_median { "median" } else { "min" },
                 "ineligible_hits": summary.ineligible_hits,
                 "unexpected_underfills": summary.unexpected_underfills,
                 "final_model_equal": summary.final_model_equal,
