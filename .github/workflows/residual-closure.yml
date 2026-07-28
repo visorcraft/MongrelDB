@@ -221,16 +221,20 @@ jobs:
       - run: cargo test -p mongreldb-server --test hot_metrics_export --all-features
 
   # -------------------------------------------------------------------------
-  # 9. Full core tests — lib + integration suite.
-  # index_churn_oracle is intentionally skipped here: the eight-seed-churn-smoke
-  # matrix already runs that binary once per seed (500 ops). Re-running all
-  # family replays inside full-core multiplies wall time past 1h+ and has
-  # repeatedly left residual-closure blocked with no logs while cargo test
-  # still "runs".
+  # 9. Full core tests — residual-scoped, not the entire integration farm.
+  #
+  # Residual-closure already has dedicated jobs for the heavy surfaces
+  # (eight-seed index_churn_oracle, point-directory, result-cache, HNSW
+  # connectivity, controlled-scan, full-workspace). Re-running every
+  # crates/mongreldb-core/tests/* binary here routinely exceeds 30–90+ min
+  # and blocks run-orchestrator. Keep this job to:
+  #   - all lib unit tests
+  #   - the production-profile recipe lock (HNSW Dense + auth)
+  # Broad integration coverage remains the responsibility of CI.yml.
   # -------------------------------------------------------------------------
   full-core-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
@@ -255,13 +259,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           toolchain: 1.97.1
-      - name: cargo test (lib)
+      - name: cargo test (lib unit)
         run: cargo test -p mongreldb-core --lib --all-features
-      - name: cargo test (integration, skip index_churn_oracle)
+      - name: cargo test (production profile HNSW Dense + auth)
         run: |
-          set -euo pipefail
-          cargo test -p mongreldb-core --tests --all-features \
-            -- --skip index_churn_oracle
+          cargo test -p mongreldb-core --all-features \
+            --test production_profile_hnsw_dense_auth
 
   # -------------------------------------------------------------------------
   # 10. Full workspace tests (non-core). Core is covered by full-core-tests;
