@@ -20,8 +20,8 @@ crate-type = ["cdylib"]
 # builder execution. Kit tracks the same published line as the engine
 # (crates.io 0.64.9); engine types track this monorepo release so the
 # adapter can pick up core/query fixes after publish.
-mongreldb-kit = "=0.64.13"
-mongreldb-kit-core = "=0.64.13"
+mongreldb-kit = "=0.64.14"
+mongreldb-kit-core = "=0.64.14"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
 mongreldb-types = "0.64.14"
 # The jni crate provides Rust bindings to the JNI API.
