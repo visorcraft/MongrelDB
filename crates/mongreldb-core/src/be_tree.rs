@@ -8,9 +8,9 @@
 //! approaching O(1). Reads consult every buffer along the root→leaf path and
 //! return the newest version with `epoch <= snapshot`.
 //!
-//! This is a drop-in MVCC alternative to the skip-list [`crate::Memtable`]; the
-//! engine ships the skip-list today because it is simpler, while this structure
-//! wins on update amplification at scale.
+//! This Bε-tree is the engine's live memtable: [`crate::Memtable`] has been
+//! backed by it since Phase 11.2, which replaced the prototype skip list.
+//! Buffering wins on update amplification at scale.
 
 use crate::epoch::Epoch;
 use crate::memtable::Row;

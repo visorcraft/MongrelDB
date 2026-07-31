@@ -374,26 +374,26 @@ MongrelDB supports **35 languages** across two integration tiers:
 |---|---|---|---|
 | **Clojure** | `clj-http` | [MongrelDB-Clojure](https://github.com/visorcraft/MongrelDB-Clojure) | deps.edn / Leiningen |
 | **Crystal** | `HTTP::Client` | [MongrelDB-Crystal](https://github.com/visorcraft/MongrelDB-Crystal) | `shards add mongreldb` |
-| **D** | `requests` | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
-| **Dart** | `http` | [MongrelDB-Dart](https://github.com/visorcraft/MongrelDB-Dart) | `dart pub add mongreldb` |
-| **Elixir** | `Req` | [MongrelDB-Elixir](https://github.com/visorcraft/MongrelDB-Elixir) | `{:mongreldb, "~> 0.55"}` in `mix.exs` |
+| **D** | `requests` | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | Git clone + `dub add-local` (not on code.dlang.org) |
+| **Dart** | `http` | [MongrelDB-Dart](https://github.com/visorcraft/MongrelDB-Dart) | `dart pub add mongreldb --git-url=https://github.com/visorcraft/MongrelDB-Dart` (not on pub.dev) |
+| **Elixir** | `Req` | [MongrelDB-Elixir](https://github.com/visorcraft/MongrelDB-Elixir) | `{:mongreldb, github: "visorcraft/MongrelDB-Elixir"}` in `mix.exs` (not on hex.pm) |
 | **Erlang** | `httpc` | [MongrelDB-Erlang](https://github.com/visorcraft/MongrelDB-Erlang) | rebar3 |
 | **F#** | `HttpClient` | [MongrelDB-FSharp](https://github.com/visorcraft/MongrelDB-FSharp) | `dotnet add reference` |
 | **Fortran** | `curl` | [MongrelDB-Fortran](https://github.com/visorcraft/MongrelDB-Fortran) | fpm |
-| **Gleam** | `gleam_http` | [MongrelDB-Gleam](https://github.com/visorcraft/MongrelDB-Gleam) | `gleam add mongreldb` |
+| **Gleam** | `gleam_http` | [MongrelDB-Gleam](https://github.com/visorcraft/MongrelDB-Gleam) | Git clone + path dependency in `gleam.toml` (not on hex.pm) |
 | **Go** | `net/http` | [MongrelDB-Go](https://github.com/visorcraft/MongrelDB-Go) | `go get github.com/visorcraft/mongreldb-go` |
-| **Julia** | `HTTP.jl` | [MongrelDB-Julia](https://github.com/visorcraft/MongrelDB-Julia) | `] add MongrelDB` |
+| **Julia** | `HTTP.jl` | [MongrelDB-Julia](https://github.com/visorcraft/MongrelDB-Julia) | `Pkg.add(url="https://github.com/visorcraft/MongrelDB-Julia")` (not in the General registry) |
 | **Kotlin/Native** | `ktor-client-curl` | [MongrelDB-Kotlin-Native](https://github.com/visorcraft/MongrelDB-Kotlin-Native) | Gradle (compiles to native, no JVM) |
-| **Lua** | `lua-curl` | [MongrelDB-Lua](https://github.com/visorcraft/MongrelDB-Lua) | `luarocks install mongreldb` |
-| **Mojo** | `http` | [MongrelDB-Mojo](https://github.com/visorcraft/MongrelDB-Mojo) | `magic add mongreldb` |
-| **Nim** | `HttpClient` | [MongrelDB-Nim](https://github.com/visorcraft/MongrelDB-Nim) | `nimble install mongreldb` |
+| **Lua** | `lua-curl` | [MongrelDB-Lua](https://github.com/visorcraft/MongrelDB-Lua) | Git clone + `luarocks make` (not on LuaRocks) |
+| **Mojo** | `http` | [MongrelDB-Mojo](https://github.com/visorcraft/MongrelDB-Mojo) | Git clone + `mojo run -I src` (no registry package) |
+| **Nim** | `HttpClient` | [MongrelDB-Nim](https://github.com/visorcraft/MongrelDB-Nim) | `nimble install https://github.com/visorcraft/MongrelDB-Nim` |
 | **Objective-C** | `NSURLSession` | [MongrelDB-ObjC](https://github.com/visorcraft/MongrelDB-ObjC) | CMake (links Foundation) |
 | **Odin** | `net/http` | [MongrelDB-Odin](https://github.com/visorcraft/MongrelDB-Odin) | `odin build` |
-| **Perl** | `HTTP::Tiny` | [MongrelDB-Perl](https://github.com/visorcraft/MongrelDB-Perl) | `cpanm MongrelDB` |
+| **Perl** | `HTTP::Tiny` | [MongrelDB-Perl](https://github.com/visorcraft/MongrelDB-Perl) | Git clone + copy `lib/MongrelDB.pm` (not on CPAN) |
 | **PHP** | `cURL` | [MongrelDB-PHP](https://github.com/visorcraft/MongrelDB-PHP) | `composer require visorcraft/mongreldb-php` |
-| **PowerShell** | `Invoke-RestMethod` | [MongrelDB-Powershell](https://github.com/visorcraft/MongrelDB-Powershell) | `Import-Module mongreldb` |
-| **R** | `libcurl` | [MongrelDB-R](https://github.com/visorcraft/MongrelDB-R) | `install.packages("mongreldb")` |
-| **Ruby** | `net/http` | [MongrelDB-Ruby](https://github.com/visorcraft/MongrelDB-Ruby) | `gem install mongreldb` |
+| **PowerShell** | `Invoke-RestMethod` | [MongrelDB-Powershell](https://github.com/visorcraft/MongrelDB-Powershell) | Git clone + `Import-Module ./src/MongrelDB.psd1` (not on PS Gallery) |
+| **R** | `libcurl` | [MongrelDB-R](https://github.com/visorcraft/MongrelDB-R) | Git clone + `R CMD INSTALL .` (not on CRAN) |
+| **Ruby** | `net/http` | [MongrelDB-Ruby](https://github.com/visorcraft/MongrelDB-Ruby) | `gem "mongreldb", git: "https://github.com/visorcraft/MongrelDB-Ruby.git"` (not on RubyGems) |
 | **Swift** | `URLSession` | [MongrelDB-Swift](https://github.com/visorcraft/MongrelDB-Swift) | Swift Package Manager |
 | **Tcl** | `http` | [MongrelDB-Tcl](https://github.com/visorcraft/MongrelDB-Tcl) | `package require mongreldb` |
 | **V** | `net.http` | [MongrelDB-V](https://github.com/visorcraft/MongrelDB-V) | `v install` |
@@ -403,18 +403,18 @@ The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C inte
 
 ### Native libraries (prebuilt)
 
-Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libmongreldb_jni` (JVM shim) are attached to every release for six platform targets:
+Prebuilt `libmongreldb` (core engine) and `libmongreldb_kit` (Kit layer) archives are attached to every release for six platform targets; the `libmongreldb_jni` (JVM shim) JARs cover the five non-musl targets:
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
 | Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.64.14-linux-x64.jar` |
-| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.64.14-linux-x64-musl.jar` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | — |
 | Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.64.14-linux-arm64.jar` |
 | macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.64.14-darwin-arm64.jar` |
 | macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.64.14-darwin-x64.jar` |
 | Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.64.14-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.64.14.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.64.14.jar`) with all five JVM targets bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 

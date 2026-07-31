@@ -1,4 +1,4 @@
-//! Mutable run tier — the LSM layer between the skip-list memtable and the
+//! Mutable run tier — the LSM layer between the Bε-tree memtable and the
 //! immutable `.sr` sorted runs (Phase 11.1).
 //!
 //! A flush drains the live memtable into this in-memory tier instead of

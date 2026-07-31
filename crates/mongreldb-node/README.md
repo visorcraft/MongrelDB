@@ -2,8 +2,10 @@
 
 High-performance Node.js bindings for MongrelDB via [NAPI](https://napi.rs),
 with native in-process storage, sub-ms writes, and hybrid indexing. It follows
-the **better-sqlite3 model**: no HTTP latency, so the ~8 µs single-row write
-isn't dwarfed by a network round-trip. Exposes a **typed object/method
+the **better-sqlite3 model**: no HTTP latency, so an accepted single-row write
+(0.78 µs p50 steady-state; 4.48 µs put without fsync — durability comes from a
+separate commit with fsync at 4.67 ms, see `BENCHMARKS.md`) isn't dwarfed by a
+network round-trip. Exposes a **typed object/method
 interface** (not SQL); TypeScript types are generated at build time.
 
 This crate is built **separately** from the Rust workspace (it targets the NAPI

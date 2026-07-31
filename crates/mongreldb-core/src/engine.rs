@@ -1,7 +1,7 @@
 //! The engine tying the write and read paths together.
 //!
 //! Sub-ms writes: [`Table::put`] appends to the WAL **without fsyncing**, upserts
-//! the skip-list memtable, and updates the in-memory HOT index + secondary
+//! the Bε-tree memtable, and updates the in-memory HOT index + secondary
 //! indexes. A batch-driven [`Table::commit`] does the group `fsync` and bumps the
 //! epoch. [`Table::flush`] commits, drains the memtable into an immutable sorted
 //! run, and rotates the WAL. Reads merge versions across the live memtable and

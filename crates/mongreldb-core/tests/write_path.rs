@@ -1,5 +1,5 @@
 //! End-to-end smoke test for the Phase-0 write path: the group-commit WAL, the
-//! skip-list memtable, the HOT primary index, a memtable→sorted-run flush of
+//! Bε-tree memtable, the HOT primary index, a memtable→sorted-run flush of
 //! the container format, and the AI-native indexes intersecting in the shared
 //! row-id space.
 

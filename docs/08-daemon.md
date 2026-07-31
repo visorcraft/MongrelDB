@@ -902,14 +902,24 @@ The daemon also runs a **background auto-compactor** that sweeps every
 ## Change Data Capture (NOTIFY / LISTEN)
 
 The daemon publishes change events to a broadcast channel. Applications can
-subscribe via the `GET /events` endpoint, which streams events as
-newline-delimited JSON (`ChangeEvent { channel, table, op, epoch, message }`):
+subscribe via the `GET /events` endpoint, a Server-Sent Events (SSE) stream
+(`text/event-stream`). Each event carries an `event:` type (`change` or
+`notify`), a JSON `data:` payload (`ChangeEvent { channel, table, op, epoch,
+message }`), and a stable `<commit_epoch>:<operation_index>` `id:`. Send
+`Last-Event-ID` to resume from a previous id; a retention gap returns 409
+before the stream starts, or a terminal `gap` event if the client falls
+behind:
 
 ```sh
 # Stream change events
-curl http://127.0.0.1:8453/events
-# {"channel":"","table":"events","op":"put","epoch":5,"message":null}
-# {"channel":"alerts","table":"","op":"notify","epoch":6,"message":"threshold exceeded"}
+curl -N http://127.0.0.1:8453/events
+# event: change
+# id: 5:0
+# data: {"channel":"","table":"events","op":"put","epoch":5,"message":null}
+#
+# event: notify
+# id: 6:0
+# data: {"channel":"alerts","table":"","op":"notify","epoch":6,"message":"threshold exceeded"}
 ```
 
 SQL `NOTIFY channel [, 'payload']` publishes a notification on a named

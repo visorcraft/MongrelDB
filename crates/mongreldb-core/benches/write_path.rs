@@ -1,7 +1,7 @@
 //! Write-path micro-benchmarks.
 //!
 //! - `put_no_fsync`: per-write latency of `put` with auto-sync disabled — the
-//!   pure in-process cost (WAL append to buffer + skip-list memtable insert +
+//!   pure in-process cost (WAL append to buffer + Bε-tree memtable insert +
 //!   HOT update). This is the "sub-ms write" number.
 //! - `commit_fsync`: the durability floor (one `fsync` of the WAL + an atomic
 //!   manifest write).
