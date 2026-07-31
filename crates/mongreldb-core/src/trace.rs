@@ -320,7 +320,7 @@ pub struct QueryTrace {
     pub underfill_reason: Option<&'static str>,
 }
 
-/// Reasons a HOT (`Hash-Organized Table`) PK lookup may fall back to the slower
+/// Reasons a HOT (`Height-Optimized Trie`) PK lookup may fall back to the slower
 /// overlay + sorted-run path. Stable identifiers; the string literals are the
 /// stable wire/label form (see TODO §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -358,7 +358,7 @@ impl fmt::Display for HotFallbackReason {
     }
 }
 
-/// Diagnostic classification of a HOT (`Hash-Organized Table`) candidate row.
+/// Diagnostic classification of a HOT (`Height-Optimized Trie`) candidate row.
 ///
 /// `Table::get` collapses several distinct failure modes into `None`
 /// (tombstone, TTL expiry, snapshot invisibility). To preserve observability

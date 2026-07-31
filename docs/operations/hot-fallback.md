@@ -5,7 +5,7 @@
 
 ## What a HOT lookup is
 
-MongrelDB serves primary-key lookups through a `Hash-Organized Table` (HOT)
+MongrelDB serves primary-key lookups through a `Height-Optimized Trie` (HOT)
 that maps the PK value to a `RowId`. A **hit** is when the HOT map returns a
 `RowId` whose materialized row matches the PK and is visible, live, and
 TTL-valid at the calling snapshot.
