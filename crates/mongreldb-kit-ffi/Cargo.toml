@@ -36,3 +36,10 @@ cc = "1"
 
 
 [workspace]
+
+# Force Kit's transitive engine deps onto this monorepo's sources: picks up
+# the datafusion `parquet` feature disable (thrift RUSTSEC fix) before the
+# next engine release reaches crates.io.
+[patch.crates-io]
+mongreldb-core = { path = "../mongreldb-core" }
+mongreldb-query = { path = "../mongreldb-query" }

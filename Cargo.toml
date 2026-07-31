@@ -19,6 +19,13 @@ members = [
 ]
 resolver = "2"
 
+# opensrv-mysql 0.7.0 (latest crates.io release) pins tokio-rustls 0.25 /
+# rustls 0.22, which pulls the vulnerable rustls-webpki 0.102 line. Upstream
+# commit 3142eb5 ("feat: update rustls to 0.23") is the same 0.7.0 with
+# tokio-rustls bumped to 0.26; pin it until a release newer than 0.7.0 ships.
+[patch.crates-io]
+opensrv-mysql = { git = "https://github.com/datafuselabs/opensrv.git", rev = "3142eb545fab811bc9289091781ce6d771cf0bf7" }
+
 [workspace.package]
 version = "0.64.14"
 edition = "2021"
