@@ -8,8 +8,8 @@ repository.workspace = true
 description = "DataFusion SQL + Arrow frontend for MongrelDB."
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.14" }
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.14" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.15" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.15" }
 datafusion = { version = "54.0.0", default-features = false, features = ["nested_expressions", "crypto_expressions", "datetime_expressions", "encoding_expressions", "regex_expressions", "string_expressions", "unicode_expressions", "compression", "recursive_protection", "sql"] }
 datafusion-datasource = "54.0.0"
 arrow = "58"
@@ -32,7 +32,7 @@ tempfile = "3"
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.14" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.15" }
 
 [[bench]]
 name = "sql_cancellation"

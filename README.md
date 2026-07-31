@@ -407,14 +407,14 @@ Prebuilt `libmongreldb` (core engine) and `libmongreldb_kit` (Kit layer) archive
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.64.14-linux-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.64.15-linux-x64.jar` |
 | Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | — |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.64.14-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.64.14-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.64.14-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.64.14-windows-x64.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.64.15-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.64.15-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.64.15-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.64.15-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.64.14.jar`) with all five JVM targets bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.64.15.jar`) with all five JVM targets bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 
