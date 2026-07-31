@@ -2177,6 +2177,8 @@ dependencies = [
 [[package]]
 name = "mongreldb-core"
 version = "0.64.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c292b3dea6fbf2c4527b3475baa1cd3cdbd5e970e573c88c45e748952ea0518e"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2194,7 +2196,7 @@ dependencies = [
  "memmap2",
  "mongreldb-fault",
  "mongreldb-log",
- "mongreldb-types 0.64.15",
+ "mongreldb-types",
  "parking_lot",
  "rayon",
  "regex",
@@ -2216,6 +2218,8 @@ dependencies = [
 [[package]]
 name = "mongreldb-fault"
 version = "0.64.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5f9d75aa56786764f2f2cd6f465abb4eb679e79257d0459877bb1dd5fb65ce4"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -2227,15 +2231,15 @@ dependencies = [
  "jni",
  "mongreldb-kit",
  "mongreldb-kit-core",
- "mongreldb-types 0.64.14",
+ "mongreldb-types",
  "serde_json",
 ]
 
 [[package]]
 name = "mongreldb-kit"
-version = "0.64.14"
+version = "0.64.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d73061a2359202999525945f682bd608cf126a08abdec7780e469de322e251"
+checksum = "110e77a888aefb02d492aa685ce05a5c30f8d9b7ee703200f56b265dee5cb271"
 dependencies = [
  "arrow",
  "bincode",
@@ -2246,31 +2250,33 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "mongreldb-kit-core"
-version = "0.64.14"
+version = "0.64.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a26b0b82dab6718e0da194a969cf1c23e085f4b99a75cea1dc8ad43e73b6e222"
+checksum = "ddbb8bd262b189990cbd634dd824748198cc1014625074e338d537fee53971d8"
 dependencies = [
  "hex",
  "regex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
  "uuid",
 ]
 
 [[package]]
 name = "mongreldb-log"
 version = "0.64.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a5206ca060f398678ca17044460611857baf35220a5012642b3c638ad239c97"
 dependencies = [
- "mongreldb-types 0.64.15",
+ "mongreldb-types",
  "serde",
  "sha2 0.10.9",
  "thiserror 1.0.69",
@@ -2279,6 +2285,8 @@ dependencies = [
 [[package]]
 name = "mongreldb-query"
 version = "0.64.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6c1f82c2d3431896fab1b3651dec10a2747b64e13f21d99ac47e26ea566fee4"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -2290,7 +2298,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "mongreldb-core",
- "mongreldb-types 0.64.15",
+ "mongreldb-types",
  "parking_lot",
  "regex",
  "serde",
@@ -2304,19 +2312,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.64.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff53a4a87107393cf3eb0259634bf0a00ae62e873da0801b874a6d95a98701d7"
-dependencies = [
- "getrandom 0.2.17",
- "serde",
- "thiserror 1.0.69",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mongreldb-types"
 version = "0.64.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edf8898a3faea41640c7760ddab015db2ae47de25b8dae0ac083f67b8d646138"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
@@ -2965,7 +2963,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

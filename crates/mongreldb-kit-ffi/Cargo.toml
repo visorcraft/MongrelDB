@@ -23,23 +23,16 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-# Engine 0.64.9 and Kit 0.64.9 are both published and aligned, so the adapter
-# resolves everything from the registry. Re-add the [patch.crates-io] below
-# when a core/query fix must ship before the next engine release.
-kit = { package = "mongreldb-kit", version = "=0.64.14" }
-mongreldb-kit-core = "=0.64.14"
+# Engine 0.64.15 and Kit 0.64.15 are both published and aligned, so the adapter
+# resolves everything from the registry. Re-add [patch.crates-io] for local
+# mongreldb-core/mongreldb-query when a core/query fix must ship before the
+# next engine release.
+kit = { package = "mongreldb-kit", version = "=0.64.15" }
+mongreldb-kit-core = "=0.64.15"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 cc = "1"
 
-
 [workspace]
-
-# Force Kit's transitive engine deps onto this monorepo's sources: picks up
-# the datafusion `parquet` feature disable (thrift RUSTSEC fix) before the
-# next engine release reaches crates.io.
-[patch.crates-io]
-mongreldb-core = { path = "../mongreldb-core" }
-mongreldb-query = { path = "../mongreldb-query" }
