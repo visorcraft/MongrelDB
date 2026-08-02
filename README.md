@@ -537,6 +537,11 @@ See
 [Architecture implementation status](docs/architecture/implementation-status.md)
 for the distinction between integrated code and exact-SHA qualified evidence.
 
+## Related tools
+
+- [Mongrel](https://visorcraft.com/mongreldb) — Commercial multi-system workbench with native MongrelDB support.
+- [MongrelDB Viewer](https://github.com/visorcraft/MongrelDB-Viewer) — Free, open-source MongrelDB GUI and MCP server.
+
 ## License
 
 MongrelDB is dual-licensed under MIT or Apache-2.0.
