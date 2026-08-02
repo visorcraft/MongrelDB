@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "MongrelDB cluster runtime: node identity, meta group, tablets, placement (Stages 2-3)."
 
 [dependencies]

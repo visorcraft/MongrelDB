@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP client library for MongrelDB Server."
 repository = "https://github.com/visorcraft/MongrelDB"
+homepage.workspace = true
 
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.64.15" }

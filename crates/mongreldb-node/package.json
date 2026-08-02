@@ -2,6 +2,7 @@
   "name": "@visorcraft/mongreldb",
   "version": "0.64.15",
   "description": "High-performance Node.js bindings for MongrelDB with native in-process storage, sub-ms writes, and hybrid indexing.",
+  "homepage": "https://www.mongreldb.com",
   "main": "index.js",
   "types": "index.d.ts",
   "repository": {

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "MongrelDB versioned protocol messages and service definitions (S1D)."
 
 [dependencies]

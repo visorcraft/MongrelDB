@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "MongrelDB consensus adapter over openraft (Stage 2; see docs/architecture/adr/0004)."
 
 [dependencies]

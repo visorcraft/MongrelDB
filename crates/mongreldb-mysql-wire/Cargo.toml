@@ -6,6 +6,7 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "MySQL wire-protocol adapter for MongrelDB native RPC"
 repository = "https://github.com/visorcraft/MongrelDB"
+homepage.workspace = true
 
 [dependencies]
 arrow = "58"

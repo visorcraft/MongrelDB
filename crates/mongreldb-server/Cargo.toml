@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP daemon for MongrelDB — serves SQL, native queries, and typed Kit API over HTTP for multi-process access."
 repository = "https://github.com/visorcraft/MongrelDB"
+homepage.workspace = true
 
 [[bin]]
 name = "mongreldb-server"

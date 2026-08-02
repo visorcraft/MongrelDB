@@ -6,6 +6,7 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Online MySQL to MongrelDB migration runtime"
 repository = "https://github.com/visorcraft/MongrelDB"
+homepage.workspace = true
 
 [dependencies]
 arrow = "58"

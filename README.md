@@ -26,6 +26,8 @@ MongrelDB is an embedded, single-node database engine for operational workloads
 on a custom columnar format, with a rich index set designed for AI-native
 access patterns. **New to MongrelDB? Start with the [docs](docs/).**
 
+Evaluating fit? See MongrelDB as an [embedded MongoDB alternative](https://www.mongreldb.com/embedded-mongodb-alternative/), an [embedded vector database in Rust](https://www.mongreldb.com/embedded-vector-database/), or an [embedded database for Node.js](https://www.mongreldb.com/nodejs-embedded-database/).
+
 The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
 Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
 runs (`.sr` PAX columnar pages).
