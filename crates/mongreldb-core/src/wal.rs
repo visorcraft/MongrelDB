@@ -40,7 +40,7 @@ const WAL_HEAD_AUTH_DOMAIN: &[u8] = b"mongreldb/wal-head/v1";
 const WAL_HEAD_BODY_LEN: usize = 72;
 const WAL_HEAD_LEN: usize = WAL_HEAD_BODY_LEN + 32;
 const MAX_RECOVERY_WAL_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_RECOVERY_WAL_RECORDS: usize = 1_000_000;
+const MAX_RECOVERY_WAL_RECORDS: usize = 2_000_000;
 /// Encryption flag stored in reserved[0] of the WAL header.
 const ENC_PLAINTEXT: u8 = 0;
 const ENC_AES_GCM: u8 = 1;
