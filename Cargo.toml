@@ -27,7 +27,7 @@ resolver = "2"
 opensrv-mysql = { git = "https://github.com/datafuselabs/opensrv.git", rev = "3142eb545fab811bc9289091781ce6d771cf0bf7" }
 
 [workspace.package]
-version = "0.64.15"
+version = "0.64.16"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
