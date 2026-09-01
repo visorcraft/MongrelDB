@@ -30,9 +30,9 @@ regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # First-party Stage 0 foundation crates (see docs/architecture/adr/).
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.16" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.16" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.16" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.17" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.17" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.17" }
 
 # Page-level AES-256-GCM encryption and the key hierarchy
 # (Argon2id + HKDF KEK -> wrapped per-file DEK). Always required.
