@@ -39,16 +39,63 @@ const WAL_HEAD_FILENAME: &str = "wal-head-v1";
 const WAL_HEAD_AUTH_DOMAIN: &[u8] = b"mongreldb/wal-head/v1";
 const WAL_HEAD_BODY_LEN: usize = 72;
 const WAL_HEAD_LEN: usize = WAL_HEAD_BODY_LEN + 32;
-/// Upper bound on the durable WAL byte length recovered in one open.
+/// Optional caps on WAL recovery. `None` means unlimited: recovery streams
+/// records and never materializes the whole log as one `Vec`.
 ///
-/// 512 MiB was too small for long-lived encrypted databases whose WAL is
-/// not checkpointed for weeks (a production Roamarr instance needed
-/// ~630 MiB / just over 2e6 records after a cold restart). 2 GiB leaves
-/// headroom without removing the allocation cap.
-const MAX_RECOVERY_WAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Upper bound on WAL records recovered in one open. See
-/// [`MAX_RECOVERY_WAL_BYTES`].
-const MAX_RECOVERY_WAL_RECORDS: usize = 10_000_000;
+/// Set `MONGRELDB_MAX_RECOVERY_WAL_BYTES` / `MONGRELDB_MAX_RECOVERY_WAL_RECORDS`
+/// (or [`crate::OpenOptions`]) to fail closed on a runaway log. `0` and unset
+/// are unlimited. A per-frame 64 MiB cap still treats a garbage length as a
+/// torn write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalReplayLimits {
+    /// Maximum sum of durable WAL segment bytes recovered in one open.
+    pub max_bytes: Option<u64>,
+    /// Maximum number of WAL records recovered in one open.
+    pub max_records: Option<usize>,
+}
+
+impl WalReplayLimits {
+    /// Read optional caps from the process environment.
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            max_bytes: parse_optional_u64_env("MONGRELDB_MAX_RECOVERY_WAL_BYTES")?,
+            max_records: parse_optional_usize_env("MONGRELDB_MAX_RECOVERY_WAL_RECORDS")?,
+        })
+    }
+
+    /// Overlay explicit open-options on top of `self` (typically env defaults).
+    pub fn overlay(self, max_bytes: Option<u64>, max_records: Option<usize>) -> Self {
+        Self {
+            max_bytes: max_bytes.or(self.max_bytes),
+            max_records: max_records.or(self.max_records),
+        }
+    }
+}
+
+fn parse_optional_u64_env(name: &str) -> Result<Option<u64>> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(MongrelError::InvalidArgument(format!("{name}: {error}"))),
+        Ok(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() || raw == "0" {
+                return Ok(None);
+            }
+            raw.parse::<u64>().map(Some).map_err(|error| {
+                MongrelError::InvalidArgument(format!("{name}={raw:?} is not a u64: {error}"))
+            })
+        }
+    }
+}
+
+fn parse_optional_usize_env(name: &str) -> Result<Option<usize>> {
+    match parse_optional_u64_env(name)? {
+        None => Ok(None),
+        Some(value) => usize::try_from(value).map(Some).map_err(|_| {
+            MongrelError::InvalidArgument(format!("{name}={value} does not fit usize"))
+        }),
+    }
+}
 /// Encryption flag stored in reserved[0] of the WAL header.
 const ENC_PLAINTEXT: u8 = 0;
 const ENC_AES_GCM: u8 = 1;
@@ -1120,6 +1167,7 @@ impl WalReader {
         self.replay_with_tail_policy(false)
     }
 
+    #[cfg(test)]
     fn replay_bounded(&mut self, max_records: usize, allow_torn_tail: bool) -> Result<Vec<Record>> {
         let mut out = Vec::new();
         loop {
@@ -1326,7 +1374,7 @@ struct ReplayTxnState {
     terminal: bool,
 }
 
-struct WalLayout {
+pub(crate) struct WalLayout {
     segments: Vec<u64>,
     head: Option<WalHead>,
 }
@@ -1455,6 +1503,39 @@ fn remove_unpublished_header_only_segment(
     Ok(true)
 }
 
+/// Durable identity of a WAL layout. Recovery holds the process lock, so a
+/// matching fingerprint is enough to prove the log did not change between
+/// planning and opening the shared WAL — no second full replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WalLayoutFingerprint {
+    segments: Vec<u64>,
+    head_segment: Option<u64>,
+    durable_len: Option<u64>,
+    open_generation: Option<u64>,
+    prefix_hash: Option<[u8; 32]>,
+}
+
+impl WalLayout {
+    pub(crate) fn fingerprint(&self) -> WalLayoutFingerprint {
+        WalLayoutFingerprint {
+            segments: self.segments.clone(),
+            head_segment: self.head.map(|head| head.segment_no),
+            durable_len: self.head.map(|head| head.durable_len),
+            open_generation: self.head.map(|head| head.open_generation),
+            prefix_hash: self.head.map(|head| head.prefix_hash),
+        }
+    }
+}
+
+/// Values recovered from the first streaming WAL visit so the shared WAL can
+/// open without replaying the log a second time.
+#[derive(Clone, Debug)]
+pub(crate) struct WalOpenContinuation {
+    pub fingerprint: WalLayoutFingerprint,
+    pub last_seq: u64,
+    pub retained_generation: u64,
+}
+
 /// One WAL segment's records as replayed from disk. Provenance is kept
 /// through sequence validation so errors can name the offending segment;
 /// records are flattened for recovery only after validation.
@@ -1503,47 +1584,192 @@ fn validate_v4_sequence_continuity(segments: &[ReplayedSegment]) -> Result<()> {
     Ok(())
 }
 
-fn enforce_recovery_wal_bytes(total_bytes: u64) -> Result<()> {
-    if total_bytes > MAX_RECOVERY_WAL_BYTES {
+fn wal_layout_total_bytes(
+    wal_root: &crate::durable_file::DurableRoot,
+    layout: &WalLayout,
+) -> Result<u64> {
+    layout.segments.iter().try_fold(0_u64, |total, segment_no| {
+        let bytes = if layout
+            .head
+            .is_some_and(|head| head.segment_no == *segment_no)
+        {
+            layout.head.unwrap().durable_len
+        } else {
+            wal_root
+                .open_regular(segment_filename(*segment_no))?
+                .metadata()?
+                .len()
+        };
+        total
+            .checked_add(bytes)
+            .ok_or(MongrelError::ResourceLimitExceeded {
+                resource: "WAL recovery bytes",
+                requested: usize::MAX,
+                limit: usize::MAX,
+            })
+    })
+}
+
+fn enforce_recovery_wal_bytes(total_bytes: u64, max_bytes: Option<u64>) -> Result<()> {
+    let Some(limit) = max_bytes else {
+        return Ok(());
+    };
+    if total_bytes > limit {
         return Err(MongrelError::ResourceLimitExceeded {
             resource: "WAL recovery bytes",
             requested: usize::try_from(total_bytes).unwrap_or(usize::MAX),
-            limit: MAX_RECOVERY_WAL_BYTES as usize,
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
         });
     }
     Ok(())
 }
 
-fn replay_wal_layout(
+#[derive(Default)]
+struct IncrementalSequence {
+    previous: Option<(u64, u64)>,
+}
+
+impl IncrementalSequence {
+    fn push(&mut self, segment_no: u64, record: &Record) -> Result<()> {
+        if let Some((previous_seq, previous_segment)) = self.previous {
+            let expected = previous_seq
+                .checked_add(1)
+                .ok_or_else(|| MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: "WAL sequence overflows after u64::MAX".into(),
+                })?;
+            if record.seq.0 != expected {
+                let reason = if segment_no == previous_segment {
+                    format!(
+                        "WAL segment {} sequence {} does not follow {previous_seq}",
+                        segment_no, record.seq.0
+                    )
+                } else {
+                    format!(
+                        "WAL segment {} begins with sequence {}, expected {expected} after segment {previous_segment}",
+                        segment_no, record.seq.0
+                    )
+                };
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason,
+                });
+            }
+        }
+        self.previous = Some((record.seq.0, segment_no));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct IncrementalFraming {
+    transactions: std::collections::HashMap<u64, ReplayTxnState>,
+    commit_epochs: std::collections::HashMap<u64, u64>,
+    previous_commit_epoch: Option<u64>,
+}
+
+impl IncrementalFraming {
+    fn push(&mut self, record: &Record) -> Result<()> {
+        if record.txn_id == SYSTEM_TXN_ID {
+            if !matches!(record.op, Op::Flush { .. }) {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: "non-system operation uses reserved transaction id 0".into(),
+                });
+            }
+            return Ok(());
+        }
+        let commit_epoch = {
+            let state = self.transactions.entry(record.txn_id).or_default();
+            if state.terminal {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: format!(
+                        "transaction {} has records after its terminal marker",
+                        record.txn_id
+                    ),
+                });
+            }
+            match record.op {
+                Op::CommitTimestamp { .. } => {
+                    if state.timestamp_seen {
+                        return Err(MongrelError::CorruptWal {
+                            offset: record.seq.0,
+                            reason: format!(
+                                "transaction {} has duplicate commit timestamps",
+                                record.txn_id
+                            ),
+                        });
+                    }
+                    state.timestamp_seen = true;
+                    None
+                }
+                Op::TxnCommit { epoch, .. } => Some(epoch),
+                Op::TxnAbort => {
+                    state.terminal = true;
+                    None
+                }
+                Op::Flush { .. } => {
+                    return Err(MongrelError::CorruptWal {
+                        offset: record.seq.0,
+                        reason: format!(
+                            "transaction {} contains a system flush record",
+                            record.txn_id
+                        ),
+                    });
+                }
+                _ => None,
+            }
+        };
+        if let Some(epoch) = commit_epoch {
+            if epoch == 0 {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: format!("transaction {} commits at epoch 0", record.txn_id),
+                });
+            }
+            if let Some(previous) = self.commit_epochs.insert(epoch, record.txn_id) {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: format!(
+                        "transactions {previous} and {} share commit epoch {epoch}",
+                        record.txn_id
+                    ),
+                });
+            }
+            if self
+                .previous_commit_epoch
+                .is_some_and(|previous| epoch <= previous)
+            {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: format!(
+                        "commit epoch {epoch} does not advance beyond {}",
+                        self.previous_commit_epoch.unwrap_or(0)
+                    ),
+                });
+            }
+            self.previous_commit_epoch = Some(epoch);
+            self.transactions.entry(record.txn_id).or_default().terminal = true;
+        }
+        Ok(())
+    }
+}
+
+/// Stream every durable WAL record without collecting the log. Callers that
+/// only need metadata or that apply Puts as they go should use this instead of
+/// [`replay_wal_layout`].
+pub(crate) fn visit_wal_records(
     wal_root: &crate::durable_file::DurableRoot,
     layout: &WalLayout,
     wal_dek: Option<&Zeroizing<[u8; 32]>>,
-) -> Result<Vec<Record>> {
-    let total_bytes = layout
-        .segments
-        .iter()
-        .try_fold(0_u64, |total, segment_no| {
-            let bytes = if layout
-                .head
-                .is_some_and(|head| head.segment_no == *segment_no)
-            {
-                layout.head.unwrap().durable_len
-            } else {
-                wal_root
-                    .open_regular(segment_filename(*segment_no))?
-                    .metadata()?
-                    .len()
-            };
-            total
-                .checked_add(bytes)
-                .ok_or(MongrelError::ResourceLimitExceeded {
-                    resource: "WAL recovery bytes",
-                    requested: usize::MAX,
-                    limit: MAX_RECOVERY_WAL_BYTES as usize,
-                })
-        })?;
-    enforce_recovery_wal_bytes(total_bytes)?;
-    let mut segments = Vec::with_capacity(layout.segments.len());
+    limits: WalReplayLimits,
+    mut visit: impl FnMut(&Record) -> Result<()>,
+) -> Result<()> {
+    let total_bytes = wal_layout_total_bytes(wal_root, layout)?;
+    enforce_recovery_wal_bytes(total_bytes, limits.max_bytes)?;
+    let mut sequence = IncrementalSequence::default();
+    let mut framing = IncrementalFraming::default();
     let mut total_records = 0_usize;
     for segment_no in layout.segments.iter().copied() {
         let mut reader = reader_for_segment(wal_root, segment_no, wal_dek)?;
@@ -1553,23 +1779,56 @@ fn replay_wal_layout(
         {
             reader.constrain_to_durable_len(layout.head.unwrap().durable_len)?;
         }
-        let remaining = MAX_RECOVERY_WAL_RECORDS.saturating_sub(total_records);
-        // Layout validation guarantees a durable WAL head, so the head
-        // segment is constrained to its authenticated prefix and every other
-        // segment must parse completely: no torn tail is admissible.
-        let records = reader.replay_bounded(remaining, false)?;
-        total_records += records.len();
-        segments.push(ReplayedSegment {
-            segment_no,
-            records,
-        });
+        loop {
+            match reader.next_record() {
+                Ok(Some(record)) => {
+                    if let Some(max_records) = limits.max_records {
+                        if total_records >= max_records {
+                            return Err(MongrelError::ResourceLimitExceeded {
+                                resource: "WAL recovery records",
+                                requested: max_records.saturating_add(1),
+                                limit: max_records,
+                            });
+                        }
+                    }
+                    sequence.push(segment_no, &record)?;
+                    framing.push(&record)?;
+                    visit(&record)?;
+                    total_records += 1;
+                }
+                Ok(None) => break,
+                Err(MongrelError::TornWrite { offset }) => {
+                    return Err(MongrelError::CorruptWal {
+                        offset,
+                        reason: "torn tail in a non-final WAL segment".into(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
-    validate_v4_sequence_continuity(&segments)?;
-    let records: Vec<Record> = segments
-        .into_iter()
-        .flat_map(|segment| segment.records)
-        .collect();
-    validate_shared_transaction_framing(&records)?;
+    Ok(())
+}
+
+fn replay_wal_layout(
+    wal_root: &crate::durable_file::DurableRoot,
+    layout: &WalLayout,
+    wal_dek: Option<&Zeroizing<[u8; 32]>>,
+) -> Result<Vec<Record>> {
+    replay_wal_layout_limited(wal_root, layout, wal_dek, WalReplayLimits::from_env()?)
+}
+
+fn replay_wal_layout_limited(
+    wal_root: &crate::durable_file::DurableRoot,
+    layout: &WalLayout,
+    wal_dek: Option<&Zeroizing<[u8; 32]>>,
+    limits: WalReplayLimits,
+) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    visit_wal_records(wal_root, layout, wal_dek, limits, |record| {
+        records.push(record.clone());
+        Ok(())
+    })?;
     Ok(records)
 }
 
@@ -1740,7 +1999,7 @@ impl SharedWal {
         root: Arc<crate::durable_file::DurableRoot>,
         epoch_created: Epoch,
         wal_dek: Option<Zeroizing<[u8; 32]>>,
-        expected_records: Option<&[Record]>,
+        planned: Option<&WalOpenContinuation>,
     ) -> Result<Self> {
         let wal_root =
             Arc::new(
@@ -1753,18 +2012,16 @@ impl SharedWal {
                     })?,
             );
         let wal_dir = wal_root.io_path()?;
-        if let Some(expected) = expected_records {
-            let layout = inspect_wal_layout(&root, &wal_root, wal_dek.as_ref())?;
-            let actual = replay_wal_layout(&wal_root, &layout, wal_dek.as_ref())?;
-            if bincode::serialize(&actual)? != bincode::serialize(expected)? {
+        remove_unpublished_header_only_segment(&root, &wal_root, wal_dek.as_ref())?;
+        let layout = inspect_wal_layout(&root, &wal_root, wal_dek.as_ref())?;
+        if let Some(planned) = planned {
+            if layout.fingerprint() != planned.fingerprint {
                 return Err(MongrelError::CorruptWal {
                     offset: 0,
                     reason: "WAL changed after recovery planning".into(),
                 });
             }
         }
-        remove_unpublished_header_only_segment(&root, &wal_root, wal_dek.as_ref())?;
-        let layout = inspect_wal_layout(&root, &wal_root, wal_dek.as_ref())?;
         let final_segment =
             layout
                 .segments
@@ -1774,18 +2031,28 @@ impl SharedWal {
                     offset: 0,
                     reason: "existing database has no WAL segments".into(),
                 })?;
-        let records = replay_wal_layout(&wal_root, &layout, wal_dek.as_ref())?;
+        let (durable_seq, retained_generation) = if let Some(planned) = planned {
+            (planned.last_seq, planned.retained_generation)
+        } else {
+            let records = replay_wal_layout(&wal_root, &layout, wal_dek.as_ref())?;
+            let generation = records
+                .iter()
+                .filter(|record| record.txn_id != SYSTEM_TXN_ID)
+                .map(|record| record.txn_id >> 32)
+                .max()
+                .unwrap_or(0);
+            (
+                records
+                    .last()
+                    .map(|record| record.seq.0)
+                    .unwrap_or(epoch_created.0),
+                generation,
+            )
+        };
         let open_generation = layout
             .head
             .map(|head| head.open_generation)
-            .unwrap_or_else(|| {
-                records
-                    .iter()
-                    .filter(|record| record.txn_id != SYSTEM_TXN_ID)
-                    .map(|record| record.txn_id >> 32)
-                    .max()
-                    .unwrap_or(0)
-            });
+            .unwrap_or(retained_generation);
 
         // Bytes beyond the authenticated head were never published durable.
         // Truncate that suffix before the file becomes an immutable chain
@@ -1807,12 +2074,6 @@ impl SharedWal {
         let next_segment_no = final_segment
             .checked_add(1)
             .ok_or_else(|| MongrelError::Full("WAL segment namespace exhausted".into()))?;
-        // The new session continues the globally contiguous v4 sequence. Only
-        // a freshly created (record-less) WAL seeds from the creation epoch.
-        let durable_seq = records
-            .last()
-            .map(|record| record.seq.0)
-            .unwrap_or(epoch_created.0);
         let cipher = match &wal_dek {
             Some(dk) => Some(Self::cipher_from_dek(dk)?),
             None => None,
@@ -2158,9 +2419,26 @@ impl SharedWal {
         root: &crate::durable_file::DurableRoot,
         wal_dek: Option<&Zeroizing<[u8; 32]>>,
     ) -> Result<Vec<Record>> {
+        Self::replay_durable_with_dek_limited(root, wal_dek, WalReplayLimits::from_env()?)
+    }
+
+    pub(crate) fn replay_durable_with_dek_limited(
+        root: &crate::durable_file::DurableRoot,
+        wal_dek: Option<&Zeroizing<[u8; 32]>>,
+        limits: WalReplayLimits,
+    ) -> Result<Vec<Record>> {
         let wal_root = root.open_directory("_wal")?;
         let layout = inspect_wal_layout(root, &wal_root, wal_dek)?;
-        replay_wal_layout(&wal_root, &layout, wal_dek)
+        replay_wal_layout_limited(&wal_root, &layout, wal_dek, limits)
+    }
+
+    pub(crate) fn inspect_durable_layout(
+        root: &crate::durable_file::DurableRoot,
+        wal_dek: Option<&Zeroizing<[u8; 32]>>,
+    ) -> Result<(crate::durable_file::DurableRoot, WalLayout)> {
+        let wal_root = root.open_directory("_wal")?;
+        let layout = inspect_wal_layout(root, &wal_root, wal_dek)?;
+        Ok((wal_root, layout))
     }
 
     pub(crate) fn durable_open_generation(
@@ -3234,29 +3512,28 @@ mod tests {
     }
 
     #[test]
-    fn recovery_caps_cover_the_production_wal_that_exceeded_legacy_limits() {
-        // Legacy caps (512 MiB / 2e6 records) rejected a real encrypted
-        // database on open: requested 659_886_506 bytes and then 46_075
-        // records against a remaining 46_074 of the 2e6 record budget.
-        assert!(MAX_RECOVERY_WAL_BYTES >= 2 * 1024 * 1024 * 1024);
-        assert!(MAX_RECOVERY_WAL_RECORDS >= 10_000_000);
-        assert!(MAX_RECOVERY_WAL_BYTES > 659_886_506);
-        assert!(MAX_RECOVERY_WAL_RECORDS > 2_000_000);
+    fn recovery_defaults_are_unlimited() {
+        let limits = WalReplayLimits::default();
+        assert_eq!(limits.max_bytes, None);
+        assert_eq!(limits.max_records, None);
+        enforce_recovery_wal_bytes(659_886_506, None).unwrap();
+        enforce_recovery_wal_bytes(2 * 1024 * 1024 * 1024, None).unwrap();
     }
 
     #[test]
     fn enforce_recovery_wal_bytes_rejects_above_the_cap() {
-        enforce_recovery_wal_bytes(MAX_RECOVERY_WAL_BYTES).unwrap();
-        let err = enforce_recovery_wal_bytes(MAX_RECOVERY_WAL_BYTES + 1).unwrap_err();
+        let limit = 512 * 1024 * 1024;
+        enforce_recovery_wal_bytes(limit, Some(limit)).unwrap();
+        let err = enforce_recovery_wal_bytes(limit + 1, Some(limit)).unwrap_err();
         match err {
             MongrelError::ResourceLimitExceeded {
                 resource,
                 requested,
-                limit,
+                limit: got,
             } => {
                 assert_eq!(resource, "WAL recovery bytes");
-                assert_eq!(requested, (MAX_RECOVERY_WAL_BYTES + 1) as usize);
-                assert_eq!(limit, MAX_RECOVERY_WAL_BYTES as usize);
+                assert_eq!(requested, (limit + 1) as usize);
+                assert_eq!(got, limit as usize);
             }
             other => panic!("unexpected error {other:?}"),
         }

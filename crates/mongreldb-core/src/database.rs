@@ -1793,6 +1793,12 @@ pub struct OpenOptions {
     /// rejects every write with [`MongrelError::ReadOnlyReplica`]. This is the
     /// only way to open a cluster replica outside the cluster node runtime.
     pub offline_validation: bool,
+    /// Optional cap on durable WAL bytes recovered during open. `None` uses
+    /// `MONGRELDB_MAX_RECOVERY_WAL_BYTES` when set, otherwise unlimited.
+    pub max_recovery_wal_bytes: Option<u64>,
+    /// Optional cap on WAL records recovered during open. `None` uses
+    /// `MONGRELDB_MAX_RECOVERY_WAL_RECORDS` when set, otherwise unlimited.
+    pub max_recovery_wal_records: Option<usize>,
 }
 
 impl OpenOptions {
@@ -1819,6 +1825,18 @@ impl OpenOptions {
     /// read-only (the offline backup-validator API of spec section 5.3).
     pub fn with_offline_validation(mut self, offline_validation: bool) -> Self {
         self.offline_validation = offline_validation;
+        self
+    }
+
+    /// Set [`OpenOptions::max_recovery_wal_bytes`].
+    pub fn with_max_recovery_wal_bytes(mut self, bytes: u64) -> Self {
+        self.max_recovery_wal_bytes = Some(bytes);
+        self
+    }
+
+    /// Set [`OpenOptions::max_recovery_wal_records`].
+    pub fn with_max_recovery_wal_records(mut self, records: usize) -> Self {
+        self.max_recovery_wal_records = Some(records);
         self
     }
 }
@@ -1867,6 +1885,7 @@ pub const DEFAULT_TEMP_DISK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(crate) struct CoreResourceConfig {
     pub memory_budget_bytes: u64,
     pub temp_disk_budget_bytes: u64,
+    pub wal_replay_limits: crate::wal::WalReplayLimits,
 }
 
 impl Default for CoreResourceConfig {
@@ -1874,6 +1893,7 @@ impl Default for CoreResourceConfig {
         Self {
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
             temp_disk_budget_bytes: DEFAULT_TEMP_DISK_BUDGET_BYTES,
+            wal_replay_limits: crate::wal::WalReplayLimits::from_env().unwrap_or_default(),
         }
     }
 }
@@ -1887,6 +1907,10 @@ impl CoreResourceConfig {
             temp_disk_budget_bytes: options
                 .temp_disk_budget_bytes
                 .unwrap_or(DEFAULT_TEMP_DISK_BUDGET_BYTES),
+            wal_replay_limits: crate::wal::WalReplayLimits::from_env()?.overlay(
+                options.max_recovery_wal_bytes,
+                options.max_recovery_wal_records,
+            ),
         };
         if config.memory_budget_bytes == 0 {
             return Err(MongrelError::InvalidArgument(
@@ -3288,11 +3312,12 @@ impl Database {
         // CATALOG is only a checkpoint. Authentication must use the
         // authoritative catalog after committed WAL DDL/security replay.
         let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
-        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek(
+        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek_limited(
             lock.durable_root.as_deref().ok_or_else(|| {
                 MongrelError::Other("database root descriptor was not pinned".into())
             })?,
             wal_dek.as_ref(),
+            resources.wal_replay_limits,
         )?;
         recover_ddl_from_records(
             &root,
@@ -3385,11 +3410,12 @@ impl Database {
         // Never verify against a stale checkpoint. A committed password,
         // user, role, or auth-mode change in WAL is authoritative.
         let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
-        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek(
+        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek_limited(
             lock.durable_root.as_deref().ok_or_else(|| {
                 MongrelError::Other("database root descriptor was not pinned".into())
             })?,
             wal_dek.as_ref(),
+            resources.wal_replay_limits,
         )?;
         recover_ddl_from_records(
             &root,
@@ -3637,11 +3663,12 @@ impl Database {
         .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
         let recovery_checkpoint = cat.clone();
         let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
-        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek(
+        let recovery_records = crate::wal::SharedWal::replay_durable_with_dek_limited(
             lock.durable_root.as_deref().ok_or_else(|| {
                 MongrelError::Other("database root descriptor was not pinned".into())
             })?,
             wal_dek.as_ref(),
+            crate::wal::WalReplayLimits::from_env()?,
         )?;
         recover_ddl_from_records(
             &root,
@@ -4054,11 +4081,26 @@ impl Database {
         memory_governor.register_reclaimable(&decoded_cache);
         let commit_lock = Arc::new(Mutex::new(()));
         let shared_wal = Arc::new(Mutex::new(if existing {
+            let (_, layout) =
+                crate::wal::SharedWal::inspect_durable_layout(&durable_root, wal_dek.as_ref())?;
+            let planned = crate::wal::WalOpenContinuation {
+                fingerprint: layout.fingerprint(),
+                last_seq: recovery_records
+                    .last()
+                    .map(|record| record.seq.0)
+                    .unwrap_or(cat.db_epoch),
+                retained_generation: recovery_records
+                    .iter()
+                    .filter(|record| record.txn_id != crate::wal::SYSTEM_TXN_ID)
+                    .map(|record| record.txn_id >> 32)
+                    .max()
+                    .unwrap_or(0),
+            };
             crate::wal::SharedWal::open_durable_root_validated(
                 Arc::clone(&durable_root),
                 Epoch(cat.db_epoch),
                 wal_dek.clone(),
-                Some(&recovery_records),
+                Some(&planned),
             )?
         } else {
             crate::wal::SharedWal::create_with_durable_root(
@@ -18505,7 +18547,11 @@ fn recover_ddl_from_wal(
 ) -> Result<()> {
     use crate::wal::SharedWal;
     let records = match durable_root {
-        Some(root) => SharedWal::replay_durable_with_dek(root, wal_dek)?,
+        Some(root) => SharedWal::replay_durable_with_dek_limited(
+            root,
+            wal_dek,
+            crate::wal::WalReplayLimits::from_env()?,
+        )?,
         None => SharedWal::replay_with_dek(root, wal_dek)?,
     };
     recover_ddl_from_records(

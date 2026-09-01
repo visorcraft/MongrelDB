@@ -1258,6 +1258,7 @@ fn should_parse(sql: &str) -> bool {
             | "release"
             | "analyze"
             | "vacuum"
+            | "checkpoint"
     )
 }
 
@@ -1822,6 +1823,13 @@ fn try_manual_command_body(
 
     if lower == "compact" || lower == "compact database" || lower == "vacuum" {
         compact_all(session, db, query)?;
+        session.clear_cache();
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower == "checkpoint" {
+        require_ddl(session, db)?;
+        db.checkpoint().map_err(MongrelQueryError::from)?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }

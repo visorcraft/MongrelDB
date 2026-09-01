@@ -2,7 +2,7 @@
 //! B1 — mounted tables route every write through that one shared WAL.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
-use mongreldb_core::{Database, Epoch, Op, SharedWal, Value};
+use mongreldb_core::{Database, Epoch, MongrelError, Op, OpenOptions, SharedWal, Value};
 use tempfile::tempdir;
 
 fn one_int_schema() -> Schema {
@@ -58,6 +58,32 @@ fn single_table_put_commit_recovers_from_shared_wal() {
     }
     let db = Database::open(dir.path()).unwrap();
     assert_eq!(db.table("t").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn open_honors_optional_recovery_byte_cap() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", one_int_schema()).unwrap();
+        let t = db.table("t").unwrap();
+        {
+            let mut g = t.lock();
+            g.put(vec![(1, Value::Int64(7))]).unwrap();
+            g.commit().unwrap();
+        }
+    }
+    let err = Database::open_with_options(
+        dir.path(),
+        OpenOptions::default().with_max_recovery_wal_bytes(1),
+    )
+    .unwrap_err();
+    match err {
+        MongrelError::ResourceLimitExceeded { resource, .. } => {
+            assert_eq!(resource, "WAL recovery bytes");
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
 }
 
 #[test]

@@ -608,6 +608,11 @@ export declare class Database {
    * if skipped (fewer than two runs).
    */
   compactTable(name: string): boolean
+  /**
+   * Flush every table, compact, and drop rotated WAL segments so recovery
+   * only has a small active segment to replay.
+   */
+  checkpoint(): void
   /** Return the path passed to `withPath` / `open`. */
   directory(): string
   /**

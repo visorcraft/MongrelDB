@@ -247,7 +247,9 @@ pub use trigger::{
     TriggerTiming, TriggerValue,
 };
 pub use txn::{IsolationLevel, OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
-pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
+pub use wal::{
+    AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, WalReplayLimits, SYSTEM_TXN_ID,
+};
 
 pub use encryption::{AesCipher, ColumnKeyDescriptor, EncryptionDescriptor, Kek};
 pub use result_cache::{

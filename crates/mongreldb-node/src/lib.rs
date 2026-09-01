@@ -2850,6 +2850,13 @@ impl Database {
         self.core()?.compact_table(&name).map_err(to_napi)
     }
 
+    /// Flush every table, compact, and drop rotated WAL segments so recovery
+    /// only has a small active segment to replay.
+    #[napi]
+    pub fn checkpoint(&self) -> napi::Result<()> {
+        self.core()?.checkpoint().map_err(to_napi)
+    }
+
     /// Return the path passed to `withPath` / `open`.
     #[napi]
     pub fn directory(&self) -> String {
