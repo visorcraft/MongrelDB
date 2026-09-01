@@ -39,8 +39,16 @@ const WAL_HEAD_FILENAME: &str = "wal-head-v1";
 const WAL_HEAD_AUTH_DOMAIN: &[u8] = b"mongreldb/wal-head/v1";
 const WAL_HEAD_BODY_LEN: usize = 72;
 const WAL_HEAD_LEN: usize = WAL_HEAD_BODY_LEN + 32;
-const MAX_RECOVERY_WAL_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_RECOVERY_WAL_RECORDS: usize = 2_000_000;
+/// Upper bound on the durable WAL byte length recovered in one open.
+///
+/// 512 MiB was too small for long-lived encrypted databases whose WAL is
+/// not checkpointed for weeks (a production Roamarr instance needed
+/// ~630 MiB / just over 2e6 records after a cold restart). 2 GiB leaves
+/// headroom without removing the allocation cap.
+const MAX_RECOVERY_WAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Upper bound on WAL records recovered in one open. See
+/// [`MAX_RECOVERY_WAL_BYTES`].
+const MAX_RECOVERY_WAL_RECORDS: usize = 10_000_000;
 /// Encryption flag stored in reserved[0] of the WAL header.
 const ENC_PLAINTEXT: u8 = 0;
 const ENC_AES_GCM: u8 = 1;
@@ -1495,6 +1503,17 @@ fn validate_v4_sequence_continuity(segments: &[ReplayedSegment]) -> Result<()> {
     Ok(())
 }
 
+fn enforce_recovery_wal_bytes(total_bytes: u64) -> Result<()> {
+    if total_bytes > MAX_RECOVERY_WAL_BYTES {
+        return Err(MongrelError::ResourceLimitExceeded {
+            resource: "WAL recovery bytes",
+            requested: usize::try_from(total_bytes).unwrap_or(usize::MAX),
+            limit: MAX_RECOVERY_WAL_BYTES as usize,
+        });
+    }
+    Ok(())
+}
+
 fn replay_wal_layout(
     wal_root: &crate::durable_file::DurableRoot,
     layout: &WalLayout,
@@ -1523,13 +1542,7 @@ fn replay_wal_layout(
                     limit: MAX_RECOVERY_WAL_BYTES as usize,
                 })
         })?;
-    if total_bytes > MAX_RECOVERY_WAL_BYTES {
-        return Err(MongrelError::ResourceLimitExceeded {
-            resource: "WAL recovery bytes",
-            requested: usize::try_from(total_bytes).unwrap_or(usize::MAX),
-            limit: MAX_RECOVERY_WAL_BYTES as usize,
-        });
-    }
+    enforce_recovery_wal_bytes(total_bytes)?;
     let mut segments = Vec::with_capacity(layout.segments.len());
     let mut total_records = 0_usize;
     for segment_no in layout.segments.iter().copied() {
@@ -3218,5 +3231,75 @@ mod tests {
         // Deterministic: identical positions produce identical nonces. Segment
         // paths are create-new and never reused.
         assert_eq!(frame_nonce_for(5, 0), frame_nonce_for(5, 0));
+    }
+
+    #[test]
+    fn recovery_caps_cover_the_production_wal_that_exceeded_legacy_limits() {
+        // Legacy caps (512 MiB / 2e6 records) rejected a real encrypted
+        // database on open: requested 659_886_506 bytes and then 46_075
+        // records against a remaining 46_074 of the 2e6 record budget.
+        assert!(MAX_RECOVERY_WAL_BYTES >= 2 * 1024 * 1024 * 1024);
+        assert!(MAX_RECOVERY_WAL_RECORDS >= 10_000_000);
+        assert!(MAX_RECOVERY_WAL_BYTES > 659_886_506);
+        assert!(MAX_RECOVERY_WAL_RECORDS > 2_000_000);
+    }
+
+    #[test]
+    fn enforce_recovery_wal_bytes_rejects_above_the_cap() {
+        enforce_recovery_wal_bytes(MAX_RECOVERY_WAL_BYTES).unwrap();
+        let err = enforce_recovery_wal_bytes(MAX_RECOVERY_WAL_BYTES + 1).unwrap_err();
+        match err {
+            MongrelError::ResourceLimitExceeded {
+                resource,
+                requested,
+                limit,
+            } => {
+                assert_eq!(resource, "WAL recovery bytes");
+                assert_eq!(requested, (MAX_RECOVERY_WAL_BYTES + 1) as usize);
+                assert_eq!(limit, MAX_RECOVERY_WAL_BYTES as usize);
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_bounded_rejects_when_the_record_cap_is_exceeded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seg-000000.wal");
+        let mut wal = Wal::create(&path, Epoch(0)).unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![1],
+            },
+        )
+        .unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![2],
+            },
+        )
+        .unwrap();
+        wal.sync().unwrap();
+
+        let err = WalReader::open(&path)
+            .unwrap()
+            .replay_bounded(1, true)
+            .unwrap_err();
+        match err {
+            MongrelError::ResourceLimitExceeded {
+                resource,
+                requested,
+                limit,
+            } => {
+                assert_eq!(resource, "WAL recovery records");
+                assert_eq!(requested, 2);
+                assert_eq!(limit, 1);
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 }
