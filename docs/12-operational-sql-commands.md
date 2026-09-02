@@ -43,7 +43,7 @@ Read-only PRAGMAs return compatibility-shaped Arrow batches:
 | `PRAGMA defer_foreign_keys` | Returns `0`; constraints are validated at commit |
 | `PRAGMA recursive_triggers` | Returns or sets recursive trigger firing (`0` by default) |
 | `PRAGMA trusted_schema` | Returns `0` |
-| `PRAGMA wal_checkpoint` | Flushes live tables, runs GC, and returns `busy`, `log`, `checkpointed` |
+| `PRAGMA wal_checkpoint` | Flushes live tables, runs GC, and returns a SQLite-shaped `busy`, `log`, `checkpointed` row |
 | `PRAGMA optimize` | Ensures indexes are complete and clears stale SQL caches |
 
 `user_version` and `application_id` can be assigned with `PRAGMA name = integer`
@@ -74,7 +74,18 @@ and runs garbage collection. `REINDEX table_name` compacts that table.
 
 `VACUUM` compacts all tables, runs garbage collection, and clears SQL caches.
 It is equivalent to the existing maintenance path exposed through Rust, Node,
-HTTP, and the CLI.
+HTTP, and the CLI. Compaction plus GC does **not** rotate the WAL. Mutable-run
+data still pins WAL segments, so a large `wal/` directory can survive `VACUUM`.
+To force-flush the mutable-run tier, compact, and replace the WAL with a fresh
+empty active segment, call the engine API `Database::checkpoint()` (Node/Kit:
+`db.checkpoint()`). There is no SQL `CHECKPOINT` statement.
+
+`PRAGMA wal_checkpoint` is the SQL compatibility entry: it flushes each live
+table, runs GC, and returns one row with `busy`, `log`, and `checkpointed`
+(currently `0`, `0`, `0` — the columns exist for SQLite-shaped tooling). It is
+not the same as `Database::checkpoint()` and does not publish a new empty WAL
+segment. See [Maintenance & Operations](09-maintenance.md) for when to use
+each.
 
 `VACUUM INTO` first performs the same compaction and GC, then copies the database
 directory to a new target directory. The target must not already exist and must

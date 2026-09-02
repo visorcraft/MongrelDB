@@ -373,6 +373,21 @@ For the HTTP daemon, start with `--auth-token <token>` (Bearer),
 `--auth-users` (HTTP Basic against catalog users), or both. See
 **[Daemon Mode](08-daemon.md#authentication)**.
 
+## Maintenance
+
+```javascript
+db.compactAll();     // merge sorted runs; { compacted, skipped }
+db.compactTable('users');
+db.checkpoint();     // flush, compact, and replace the WAL (0.64.18+)
+```
+
+`checkpoint()` is the operation that bounds WAL recovery. `compactAll()`
+alone does not drop WAL segments that still cover mutable-run data. Recovery
+on open is unlimited by default; to fail closed on a runaway log, set
+`MONGRELDB_MAX_RECOVERY_WAL_BYTES` and/or `MONGRELDB_MAX_RECOVERY_WAL_RECORDS`
+in the process environment before `Database.open` (`0` or unset = unlimited).
+See [Maintenance & Operations](09-maintenance.md).
+
 ## Closing
 
 ```javascript

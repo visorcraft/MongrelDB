@@ -897,7 +897,12 @@ curl -X POST http://127.0.0.1:8453/tables/events/compact
 ```
 
 The daemon also runs a **background auto-compactor** that sweeps every
-30 seconds and merges any table with 8+ sorted runs.
+30 seconds and merges any table with 8+ sorted runs. Auto-compaction does
+**not** reset the WAL. There is no HTTP `/checkpoint` route. `PRAGMA
+wal_checkpoint` over the SQL endpoint flushes tables and runs GC; it does
+not publish a fresh empty WAL. To shrink recovery, stop the daemon and run
+`Database::checkpoint()` / `mongreldb-kit checkpoint` against the data
+directory. See [Maintenance & Operations](09-maintenance.md).
 
 ## Change Data Capture (NOTIFY / LISTEN)
 

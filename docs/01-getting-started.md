@@ -145,14 +145,18 @@ a unique `RowId` - an internal ID assigned by the database.
 When you write or update a row, MongrelDB doesn't modify the old data in place.
 Instead, it appends the new version to a write-ahead log (WAL). This is what
 makes writes so fast - there's no random-access disk I/O, just sequential
-appends. Old data gets cleaned up later during a process called compaction.
+appends. Old data gets cleaned up later during compaction. On the next open,
+MongrelDB streams the WAL and replays committed records; that recovery has no
+default size cap. See [Maintenance & Operations](09-maintenance.md) for
+checkpoint (the way to shrink the log) and optional recovery limits.
 
 ### Commits
 
 After calling `put()` or `delete()`, your changes are in memory but not yet
 guaranteed to survive a crash. Calling `commit()` flushes the WAL to disk with
 `fsync`. You can also call `flush()`, which commits and then moves data from the
-WAL into the columnar storage format.
+memtable toward columnar storage. Flush alone does not always drop WAL
+segments; use `checkpoint()` when you need a small recovery log.
 
 ### Snapshots
 

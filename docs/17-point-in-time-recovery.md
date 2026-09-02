@@ -5,6 +5,11 @@ backup with transaction-complete logical WAL chunks. Applications can restore
 the latest archived state, a committed epoch, the last commit at or before a
 timestamp, an exact transaction ID, or a WAL log position.
 
+PITR archives are not the same as startup WAL replay. Opening a database
+streams the live `wal/` directory with no default size cap; optional caps and
+`Database::checkpoint()` are documented in
+[Maintenance & Operations](09-maintenance.md).
+
 ## Create and update an archive
 
 ```rust

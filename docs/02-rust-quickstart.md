@@ -412,3 +412,25 @@ let db = Database::open_with_options("./mydb", opts)?;
 
 Backoff schedule: 1ms → 10ms → 50ms, capped at `lock_timeout_ms`. Set `0` to
 keep the fail-fast default.
+
+### WAL recovery limits
+
+Open streams the write-ahead log. There is no default byte or record cap.
+Optional caps fail closed on a runaway log; `0` and unset mean unlimited.
+`OpenOptions` overrides `MONGRELDB_MAX_RECOVERY_WAL_BYTES` /
+`MONGRELDB_MAX_RECOVERY_WAL_RECORDS` when set.
+
+```rust
+use mongreldb_core::{Database, OpenOptions};
+
+let opts = OpenOptions::default()
+    .with_lock_timeout_ms(5_000)
+    .with_max_recovery_wal_bytes(2 * 1024 * 1024 * 1024)
+    .with_max_recovery_wal_records(10_000_000);
+let db = Database::open_with_options("./mydb", opts)?;
+```
+
+A cap that is exceeded returns `MongrelError::ResourceLimitExceeded`. Call
+`db.checkpoint()` while the database is open to flush, compact, and drop
+rotated WAL segments so the next open has only a small active segment to
+replay. Details: [Maintenance & Operations](09-maintenance.md).

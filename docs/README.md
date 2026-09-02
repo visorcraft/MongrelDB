@@ -28,13 +28,14 @@ vector similarity, range queries, and more.
 8. **[Daemon Mode](08-daemon.md)** - running `mongreldb-server` for
    multi-process access over HTTP
 9. **[Maintenance & Operations](09-maintenance.md)** - compaction,
-   flush-on-close, cron jobs, GC
+   flush-on-close, checkpoint, WAL recovery, cron jobs, GC
 10. **[Stored Procedures](10-stored-procedures.md)** - catalog-backed routines
     callable from SQL, HTTP, NAPI, and Kit clients
 11. **[Extended SQL Functions](11-extended-sql-functions.md)** - built-in
     date/time, JSON, string, math, and custom function hooks
 12. **[Operational SQL Commands](12-operational-sql-commands.md)** -
-    PRAGMA introspection, ANALYZE, REINDEX, VACUUM, and EXPLAIN QUERY PLAN
+    PRAGMA introspection, ANALYZE, REINDEX, VACUUM, WAL checkpoint, and
+    EXPLAIN QUERY PLAN
 13. **[Triggers & External Tables](13-triggers-and-external-table-modules.md)** -
     current trigger behavior and built-in or app-provided virtual tables
 14. **[Users, Roles & Permissions](14-auth.md)** - catalog-stored users with
