@@ -46,16 +46,11 @@ fn check_reports_missing_run_file() {
     db.table("t").unwrap().lock().flush().unwrap();
 
     let table_id = db.table_id("t").unwrap();
-    let tdir = dir.path().join("tables").join(table_id.to_string());
 
-    // Find and delete a run file.
-    let runs_dir = tdir.join("_runs");
-    if let Ok(entries) = std::fs::read_dir(&runs_dir) {
-        let run_files: Vec<_> = entries.flatten().collect();
-        if let Some(first) = run_files.first() {
-            std::fs::remove_file(first.path()).unwrap();
-        }
-    }
+    // Find and delete a run file. Filter to `.sr`: `_runs` also holds
+    // non-run entries (e.g. `directory.shard-*-open` lookup-directory
+    // markers), and readdir order is filesystem-dependent.
+    std::fs::remove_file(first_run_path(dir.path(), table_id)).unwrap();
 
     // check() should report the missing run.
     let issues = db.check();

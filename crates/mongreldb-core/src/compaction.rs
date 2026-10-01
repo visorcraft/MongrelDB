@@ -176,6 +176,23 @@ impl Table {
     {
         control.checkpoint()?;
         let maintenance_epoch = self.current_epoch();
+        // The merge below makes every mutable-run row durable in the
+        // replacement run, and publishing advances the WAL replay gate
+        // (`flushed_epoch`) to `maintenance_epoch` so replay does not
+        // re-apply (and double-index) those rows. The gate is a single epoch,
+        // so both steps are only safe once every committed row is inside the
+        // merge input. When no mutations are pending, every memtable row is
+        // committed: drain them into the mutable run so the input is complete
+        // (a committed row's stamp never exceeds the visible watermark).
+        // When mutations ARE pending, committed and uncommitted rows may
+        // interleave in the memtable — on a mounted table the shared epoch
+        // authority can advance past a pending row's stamp — so the merge
+        // must exclude both in-memory tiers and the gate must stay put:
+        // nothing beyond it may become run-resident.
+        let pending_uncommitted = self.has_pending_mutations();
+        if !pending_uncommitted {
+            self.drain_committed_memtable_rows(maintenance_epoch);
+        }
         let reclaim_ttl = self.ttl().is_some() && self.has_expired_run_rows_inner(Some(control))?;
         if self.run_refs().len() < 2 && !reclaim_ttl {
             return Ok((false, None));
@@ -183,7 +200,7 @@ impl Table {
         let min_active = self.min_active_snapshot();
         let old_refs: Vec<RunRef> = self.run_refs().to_vec();
         let now_nanos = crate::engine::unix_nanos_now();
-        let mutable_rows = if self.mutable_run_len() > 0 {
+        let mutable_rows = if !pending_uncommitted && self.mutable_run_len() > 0 {
             self.snapshot_mutable_run()
         } else {
             Vec::new()
@@ -333,7 +350,7 @@ impl Table {
             None
         };
 
-        if self.mutable_run_len() > 0 {
+        if !pending_uncommitted && self.mutable_run_len() > 0 {
             self.drain_mutable_run();
         }
         self.live_count = current_live_count;
@@ -355,7 +372,21 @@ impl Table {
         // the old epoch stamped here could make reopen accept indexes for the
         // superseded runs.
         self.prepare_indexes_for_run_replacement();
-        if let Err(error) = self.persist_manifest(maintenance_epoch) {
+        // The replacement run now carries every committed row at or below
+        // `maintenance_epoch` (the merge input above covers all runs, the
+        // drained mutable run, and the committed memtable rows drained at the
+        // start) — but only when no mutations were pending; otherwise the
+        // in-memory tiers stayed out of the merge and the gate must not move.
+        // Advance the WAL replay gate past the merged content — before the
+        // manifest makes the new topology durable — so reopen does not
+        // re-apply and double-index rows that are already run-resident.
+        // Read-only replicas never replay a WAL, so there is no gate to move.
+        if let Err(error) = (|| {
+            if !pending_uncommitted && !self.wal_is_read_only() {
+                self.mark_flushed(maintenance_epoch)?;
+            }
+            self.persist_manifest(maintenance_epoch)
+        })() {
             self.poison_after_maintenance_publish_failure();
             return Err(MongrelError::CommitOutcomeUnknown {
                 epoch: maintenance_epoch.0,
@@ -582,6 +613,103 @@ mod tests {
                 .and_then(|row| row.columns.get(&1).cloned()),
             None
         );
+    }
+
+    /// Schema with a Sparse secondary index on a bincode-packed
+    /// `Vec<(u32, f32)>` Bytes column (the engine's sparse wire format).
+    fn sparse_schema() -> Schema {
+        Schema {
+            schema_id: 1,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "v".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "terms".into(),
+                    ty: TypeId::Bytes,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            indexes: vec![crate::schema::IndexDef {
+                name: "terms_sparse".into(),
+                column_id: 2,
+                kind: crate::schema::IndexKind::Sparse,
+                predicate: None,
+                options: Default::default(),
+            }],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        }
+    }
+
+    #[test]
+    fn compaction_advances_wal_gate_over_merged_mutable_run_content() {
+        // Regression: compaction makes mutable-run content durable in the
+        // replacement run; without advancing the WAL replay gate
+        // (`flushed_epoch`) to match, the next open replayed those commits and
+        // re-indexed rows that were already run-resident — Sparse dot-product
+        // scores double-counted (2×) after close+reopen.
+        let dir = tempdir().unwrap();
+        let mut db = Table::create(dir.path(), sparse_schema(), 1).unwrap();
+        let pack = |terms: &[(u32, f32)]| Value::Bytes(bincode::serialize(terms).unwrap());
+        // Two spilled runs so compaction really merges.
+        db.set_mutable_run_spill_bytes(1);
+        db.put(vec![(1, Value::Int64(1)), (2, pack(&[(1, 1.0)]))])
+            .unwrap();
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.put(vec![(1, Value::Int64(2)), (2, pack(&[(1, 0.5)]))])
+            .unwrap();
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.run_count(), 2);
+
+        // A third committed row that never reaches a sorted run before the
+        // compaction: with the watermark raised, `flush` only drains the
+        // memtable into the in-memory mutable run.
+        db.set_mutable_run_spill_bytes(u64::MAX);
+        let rid_c = db
+            .put(vec![(1, Value::Int64(3)), (2, pack(&[(1, 2.0)]))])
+            .unwrap();
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.run_count(), 2, "no spill past the raised watermark");
+
+        // The merge carries rid_c; the WAL gate must cover it afterwards.
+        db.compact().unwrap();
+        assert_eq!(db.run_count(), 1);
+        db.close().unwrap(); // memtable and mutable run are empty: no flush
+        let mut db = Table::open(dir.path()).unwrap();
+
+        let hits = db
+            .retrieve_at(
+                &crate::query::Retriever::Sparse {
+                    column_id: 2,
+                    query: vec![(1u32, 1.0)],
+                    k: 10,
+                },
+                db.snapshot(),
+                None,
+            )
+            .unwrap();
+        let by_rid: std::collections::HashMap<u64, f64> = hits
+            .into_iter()
+            .map(|h| match h.score {
+                crate::query::RetrieverScore::SparseDotProduct(d) => (h.row_id.0, d),
+                _ => (h.row_id.0, f64::NAN),
+            })
+            .collect();
+        assert_eq!(by_rid.len(), 3, "each row indexed exactly once: {by_rid:?}");
+        assert_eq!(by_rid[&rid_c.0], 2.0, "replayed rid would score 4.0");
     }
 
     #[test]

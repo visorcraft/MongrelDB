@@ -341,7 +341,7 @@ configuration, not a claim that every production corpus has identical recall.
 | ANN HNSW Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
 | ANN DiskANN Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
 | ANN IVF Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.85 |
-| ANN Product Quantization | Approximate, including reconstructed-vector rerank | Smaller distance, then `RowId` | Rerank candidates may be capped; cap hit must be traced | Bounded scan and rerank; exhaustion must be explicit | 0.80 with rerank |
+| ANN Product Quantization | Approximate, including reconstructed-vector rerank | Smaller distance, then `RowId` (exact-distance ties may substitute across layers) | Rerank candidates may be capped; cap hit must be traced | Bounded scan and rerank; exhaustion must be explicit | 0.80 with rerank |
 
 ### Per-family recall floors
 
@@ -356,7 +356,7 @@ configuration, not a claim that every production corpus has identical recall.
 - **ANN HNSW Dense:** 0.90.
 - **ANN DiskANN Dense:** 0.90.
 - **ANN IVF Dense:** 0.85.
-- **ANN Product Quantization:** 0.80 with rerank.
+- **ANN Product Quantization:** 0.80 with rerank, tie-tolerant on exact-duplicate rows (per-layer codebooks may order distance-tied duplicates differently; a returned row at the same exact distance substitutes freely).
 
 ### MinHash recall floor
 
@@ -364,7 +364,10 @@ configuration, not a claim that every production corpus has identical recall.
 `crates/mongreldb-core/tests/index_churn_oracle.rs`) is **0.80**. It is
 enforced as the *median* tie-tolerant recall across every checkpoint of a
 500-operation churn run, with an additional per-checkpoint guard that
-recall never collapses to zero on a non-empty oracle answer. Measured
+recall never collapses to zero when the best exact match is strong
+(Jaccard ≥ 0.5, where band sharing is near-certain); a checkpoint whose
+only expected rows are marginal (J < 0.5) may deterministically miss every
+band, which is documented LSH candidate behavior, not an engine collapse. Measured
 healthy recall on the deterministic corpus (128-permutation signatures,
 32 LSH bands, near-duplicate-heavy corpus, 500 operations per seed) is a
 **median of 1.0 on every seed of the CI matrix (1-8)**; individual
@@ -443,7 +446,8 @@ including when the weekly profile would otherwise imply it:
   hard candidate cap binds on the ANN retrieval path only: Sparse and
   MinHash still run the probe (their paths accept the constrained
   execution context) and FM/LearnedRange keep the delete-based pressure
-  op, because the exact query path exposes no candidate cap.
+  op, because the exact query path exposes no candidate cap. The probe's
+  cap-hit assertion applies only to the ANN families that enforce the cap.
 - `MONGRELDB_ORACLE_WORK_BUDGET_PRESSURE`: `"1"` adds a work-budget probe:
   a zero-budget retrieval must fail explicitly with `WorkBudgetExceeded`
   (or charge nothing on an empty index), and a generous budget must
@@ -472,13 +476,19 @@ including when the weekly profile would otherwise imply it:
   and the panic context into `<dir>/<family>-seed-<seed>/` before
   re-raising the panic.
 
-Known oracle limitation: compaction physically reclaims TTL-expired rows,
-while the oracle model treats TTL as a query-time filter that `clear_ttl`
-reverses. The harness therefore asserts TTL-adjacent properties
-directionally (the auth allowed-set check is subset-based: the engine must
-never return a row outside the allowed set, but a legitimately reclaimed
-row may be absent), matching the long-standing soft final-consistency
-check.
+Known oracle alignment notes: the harness force-flushes before every
+compaction op (the engine reclaims TTL-expired rows only when a real
+compaction merges sorted runs) and flushes before pinning a snapshot (the
+engine's `pin_snapshot` pins the committed watermark, so uncommitted writes
+are correctly invisible to it). Compaction drops TTL-expired versions even
+when a pin holds them, and the model mirrors that: expired rows are never
+pin-shielded on either side, and `clear_ttl` resurrects only rows that were
+never physically reclaimed. The auth allowed-set check remains subset-based
+(the engine must never return a row outside the allowed set; a legitimately
+reclaimed row may be absent). MinHash checkpoints tolerate LSH
+candidate-miss underfill (documented candidate semantics); the PQ recall
+gate accepts exact-distance tie substitutes because per-layer codebooks
+legitimately reorder exact-duplicate rows.
 
 ## Choosing the Right Index
 

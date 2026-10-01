@@ -6523,7 +6523,7 @@ impl Table {
         outcome
     }
 
-    fn has_pending_mutations(&self) -> bool {
+    pub(crate) fn has_pending_mutations(&self) -> bool {
         self.pending_private_mutations
             || !self.pending_rows.is_empty()
             || !self.pending_dels.is_empty()
@@ -6577,7 +6577,41 @@ impl Table {
     /// shared WAL is never rotated per-table; recovery skips its already-flushed
     /// records via the manifest `flushed_epoch` gate, and segment GC (B3c) reaps
     /// them once every table has flushed past them.
-    fn mark_flushed(&mut self, epoch: Epoch) -> Result<()> {
+    /// True when this table has no WAL replay gate to advance (read-only
+    /// replica sink). Compaction consults this before advancing
+    /// `flushed_epoch`.
+    pub(crate) fn wal_is_read_only(&self) -> bool {
+        matches!(self.wal, WalSink::ReadOnly)
+    }
+
+    /// Move committed memtable rows (committed at or below `epoch`) into the
+    /// mutable run, leaving pending, uncommitted rows (which sit at
+    /// `pending_epoch = visible + 1`) in the memtable. Compaction calls this
+    /// before snapshotting the merge input so publishing can advance the WAL
+    /// replay gate without stranding committed rows outside the runs.
+    pub(crate) fn drain_committed_memtable_rows(&mut self, epoch: Epoch) {
+        if self.memtable_len() == 0 {
+            return;
+        }
+        let rows = self.memtable.drain_sorted();
+        let mut pending = Vec::new();
+        let mut committed = Vec::new();
+        for row in rows {
+            if row.committed_epoch > epoch {
+                pending.push(row);
+            } else {
+                committed.push(row);
+            }
+        }
+        if !committed.is_empty() {
+            self.mutable_run.insert_many(committed);
+        }
+        for row in pending {
+            self.memtable.upsert(row);
+        }
+    }
+
+    pub(crate) fn mark_flushed(&mut self, epoch: Epoch) -> Result<()> {
         let op = Op::Flush {
             table_id: self.table_id,
             flushed_epoch: epoch.0,
@@ -7052,6 +7086,16 @@ impl Table {
         // Never persist an incomplete index set (e.g. after bulk_load_columns,
         // which bypasses per-row indexing) — reopen rebuilds from the runs.
         if !self.indexes_complete {
+            return;
+        }
+        // The reopen replay gate is the manifest's `flushed_epoch`: every
+        // commit past it is re-applied (and re-indexed) from the WAL on open.
+        // The live index maps also cover committed-but-unflushed rows
+        // (memtable / mutable-run content), so a checkpoint stamped past
+        // `flushed_epoch` would make replay double-index those rows (Sparse
+        // dot-product scores double-count; ANN graphs gain duplicate nodes).
+        // Only persist an image whose content is fully behind the gate.
+        if epoch.0 > self.flushed_epoch {
             return;
         }
         // FND-006: a fired fault behaves like a failed checkpoint — the write

@@ -284,11 +284,37 @@ fn kmeans_train(
     // sample (keeps the codebook well-defined for tiny training sets).
     let effective_k = k.min(samples.len().max(1));
     let mut centroids = vec![0.0f32; k * dim];
-    // Seed centroids by striding through the samples at a seed-derived offset.
+    // Low-cardinality inputs must be encoded exactly: when the distinct
+    // subvector values fit the centroid budget, seed one centroid per distinct
+    // value. Stride-seeding the raw (duplicate-heavy) sample list can leave a
+    // distinct value without any seed, and Lloyd iterations never split a
+    // cluster — the value is then permanently merged into a neighbor's
+    // centroid, tying distinct distance classes under ADC and collapsing
+    // top-k ranking on clustered corpora. Above the budget, keep the
+    // density-weighted stride seeding.
+    let mut distinct: Vec<&[f32]> = Vec::new();
+    {
+        let mut seen = std::collections::BTreeMap::new();
+        for sample in samples {
+            let key: Vec<u32> = sample.iter().map(|v| v.to_bits()).collect();
+            if seen.insert(key, *sample).is_none() {
+                distinct.push(sample);
+            }
+        }
+    }
     let start = (splitmix64(seed.wrapping_add(salt)) as usize) % samples.len().max(1);
-    for c in 0..effective_k {
-        let src = samples[(start + c * (samples.len() / effective_k).max(1)) % samples.len()];
-        centroids[c * dim..(c + 1) * dim].copy_from_slice(src);
+    if distinct.len() <= effective_k {
+        let offset = start % distinct.len().max(1);
+        for c in 0..effective_k {
+            let src = distinct[(offset + c) % distinct.len()];
+            centroids[c * dim..(c + 1) * dim].copy_from_slice(src);
+        }
+    } else {
+        // Seed centroids by striding through the samples at a seed-derived offset.
+        for c in 0..effective_k {
+            let src = samples[(start + c * (samples.len() / effective_k).max(1)) % samples.len()];
+            centroids[c * dim..(c + 1) * dim].copy_from_slice(src);
+        }
     }
     // Fill any remaining centroids (k > samples) with zeros so the codebook
     // is fully populated; they will never be the nearest centroid.
@@ -530,5 +556,44 @@ mod tests {
         let pq = ProductQuantizer::train(dim, 2, 8, &refs, &options(5)).unwrap();
         let code = pq.encode(&data[0]);
         assert_eq!(code.len(), 2);
+    }
+
+    #[test]
+    fn distinct_values_within_centroid_budget_encode_exactly() {
+        // Duplicate-heavy corpus with fewer distinct subvector values than
+        // centroids: stride seeding over raw samples can leave a distinct
+        // value unseeded, and Lloyd never splits clusters, so the value would
+        // be permanently merged into a neighbor's centroid (tying distinct
+        // distance classes under ADC). Seeding from the distinct set must
+        // instead encode every value exactly.
+        let dim = 4;
+        let mut data: Vec<Vec<f32>> = Vec::new();
+        for i in 0..40 {
+            let v = vec![1.0, 0.80 + i as f32 * 0.004, 0.0, 0.0];
+            // Many duplicates per distinct value, like a clustered production
+            // corpus under churn.
+            for _ in 0..19 {
+                data.push(v.clone());
+            }
+        }
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+        for seed in [1, 5, 42, 99] {
+            let pq = ProductQuantizer::train(dim, 2, 8, &refs, &options(seed)).unwrap();
+            for (i, v) in [0usize, 1, 17, 39].into_iter().map(|i| (i, &data[i * 19])) {
+                let recon = pq.reconstruct(&pq.encode(v));
+                assert_eq!(
+                    &recon, v,
+                    "distinct value {i} must survive encode/reconstruct exactly (seed {seed})"
+                );
+            }
+            // Adjacent values must not share a code.
+            let codes: Vec<Vec<u8>> = (0..40).map(|i| pq.encode(&data[i * 19])).collect();
+            let unique: std::collections::HashSet<&Vec<u8>> = codes.iter().collect();
+            assert_eq!(
+                unique.len(),
+                40,
+                "seed {seed}: 40 distinct values must yield 40 distinct codes"
+            );
+        }
     }
 }
