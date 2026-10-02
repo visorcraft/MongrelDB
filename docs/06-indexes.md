@@ -336,11 +336,11 @@ configuration, not a claim that every production corpus has identical recall.
 | LearnedRange | Exact range | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
 | FmIndex | Exact substring | `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
 | Sparse | Exact dot-product top-k | Higher score, then `RowId` | No approximate candidate cap; never silently truncates | Must complete or return a budget error | Exact; no floor |
-| MinHash | Approximate LSH candidates; exact verification cannot recover missed candidates | Higher verified Jaccard score, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.80 (see below) |
-| ANN HNSW BinarySign | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.95 |
-| ANN HNSW Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
-| ANN DiskANN Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
-| ANN IVF Dense | Approximate | Smaller distance, then `RowId` | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.85 |
+| MinHash | Approximate LSH candidates; exact verification cannot recover missed candidates | Higher estimated Jaccard (128-perm signature match), then `RowId`; exact-similarity ties and 2σ estimator-band substitutes may reorder | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.80 (see below) |
+| ANN HNSW BinarySign | Approximate | Smaller distance, then `RowId`; equal hamming distances are coarse, so exact-distance ties may substitute freely | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.95 |
+| ANN HNSW Dense | Approximate | Smaller distance, then `RowId`; exact-distance ties may substitute (1e-6 f32-accumulation slack) | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| ANN DiskANN Dense | Approximate | Smaller distance, then `RowId`; exact-distance ties may substitute (1e-6 f32-accumulation slack) | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.90 |
+| ANN IVF Dense | Approximate | Smaller distance, then `RowId`; exact-distance ties may substitute (1e-6 f32-accumulation slack) | May truncate candidates; cap hit must be traced | Bounded search; exhaustion must be explicit | 0.85 |
 | ANN Product Quantization | Approximate, including reconstructed-vector rerank | Smaller distance, then `RowId` (exact-distance ties may substitute across layers) | Rerank candidates may be capped; cap hit must be traced | Bounded scan and rerank; exhaustion must be explicit | 0.80 with rerank |
 
 ### Per-family recall floors
@@ -352,10 +352,10 @@ configuration, not a claim that every production corpus has identical recall.
   against an independent model at every checkpoint.
 - **MinHash:** 0.80 median recall on the deterministic oracle corpus (see
   below); the exact-duplicate gate is 1.0.
-- **ANN HNSW BinarySign:** 0.95.
-- **ANN HNSW Dense:** 0.90.
-- **ANN DiskANN Dense:** 0.90.
-- **ANN IVF Dense:** 0.85.
+- **ANN HNSW BinarySign:** 0.95, tie-tolerant on equal hamming distance (8-bit signatures tie massively; any returned row at the same exact distance substitutes freely).
+- **ANN HNSW Dense:** 0.90, tie-tolerant with 1e-6 slack (engine backends accumulate cosine in f32, the model in f64).
+- **ANN DiskANN Dense:** 0.90, tie-tolerant with 1e-6 slack (same f32/f64 accumulation note).
+- **ANN IVF Dense:** 0.85, tie-tolerant with 1e-6 slack (same f32/f64 accumulation note).
 - **ANN Product Quantization:** 0.80 with rerank, tie-tolerant on exact-duplicate rows (per-layer codebooks may order distance-tied duplicates differently; a returned row at the same exact distance substitutes freely).
 
 ### MinHash recall floor
@@ -363,8 +363,14 @@ configuration, not a claim that every production corpus has identical recall.
 `MINHASH_GENERAL_RECALL_FLOOR` (in
 `crates/mongreldb-core/tests/index_churn_oracle.rs`) is **0.80**. It is
 enforced as the *median* tie-tolerant recall across every checkpoint of a
-500-operation churn run, with an additional per-checkpoint guard that
-recall never collapses to zero when the best exact match is strong
+500-operation churn run. Tie tolerance has two parts: (a) an expected row
+counts as found when the engine returned it, or returned an unused row
+whose **exact** Jaccard is at least as high, or is within the 128-perm
+estimator's 2σ band of the expected row's exact Jaccard
+(`2·sqrt(J(1-J)/128)` — the engine ranks by the estimate, so estimate
+noise legitimately reorders near-ties); a substitute beyond that band is
+a genuine miss. (b) An additional per-checkpoint guard fires only when
+recall collapses to zero while the best exact match is strong
 (Jaccard ≥ 0.5, where band sharing is near-certain); a checkpoint whose
 only expected rows are marginal (J < 0.5) may deterministically miss every
 band, which is documented LSH candidate behavior, not an engine collapse. Measured
@@ -397,7 +403,7 @@ close+reopen; the current snapshot reflects the latest committed state.
 
 Equal distances break ties by `RowId` in every mode. ANN ranks smaller distance
 first, then `RowId`. Sparse ranks larger dot product first, then `RowId`, and
-MinHash ranks larger verified Jaccard similarity first, then `RowId`.
+MinHash ranks larger estimated Jaccard similarity (the 128-permutation signature-match fraction) first, then `RowId`.
 
 ### Candidate caps
 

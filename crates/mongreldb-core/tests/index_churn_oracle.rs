@@ -2035,15 +2035,145 @@ mod families {
         scored
     }
 
-    /// Shared ANN recall + eligibility + ordering gate (B468-03/04).
-    fn assert_ann_recall_and_eligibility(
+    /// Exact top-k answer plus the exact metric value of every live row, so
+    /// the recall gate can accept tie substitutes (same substitution rule as
+    /// the MinHash §10.6 gate): an expected row counts as found when the
+    /// engine returned it, or when it returned an unused row whose exact
+    /// metric is at least as good. Rid-set recall would measure tie-break
+    /// luck on coarse/tied metric scales, not index quality.
+    #[derive(Debug, Clone)]
+    pub struct TopKWithExact {
+        pub topk: Vec<(u64, f64)>,
+        pub exact: std::collections::HashMap<u64, f64>,
+    }
+
+    /// ANN oracle helper: exact top-k over the model with cosine distance,
+    /// plus the full exact distance map for tie substitution.
+    pub fn ann_dense_expected_full(
+        model: &model::Model,
+        snap: model::ModelSnapshot,
+        column_id: u16,
+        qvec: &[f32],
+        k: usize,
+    ) -> TopKWithExact {
+        let mut scored: Vec<(u64, f64)> = model
+            .live_rows(snap)
+            .into_iter()
+            .filter_map(|row| match row.cols.get(&column_id) {
+                Some(ValueRepr::EmbeddingQ(v)) => {
+                    let emb = ValueRepr::decode_embedding(v);
+                    Some((row.rid, f64::from(ValueRepr::cosine_distance(qvec, &emb))))
+                }
+                _ => None,
+            })
+            .collect();
+        scored.sort_by(|(r1, d1), (r2, d2)| {
+            d1.partial_cmp(d2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(r1.cmp(r2))
+        });
+        let exact = scored.iter().copied().collect();
+        scored.truncate(k);
+        TopKWithExact {
+            topk: scored,
+            exact,
+        }
+    }
+
+    /// Distance-ascending tie-tolerant recall: an expected row counts as
+    /// found when the engine returned it, or when the engine returned an
+    /// unused row whose exact distance is at most `eps` larger — an exact
+    /// tie, a strictly better row, or float-accumulation slack. A substitute
+    /// any farther than that is a genuine recall miss.
+    pub fn tie_recall_distance(
+        topk: &[(u64, f64)],
+        exact: &std::collections::HashMap<u64, f64>,
+        actual_rids: &[u64],
+        eps: f64,
+    ) -> f32 {
+        let mut pool: Vec<(u64, f64)> = actual_rids
+            .iter()
+            .filter_map(|rid| exact.get(rid).map(|d| (*rid, *d)))
+            .collect();
+        pool.sort_by(|(r1, d1), (r2, d2)| d1.total_cmp(d2).then_with(|| r1.cmp(r2)));
+        let mut found = 0usize;
+        for (rid, d) in topk {
+            if let Some(pos) = pool.iter().position(|(r, _)| r == rid) {
+                pool.remove(pos);
+                found += 1;
+            } else if let Some(pos) = pool.iter().position(|(_, sd)| *sd <= *d + eps) {
+                pool.remove(pos);
+                found += 1;
+            }
+        }
+        if topk.is_empty() {
+            1.0
+        } else {
+            found as f32 / topk.len() as f32
+        }
+    }
+
+    /// Similarity-descending tie-tolerant recall: an expected row counts as
+    /// found when the engine returned it, or when the engine returned an
+    /// unused row whose exact similarity is at least
+    /// `expected - tolerance(expected)` — an exact tie, a strictly better
+    /// row, or estimator noise. A substitute beyond that band is a genuine
+    /// recall miss.
+    pub fn tie_recall_similarity(
+        topk: &[(u64, f64)],
+        exact: impl Fn(u64) -> Option<f64>,
+        actual_rids: &[u64],
+        tolerance: impl Fn(f64) -> f64,
+    ) -> f32 {
+        let mut pool: Vec<(u64, f64)> = actual_rids
+            .iter()
+            .filter_map(|rid| exact(*rid).map(|j| (*rid, j)))
+            .collect();
+        pool.sort_by(|(r1, j1), (r2, j2)| j2.total_cmp(j1).then_with(|| r1.cmp(r2)));
+        let mut found = 0usize;
+        for (rid, ej) in topk {
+            if let Some(pos) = pool.iter().position(|(r, _)| r == rid) {
+                pool.remove(pos);
+                found += 1;
+            } else if let Some(pos) = pool.iter().position(|(_, j)| *j >= *ej - tolerance(*ej)) {
+                pool.remove(pos);
+                found += 1;
+            }
+        }
+        if topk.is_empty() {
+            1.0
+        } else {
+            found as f32 / topk.len() as f32
+        }
+    }
+
+    /// Two standard errors of the 128-permutation MinHash Jaccard estimator
+    /// at similarity `j` (binomial variance `j(1-j)/128`). The engine ranks
+    /// by that estimate (docs/06-indexes.md), so a substitute within this
+    /// band of the expected boundary is estimator noise, not a recall miss.
+    pub fn minhash_estimate_tolerance(j: f64) -> f64 {
+        2.0 * (j * (1.0 - j) / 128.0).sqrt()
+    }
+
+    /// Slack for dense-cosine tie substitution: the engine's backends
+    /// accumulate cosine in f32 while the model accumulates in f64, so
+    /// near-tie ranks can differ at the ~1e-7 scale. The slack only covers
+    /// accumulation noise — it is orders of magnitude below any real
+    /// distance gap in the oracle corpus.
+    pub const DENSE_TIE_EPS: f64 = 1e-6;
+
+    /// Shared ANN eligibility + tie-tolerant recall + ordering gate
+    /// (B468-03/04). `actual` carries the engine-reported distances, used
+    /// only for the ascending-order check; recall is computed from the
+    /// model's exact metric.
+    fn assert_ann_gate(
         family_name: &str,
         floor: f32,
-        expected: &[(u64, f32)],
-        actual: &[(u64, f32)],
+        expected: &TopKWithExact,
+        actual: &[(u64, f64)],
         eligible: &HashSet<u64>,
         context: &FailureContext,
-        distance_ascending: bool,
+        eps: f64,
     ) {
         for (rid, _) in actual {
             assert!(
@@ -2052,35 +2182,20 @@ mod families {
                 context.render()
             );
         }
-        let exp_set: HashSet<u64> = expected.iter().map(|(r, _)| *r).collect();
-        let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-        let found = exp_set.intersection(&act_set).count();
-        let recall = if exp_set.is_empty() {
-            1.0
-        } else {
-            found as f32 / exp_set.len() as f32
-        };
+        let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+        let recall = tie_recall_distance(&expected.topk, &expected.exact, &act_rids, eps);
         assert!(
             recall >= floor,
             "{family_name} recall {recall} < floor {floor}:\n{}",
             context.render()
         );
         for w in actual.windows(2) {
-            if distance_ascending {
-                assert!(
-                    w[0].1 <= w[1].1 + 1e-5,
-                    "{family_name} not sorted by ascending distance: {:?}\n{}",
-                    actual,
-                    context.render()
-                );
-            } else {
-                assert!(
-                    w[0].1 + 1e-5 >= w[1].1,
-                    "{family_name} not sorted by descending score: {:?}\n{}",
-                    actual,
-                    context.render()
-                );
-            }
+            assert!(
+                w[0].1 <= w[1].1 + 1e-5,
+                "{family_name} not sorted by ascending distance: {:?}\n{}",
+                actual,
+                context.render()
+            );
         }
         // Unexplained underfill: when model expected full k and engine
         // returned fewer without an explicit underfill reason, fail.
@@ -2088,7 +2203,7 @@ mod families {
             panic!(
                 "{family_name} unexpected underfill (actual {} < expected {}):\n{}",
                 actual.len(),
-                expected.len(),
+                expected.topk.len(),
                 context.render()
             );
         }
@@ -2098,8 +2213,8 @@ mod families {
 
     impl ChurnOracleFamily for AnnDenseFamily {
         type Query = (Vec<f32>, usize);
-        type Expected = Vec<(u64, f32)>;
-        type Actual = Vec<(u64, f32)>;
+        type Expected = TopKWithExact;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "ANN/HNSW/Dense"
@@ -2146,7 +2261,7 @@ mod families {
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
-            ann_dense_expected(model, snapshot, self.indexed_column(), qvec, *k)
+            ann_dense_expected_full(model, snapshot, self.indexed_column(), qvec, *k)
         }
 
         fn actual(
@@ -2170,10 +2285,20 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, d),
-                    _ => (h.row_id.0, f32::INFINITY),
+                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, f64::from(d)),
+                    _ => (h.row_id.0, f64::INFINITY),
                 })
                 .collect())
+        }
+
+        fn recorded_recall(
+            &self,
+            _raw: f32,
+            expected: &Self::Expected,
+            actual: &Self::Actual,
+        ) -> f32 {
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_distance(&expected.topk, &expected.exact, &act_rids, DENSE_TIE_EPS)
         }
 
         fn assert_equivalent(
@@ -2186,14 +2311,14 @@ mod families {
             // captured at checkpoint (expected_row_ids is the model top-k;
             // also accept actual hits that match expected for recall).
             let eligible: HashSet<u64> = context.expected_row_ids.iter().copied().collect();
-            assert_ann_recall_and_eligibility(
+            assert_ann_gate(
                 "ANN/HNSW/Dense",
                 self.recall_floor(),
                 expected,
                 actual,
                 &eligible,
                 context,
-                true,
+                DENSE_TIE_EPS,
             );
         }
 
@@ -2206,19 +2331,19 @@ mod families {
         }
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
-            let rids: Vec<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.iter().map(|(_, s)| *s as f64).collect();
+            let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn expected_full_count(&self, expected: &Self::Expected) -> usize {
-            expected.len()
+            expected.topk.len()
         }
     }
 
@@ -2226,8 +2351,8 @@ mod families {
 
     impl ChurnOracleFamily for AnnBinarySignFamily {
         type Query = (Vec<f32>, usize);
-        type Expected = Vec<(u64, u32)>;
-        type Actual = Vec<(u64, u32)>;
+        type Expected = TopKWithExact;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "ANN/HNSW/BinarySign"
@@ -2275,21 +2400,29 @@ mod families {
         ) -> Self::Expected {
             let (qvec, k) = query;
             let qbits = quantize_sign(qvec);
-            let mut scored: Vec<(u64, u32)> = model
+            let mut scored: Vec<(u64, f64)> = model
                 .live_rows(snapshot)
                 .into_iter()
                 .filter_map(|row| match row.cols.get(&self.indexed_column()) {
                     Some(ValueRepr::EmbeddingQ(v)) => {
                         let emb = ValueRepr::decode_embedding(v);
                         let rbits = quantize_sign(&emb);
-                        Some((row.rid, hamming_distance(&qbits, &rbits)))
+                        Some((row.rid, f64::from(hamming_distance(&qbits, &rbits))))
                     }
                     _ => None,
                 })
                 .collect();
-            scored.sort_by(|(r1, d1), (r2, d2)| d1.cmp(d2).then(r1.cmp(r2)));
+            scored.sort_by(|(r1, d1), (r2, d2)| {
+                d1.partial_cmp(d2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(r1.cmp(r2))
+            });
+            let exact = scored.iter().copied().collect();
             scored.truncate(*k);
-            scored
+            TopKWithExact {
+                topk: scored,
+                exact,
+            }
         }
 
         fn actual(
@@ -2313,10 +2446,20 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::AnnHammingDistance(d) => (h.row_id.0, d),
-                    _ => (h.row_id.0, u32::MAX),
+                    RetrieverScore::AnnHammingDistance(d) => (h.row_id.0, f64::from(d)),
+                    _ => (h.row_id.0, f64::INFINITY),
                 })
                 .collect())
+        }
+
+        fn recorded_recall(
+            &self,
+            _raw: f32,
+            expected: &Self::Expected,
+            actual: &Self::Actual,
+        ) -> f32 {
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_distance(&expected.topk, &expected.exact, &act_rids, 0.0)
         }
 
         fn assert_equivalent(
@@ -2326,34 +2469,17 @@ mod families {
             context: &FailureContext,
         ) {
             let eligible: HashSet<u64> = context.expected_row_ids.iter().copied().collect();
-            for (rid, _) in actual {
-                assert!(
-                    eligible.contains(rid),
-                    "ANN/HNSW/BinarySign ineligible rid {rid}:\n{}",
-                    context.render()
-                );
-            }
-            let exp_set: HashSet<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let found = exp_set.intersection(&act_set).count();
-            let recall = if exp_set.is_empty() {
-                1.0
-            } else {
-                found as f32 / exp_set.len() as f32
-            };
-            assert!(
-                recall >= self.recall_floor(),
-                "ANN/HNSW/BinarySign recall {recall} < floor {}:\n{}",
+            assert_ann_gate(
+                "ANN/HNSW/BinarySign",
                 self.recall_floor(),
-                context.render()
+                expected,
+                actual,
+                &eligible,
+                context,
+                // Integer hamming distances: exact ties substitute freely,
+                // no approximation slack.
+                0.0,
             );
-            for w in actual.windows(2) {
-                assert!(
-                    w[0].1 <= w[1].1,
-                    "ANN/HNSW/BinarySign not sorted: {:?}",
-                    actual
-                );
-            }
         }
 
         fn is_exact(&self) -> bool {
@@ -2365,19 +2491,19 @@ mod families {
         }
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
-            let rids: Vec<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.iter().map(|(_, s)| *s as f64).collect();
+            let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn expected_full_count(&self, expected: &Self::Expected) -> usize {
-            expected.len()
+            expected.topk.len()
         }
     }
 
@@ -2448,51 +2574,10 @@ mod families {
         }
     }
 
-    /// PQ oracle answer: the exact top-k plus the exact cosine distance of
-    /// every live row, so the recall gate can accept tie substitutes (same
-    /// substitution rule as the MinHash §10.6 gate). Flat PQ ranks by
-    /// reconstructed codes; exact-duplicate rows tie at distance 0 and
-    /// layer-local codebooks order them by local ADC noise, never by rid —
-    /// rid-set membership would measure tie-break luck, not recall.
-    #[derive(Debug, Clone)]
-    pub struct AnnPqExpected {
-        pub topk: Vec<(u64, f32)>,
-        pub exact: std::collections::HashMap<u64, f32>,
-    }
-
-    /// Tie-tolerant recall (same substitution rule as the MinHash §10.6
-    /// gate): an expected row counts as found when the engine returned it, or
-    /// when the engine returned an unused row whose exact model distance is
-    /// no larger — flat PQ legitimately reorders exact-tie duplicates across
-    /// per-layer codebooks, but can never substitute a strictly farther row.
-    /// A substitute with a larger exact distance is a genuine recall miss.
-    pub fn pq_tie_tolerant_recall(expected: &AnnPqExpected, actual: &[(u64, f32)]) -> f32 {
-        let mut pool: Vec<(u64, f32)> = actual
-            .iter()
-            .filter_map(|(rid, _)| expected.exact.get(rid).map(|d| (*rid, *d)))
-            .collect();
-        pool.sort_by(|(r1, d1), (r2, d2)| d1.total_cmp(d2).then_with(|| r1.cmp(r2)));
-        let mut found = 0usize;
-        for (rid, d) in &expected.topk {
-            if let Some(pos) = pool.iter().position(|(r, _)| r == rid) {
-                pool.remove(pos);
-                found += 1;
-            } else if let Some(pos) = pool.iter().position(|(_, sd)| *sd <= *d) {
-                pool.remove(pos);
-                found += 1;
-            }
-        }
-        if expected.topk.is_empty() {
-            1.0
-        } else {
-            found as f32 / expected.topk.len() as f32
-        }
-    }
-
     impl ChurnOracleFamily for AnnPqFamily {
         type Query = (Vec<f32>, usize);
-        type Expected = AnnPqExpected;
-        type Actual = Vec<(u64, f32)>;
+        type Expected = TopKWithExact;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "ANN/HNSW/PQ"
@@ -2574,30 +2659,7 @@ mod families {
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
-            // Full exact distance map for tie substitution; top-k stays the
-            // exact nearest neighbors by (distance, rid).
-            let mut scored: Vec<(u64, f32)> = model
-                .live_rows(snapshot)
-                .into_iter()
-                .filter_map(|row| match row.cols.get(&self.indexed_column()) {
-                    Some(ValueRepr::EmbeddingQ(v)) => {
-                        let emb = ValueRepr::decode_embedding(v);
-                        Some((row.rid, ValueRepr::cosine_distance(qvec, &emb)))
-                    }
-                    _ => None,
-                })
-                .collect();
-            scored.sort_by(|(r1, d1), (r2, d2)| {
-                d1.partial_cmp(d2)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(r1.cmp(r2))
-            });
-            let exact = scored.iter().copied().collect();
-            scored.truncate(*k);
-            AnnPqExpected {
-                topk: scored,
-                exact,
-            }
+            ann_dense_expected_full(model, snapshot, self.indexed_column(), qvec, *k)
         }
 
         fn actual(
@@ -2621,8 +2683,8 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, d),
-                    _ => (h.row_id.0, f32::INFINITY),
+                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, f64::from(d)),
+                    _ => (h.row_id.0, f64::INFINITY),
                 })
                 .collect())
         }
@@ -2633,7 +2695,8 @@ mod families {
             expected: &Self::Expected,
             actual: &Self::Actual,
         ) -> f32 {
-            pq_tie_tolerant_recall(expected, actual)
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_distance(&expected.topk, &expected.exact, &act_rids, 0.0)
         }
 
         fn assert_equivalent(
@@ -2643,28 +2706,17 @@ mod families {
             context: &FailureContext,
         ) {
             let eligible: HashSet<u64> = context.expected_row_ids.iter().copied().collect();
-            for (rid, _) in actual {
-                assert!(
-                    eligible.contains(rid),
-                    "ANN/HNSW/PQ ineligible rid {rid}:\n{}",
-                    context.render()
-                );
-            }
-            let recall = pq_tie_tolerant_recall(expected, actual);
-            // B468-03 / AC2: documented 0.80 floor at every checkpoint — no median softener.
-            assert!(
-                recall >= self.recall_floor(),
-                "ANN/HNSW/PQ recall {recall} < floor {}:\n{}",
+            // Exact-tie duplicates substitute freely across per-layer
+            // codebooks; a strictly farther substitute is a genuine miss.
+            assert_ann_gate(
+                "ANN/HNSW/PQ",
                 self.recall_floor(),
-                context.render()
+                expected,
+                actual,
+                &eligible,
+                context,
+                0.0,
             );
-            for w in actual.windows(2) {
-                assert!(
-                    w[0].1 <= w[1].1 + 1e-5,
-                    "ANN/HNSW/PQ not sorted: {:?}",
-                    actual
-                );
-            }
         }
 
         fn is_exact(&self) -> bool {
@@ -2676,13 +2728,13 @@ mod families {
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
@@ -2695,8 +2747,8 @@ mod families {
 
     impl ChurnOracleFamily for DiskAnnFamily {
         type Query = (Vec<f32>, usize);
-        type Expected = Vec<(u64, f32)>;
-        type Actual = Vec<(u64, f32)>;
+        type Expected = TopKWithExact;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "ANN/DiskANN/Dense"
@@ -2743,7 +2795,7 @@ mod families {
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
-            ann_dense_expected(model, snapshot, self.indexed_column(), qvec, *k)
+            ann_dense_expected_full(model, snapshot, self.indexed_column(), qvec, *k)
         }
 
         fn actual(
@@ -2767,10 +2819,20 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, d),
-                    _ => (h.row_id.0, f32::INFINITY),
+                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, f64::from(d)),
+                    _ => (h.row_id.0, f64::INFINITY),
                 })
                 .collect())
+        }
+
+        fn recorded_recall(
+            &self,
+            _raw: f32,
+            expected: &Self::Expected,
+            actual: &Self::Actual,
+        ) -> f32 {
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_distance(&expected.topk, &expected.exact, &act_rids, DENSE_TIE_EPS)
         }
 
         fn assert_equivalent(
@@ -2780,34 +2842,15 @@ mod families {
             context: &FailureContext,
         ) {
             let eligible: HashSet<u64> = context.expected_row_ids.iter().copied().collect();
-            for (rid, _) in actual {
-                assert!(
-                    eligible.contains(rid),
-                    "ANN/DiskANN/Dense ineligible rid {rid}:\n{}",
-                    context.render()
-                );
-            }
-            let exp_set: HashSet<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let found = exp_set.intersection(&act_set).count();
-            let recall = if exp_set.is_empty() {
-                1.0
-            } else {
-                found as f32 / exp_set.len() as f32
-            };
-            assert!(
-                recall >= self.recall_floor(),
-                "ANN/DiskANN/Dense recall {recall} < floor {}:\n{}",
+            assert_ann_gate(
+                "ANN/DiskANN/Dense",
                 self.recall_floor(),
-                context.render()
+                expected,
+                actual,
+                &eligible,
+                context,
+                DENSE_TIE_EPS,
             );
-            for w in actual.windows(2) {
-                assert!(
-                    w[0].1 <= w[1].1 + 1e-5,
-                    "ANN/DiskANN/Dense not sorted: {:?}",
-                    actual
-                );
-            }
         }
 
         fn is_exact(&self) -> bool {
@@ -2818,19 +2861,19 @@ mod families {
         }
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
-            let rids: Vec<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.iter().map(|(_, s)| *s as f64).collect();
+            let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn expected_full_count(&self, expected: &Self::Expected) -> usize {
-            expected.len()
+            expected.topk.len()
         }
     }
 
@@ -2838,8 +2881,8 @@ mod families {
 
     impl ChurnOracleFamily for IvfFamily {
         type Query = (Vec<f32>, usize);
-        type Expected = Vec<(u64, f32)>;
-        type Actual = Vec<(u64, f32)>;
+        type Expected = TopKWithExact;
+        type Actual = Vec<(u64, f64)>;
 
         fn name(&self) -> &'static str {
             "ANN/IVF/Dense"
@@ -2886,7 +2929,7 @@ mod families {
             query: &Self::Query,
         ) -> Self::Expected {
             let (qvec, k) = query;
-            ann_dense_expected(model, snapshot, self.indexed_column(), qvec, *k)
+            ann_dense_expected_full(model, snapshot, self.indexed_column(), qvec, *k)
         }
 
         fn actual(
@@ -2910,10 +2953,20 @@ mod families {
             Ok(hits
                 .into_iter()
                 .map(|h| match h.score {
-                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, d),
-                    _ => (h.row_id.0, f32::INFINITY),
+                    RetrieverScore::AnnCosineDistance(d) => (h.row_id.0, f64::from(d)),
+                    _ => (h.row_id.0, f64::INFINITY),
                 })
                 .collect())
+        }
+
+        fn recorded_recall(
+            &self,
+            _raw: f32,
+            expected: &Self::Expected,
+            actual: &Self::Actual,
+        ) -> f32 {
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_distance(&expected.topk, &expected.exact, &act_rids, DENSE_TIE_EPS)
         }
 
         fn assert_equivalent(
@@ -2923,34 +2976,15 @@ mod families {
             context: &FailureContext,
         ) {
             let eligible: HashSet<u64> = context.expected_row_ids.iter().copied().collect();
-            for (rid, _) in actual {
-                assert!(
-                    eligible.contains(rid),
-                    "ANN/IVF/Dense ineligible rid {rid}:\n{}",
-                    context.render()
-                );
-            }
-            let exp_set: HashSet<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let act_set: HashSet<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let found = exp_set.intersection(&act_set).count();
-            let recall = if exp_set.is_empty() {
-                1.0
-            } else {
-                found as f32 / exp_set.len() as f32
-            };
-            assert!(
-                recall >= self.recall_floor(),
-                "ANN/IVF/Dense recall {recall} < floor {}:\n{}",
+            assert_ann_gate(
+                "ANN/IVF/Dense",
                 self.recall_floor(),
-                context.render()
+                expected,
+                actual,
+                &eligible,
+                context,
+                DENSE_TIE_EPS,
             );
-            for w in actual.windows(2) {
-                assert!(
-                    w[0].1 <= w[1].1 + 1e-5,
-                    "ANN/IVF/Dense not sorted: {:?}",
-                    actual
-                );
-            }
         }
 
         fn is_exact(&self) -> bool {
@@ -2961,19 +2995,19 @@ mod families {
         }
 
         fn expected_rids_scores(&self, expected: &Self::Expected) -> (Vec<u64>, Vec<f64>) {
-            let rids: Vec<u64> = expected.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = expected.iter().map(|(_, s)| *s as f64).collect();
+            let rids: Vec<u64> = expected.topk.iter().map(|(r, _)| *r).collect();
+            let scores: Vec<f64> = expected.topk.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn actual_rids_scores(&self, actual: &Self::Actual) -> (Vec<u64>, Vec<f64>) {
             let rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
-            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s as f64).collect();
+            let scores: Vec<f64> = actual.iter().map(|(_, s)| *s).collect();
             (rids, scores)
         }
 
         fn expected_full_count(&self, expected: &Self::Expected) -> usize {
-            expected.len()
+            expected.topk.len()
         }
     }
 
@@ -3442,6 +3476,21 @@ mod families {
                 .collect())
         }
 
+        fn recorded_recall(
+            &self,
+            _raw: f32,
+            expected: &Self::Expected,
+            actual: &Self::Actual,
+        ) -> f32 {
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            tie_recall_similarity(
+                &expected.topk,
+                |rid| expected.exact_j.get(&rid).copied(),
+                &act_rids,
+                minhash_estimate_tolerance,
+            )
+        }
+
         fn assert_equivalent(
             &self,
             expected: &Self::Expected,
@@ -3469,26 +3518,18 @@ mod families {
             // Gate 2: tie/estimation-noise-tolerant recall against the
             // model's exact-Jaccard top-k. An expected row counts as found
             // when the engine returned it, or when the engine returned an
-            // unused row whose exact Jaccard is at least as high (the
-            // estimator legitimately reorders near-ties). A genuine LSH
-            // band miss can only substitute a lower-similarity row and is
-            // counted as a miss.
-            let mut pool: Vec<(u64, f64)> = actual
-                .iter()
-                .map(|(rid, _)| (*rid, expected.exact_j[rid]))
-                .collect();
-            pool.sort_by(|(r1, j1), (r2, j2)| j2.total_cmp(j1).then_with(|| r1.cmp(r2)));
-            let mut found = 0usize;
-            for (rid, ej) in &expected.topk {
-                if let Some(pos) = pool.iter().position(|(r, _)| r == rid) {
-                    pool.remove(pos);
-                    found += 1;
-                } else if let Some(pos) = pool.iter().position(|(_, j)| *j >= *ej) {
-                    pool.remove(pos);
-                    found += 1;
-                }
-            }
-            let recall = found as f32 / expected.topk.len() as f32;
+            // unused row whose exact Jaccard is at least as high — or within
+            // the 128-perm estimator's 2σ band of it, because the engine
+            // ranks by that estimate (docs/06-indexes.md) and estimate noise
+            // legitimately reorders near-ties. A substitute beyond that band
+            // is a genuine LSH miss and counts against recall.
+            let act_rids: Vec<u64> = actual.iter().map(|(r, _)| *r).collect();
+            let recall = tie_recall_similarity(
+                &expected.topk,
+                |rid| expected.exact_j.get(&rid).copied(),
+                &act_rids,
+                minhash_estimate_tolerance,
+            );
             self.recall_samples.borrow_mut().push(recall);
             // Total LSH failure on a non-empty oracle answer fails
             // immediately — but only when the best exact match is strong
@@ -5626,11 +5667,132 @@ fn topk_recall_is_measured_not_assumed() {
 }
 
 #[test]
+fn tie_recall_distance_substitutes_only_ties_or_better() {
+    use families::{tie_recall_distance, TopKWithExact};
+    let expected = TopKWithExact {
+        topk: vec![(1, 0.10), (2, 0.20), (3, 0.30)],
+        exact: [
+            (1, 0.10),
+            (2, 0.20),
+            (3, 0.30),
+            (7, 0.10), // exact tie with rid 1
+            (8, 0.15), // strictly better than rid 2
+            (9, 0.40), // strictly worse than every expected row
+        ]
+        .into_iter()
+        .collect(),
+    };
+    // Exact ties and strictly-better substitutes fill every slot.
+    assert_eq!(
+        tie_recall_distance(&expected.topk, &expected.exact, &[7, 8, 1], 0.0),
+        1.0
+    );
+    // A strictly-worse substitute must NOT fill the slot (rid 3 unsubstituted).
+    let recall = tie_recall_distance(&expected.topk, &expected.exact, &[1, 2, 9], 0.0);
+    assert!((recall - 2.0 / 3.0).abs() < 1e-6, "recall {recall}");
+    // eps slack admits a substitute within eps, never beyond it.
+    let expected_eps = TopKWithExact {
+        topk: vec![(1, 0.10)],
+        exact: [(1, 0.10), (9, 0.10 + 5e-7)].into_iter().collect(),
+    };
+    assert_eq!(
+        tie_recall_distance(&expected_eps.topk, &expected_eps.exact, &[9], 1e-6),
+        1.0
+    );
+    let expected_beyond = TopKWithExact {
+        topk: vec![(1, 0.10)],
+        exact: [(1, 0.10), (9, 0.10 + 2e-6)].into_iter().collect(),
+    };
+    assert_eq!(
+        tie_recall_distance(&expected_beyond.topk, &expected_beyond.exact, &[9], 1e-6),
+        0.0
+    );
+    // One returned row substitutes at most one expected row.
+    let dup = TopKWithExact {
+        topk: vec![(1, 0.10), (2, 0.10), (3, 0.10)],
+        exact: [(1, 0.10), (2, 0.10), (3, 0.10), (7, 0.10)]
+            .into_iter()
+            .collect(),
+    };
+    let recall = tie_recall_distance(&dup.topk, &dup.exact, &[7], 0.0);
+    assert!((recall - 1.0 / 3.0).abs() < 1e-6, "recall {recall}");
+}
+
+#[test]
+fn tie_recall_similarity_respects_estimator_tolerance() {
+    use families::{minhash_estimate_tolerance, tie_recall_similarity};
+    // Seed-77 shape: expected top-4 all exact 0.8; engine returned four
+    // different rows at exact 0.75 — within the 128-perm estimator's 2σ
+    // band (τ(0.8) ≈ 0.0707), so every slot substitutes.
+    let expected_topk: Vec<(u64, f64)> = vec![(885, 0.8), (897, 0.8), (900, 0.8), (915, 0.8)];
+    let exact: std::collections::HashMap<u64, f64> = [
+        (885, 0.8),
+        (897, 0.8),
+        (900, 0.8),
+        (915, 0.8),
+        (907, 0.75),
+        (916, 0.75),
+        (921, 0.75),
+        (929, 0.75),
+        (990, 0.70), // beyond τ(0.8): must not substitute
+    ]
+    .into_iter()
+    .collect();
+    assert!(
+        (minhash_estimate_tolerance(0.8) - 0.0707).abs() < 1e-3,
+        "τ(0.8) = {}",
+        minhash_estimate_tolerance(0.8)
+    );
+    assert_eq!(
+        tie_recall_similarity(
+            &expected_topk,
+            |rid| exact.get(&rid).copied(),
+            &[907, 916, 921, 929],
+            minhash_estimate_tolerance,
+        ),
+        1.0
+    );
+    // Beyond the band: 0.70 < 0.8 - τ(0.8) — genuine misses.
+    let recall = tie_recall_similarity(
+        &expected_topk,
+        |rid| exact.get(&rid).copied(),
+        &[990, 990, 990, 990],
+        minhash_estimate_tolerance,
+    );
+    // rid 990 appears once in the pool, so at most one slot could ever fill;
+    // with 0.70 beyond the band, nothing fills.
+    assert_eq!(recall, 0.0);
+    // Direct hits and strictly-better rows always count.
+    let exact2: std::collections::HashMap<u64, f64> =
+        [(885, 0.8), (897, 0.8), (900, 0.8), (915, 0.8)]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        tie_recall_similarity(
+            &expected_topk,
+            |rid| exact2.get(&rid).copied(),
+            &[885, 897, 900, 915],
+            minhash_estimate_tolerance,
+        ),
+        1.0
+    );
+    // Narrower bands at the extremes: τ(0.1) ≈ 0.053, τ(0.9) ≈ 0.053.
+    assert!(minhash_estimate_tolerance(0.1) < 0.06);
+    assert!(minhash_estimate_tolerance(0.9) < 0.06);
+    assert!(minhash_estimate_tolerance(0.5) > 0.08);
+}
+
+#[test]
 fn ann_unexpected_underfill_fails_closed() {
     // Approximate family + Unexpected underfill must fail (not soft-pass as
     // ApproximateRecall). Mirrors the B468-04 fail-closed requirement.
     let family = AnnDenseFamily;
-    let expected = vec![(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4), (5, 0.5)];
+    let expected = families::TopKWithExact {
+        topk: vec![(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4), (5, 0.5)],
+        exact: [(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4), (5, 0.5)]
+            .into_iter()
+            .collect(),
+    };
     let actual = vec![(1, 0.1), (2, 0.2)]; // short without cap/budget
     let context = FailureContext {
         family: "ANN/HNSW/Dense".into(),
@@ -5747,8 +5909,11 @@ fn sparse_oracle_rejects_empty_actual_for_nonempty_expected() {
 #[test]
 fn ann_dense_oracle_rejects_zero_recall_against_nonzero_floor() {
     let family = AnnDenseFamily;
-    let expected = vec![(1u64, 0.1f32), (2, 0.2), (3, 0.3)];
-    let actual: Vec<(u64, f32)> = vec![];
+    let expected = families::TopKWithExact {
+        topk: vec![(1u64, 0.1f64), (2, 0.2), (3, 0.3)],
+        exact: [(1, 0.1), (2, 0.2), (3, 0.3)].into_iter().collect(),
+    };
+    let actual: Vec<(u64, f64)> = vec![];
     let context = FailureContext {
         family: "ANN/HNSW/Dense".into(),
         seed: 1,
