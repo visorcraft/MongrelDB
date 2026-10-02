@@ -1,7 +1,7 @@
 # Index churn nightly (Spec REM-H §12.2) — durable long-duration churn gate.
 #
-# Runs the index churn oracle across 100 deterministic seeds, sharded into 20
-# matrix jobs of 5 seeds each (fail-fast: false so every shard failure is
+# Runs the index churn oracle across 100 deterministic seeds, sharded into 50
+# matrix jobs of 2 seeds each (fail-fast: false so every shard failure is
 # collected). Each shard runs every non-Bitmap index family at 10,000
 # operations per family per seed and emits a signed/SHA-stamped JSON result
 # artifact. The aggregate job only runs when every shard passes and publishes
@@ -16,7 +16,7 @@
 #     `index_churn_oracle::family::<family>`);
 #   - encryption on/off, TTL, historical snapshots, candidate-cap pressure:
 #     four boolean axes derived from the shard index (16 combinations over
-#     shards 0-15; shards 16-19 repeat combinations 0-3 with fresh seeds);
+#     shards 0-15; later shards repeat combinations with fresh seeds).
 #   - reopen/rebuild/compaction: always enabled at full op-matrix weight
 #     (MONGRELDB_ORACLE_LIFECYCLE_OPS=1).
 #
@@ -55,7 +55,7 @@ permissions:
 env:
   TOOLCHAIN: "1.97.1"
   ORACLE_OPS: "10000"
-  SEEDS_PER_SHARD: "5"
+  SEEDS_PER_SHARD: "2"
 
 jobs:
   churn-shard:
@@ -67,8 +67,15 @@ jobs:
       # if any shard fails.
       fail-fast: false
       matrix:
-        # 20 shards x 5 seeds = 100 deterministic seeds (seeds 1..100).
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        # 50 shards x 2 seeds = 100 deterministic seeds (seeds 1..100).
+        # 2 seeds/shard keeps the slow axis configs (ttl off + snapshots on,
+        # ~30-55 min/seed) well under the 360-minute job cap: 5-seed shards
+        # timed out at 6h on those axes (run 36875277340).
+        shard: [
+          0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+          20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+          37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+        ]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -90,7 +97,7 @@ jobs:
             echo "snapshots=$(( (s / 4) % 2 ))"
             echo "candidate_cap=$(( (s / 8) % 2 ))"
           } >> "$GITHUB_OUTPUT"
-      - name: Run churn oracle shard (5 seeds x 9 families x 10000 ops)
+      - name: Run churn oracle shard (2 seeds x 9 families x 10000 ops)
         env:
           MONGRELDB_ORACLE_OPERATIONS: ${{ env.ORACLE_OPS }}
           MONGRELDB_ORACLE_ENCRYPTION: ${{ steps.shard.outputs.encryption }}
@@ -335,8 +342,8 @@ jobs:
                   sys.exit(1)
               results.append(result)
 
-          if len(results) != 20:
-              print(f"FAIL: expected 20 shard results, found {len(results)}", file=sys.stderr)
+          if len(results) != 50:
+              print(f"FAIL: expected 50 shard results, found {len(results)}", file=sys.stderr)
               sys.exit(1)
 
           seeds = set()
@@ -370,11 +377,11 @@ jobs:
               "sha": os.environ["GITHUB_SHA"],
               "ref": os.environ["GITHUB_REF"],
               "toolchain": "1.97.1",
-              "shards": 20,
+              "shards": 50,
               "seeds": 100,
               "operations_per_family_per_seed": 10000,
               "families": 9,
-              "total_operations": 20 * 5 * 9 * 10000,
+              "total_operations": 50 * 2 * 9 * 10000,
               "shard_digests": {
                   str(r["payload"]["shard"]): r["content_sha256"] for r in results
               },
