@@ -30,9 +30,9 @@ regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # First-party Stage 0 foundation crates (see docs/architecture/adr/).
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.18" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.18" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.18" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.19" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.19" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.19" }
 
 # Page-level AES-256-GCM encryption and the key hierarchy
 # (Argon2id + HKDF KEK -> wrapped per-file DEK). Always required.
@@ -44,7 +44,7 @@ base64 = "0.22"
 subtle = "2.6"
 ring = "0.17"
 fs2 = "0.4.3"
-tokio = { version = "1.52.3", features = ["sync", "rt", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "time", "macros"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

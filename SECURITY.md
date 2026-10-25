@@ -59,7 +59,7 @@ and (for remote access) TLS termination in front of it.
 
 ## Input validation
 
-- SQL queries are parsed by DataFusion 54, which applies its own input
+- SQL queries are parsed by DataFusion 55, which applies its own input
   validation and parameterization.
 - The native Condition API accepts typed parameters (column IDs, value
   bytes, numeric ranges) - no string interpolation, no injection surface.

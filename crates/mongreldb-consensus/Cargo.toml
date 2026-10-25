@@ -14,19 +14,19 @@ description = "MongrelDB consensus adapter over openraft (Stage 2; see docs/arch
 # wire/durable types (Vote, LogId, Entry, Membership) which our checksummed
 # on-disk frames serialize.
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
-tokio = { version = "1.52.3", features = ["sync", "rt", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
 sha2 = "0.10"
 thiserror = "1"
-mongreldb-types = { path = "../mongreldb-types", version = "0.64.18" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.64.18" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.18" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.64.19" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.64.19" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.64.19" }
 # Stage 2E engine binding: the apply sink drives a core DatabaseCore through
 # the replicated apply path (engine_sink.rs).
-mongreldb-core = { path = "../mongreldb-core", version = "0.64.18" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.64.19" }
 
 [dev-dependencies]
-mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.18" }
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.64.19" }
 tempfile = "3"

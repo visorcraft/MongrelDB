@@ -196,7 +196,7 @@ across `sql()` calls. Closing and reopening the database starts a fresh session
 
 ## Advanced SQL: CTEs, Windows, Regex, Catalog
 
-The SQL surface (`db.sql()`) runs DataFusion 54, which supports a rich SQL
+The SQL surface (`db.sql()`) runs DataFusion 55, which supports a rich SQL
 dialect. These features are all accessible through `await db.sql(sql)`:
 
 **Recursive CTEs** - tree traversal, hierarchy queries:

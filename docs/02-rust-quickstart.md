@@ -202,7 +202,7 @@ combinations.
 ## SQL Queries (CTEs, Windows, Regex, Catalog)
 
 For analytical queries, joins, and SQL-stdlib features, use `MongrelSession`
-which wraps DataFusion 54. This gives you the full SQL surface - recursive CTEs,
+which wraps DataFusion 55. This gives you the full SQL surface - recursive CTEs,
 window functions, `regexp()`, catalog introspection, and more:
 
 ```rust

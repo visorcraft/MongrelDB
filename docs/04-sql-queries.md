@@ -387,7 +387,7 @@ min/max/null_count statistics. DataFusion uses these to answer `MIN(col)`,
 ## Recursive CTEs (`WITH RECURSIVE`)
 
 MongrelDB supports `WITH RECURSIVE` for tree traversal, graph queries, and
-hierarchical aggregation - the full DataFusion 54 recursive-CTE engine:
+hierarchical aggregation - the full DataFusion 55 recursive-CTE engine:
 
 ```sql
 WITH RECURSIVE tree AS (

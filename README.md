@@ -14,7 +14,7 @@
   <a href="https://github.com/visorcraft/MongrelDB/releases/latest"><img src="https://img.shields.io/github/v/release/visorcraft/MongrelDB?sort=semver" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0" />
   <img src="https://img.shields.io/badge/built%20with-Rust-000000?logo=rust&amp;logoColor=white" alt="Built with Rust" />
-  <img src="https://img.shields.io/badge/engine-DataFusion%2054-4B8BBE" alt="DataFusion 54" />
+  <img src="https://img.shields.io/badge/engine-DataFusion%2055-4B8BBE" alt="DataFusion 55" />
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-333333?logo=linux&amp;logoColor=white" alt="Platform: Linux, macOS, Windows" />
 </p>
 
@@ -199,7 +199,7 @@ Latest local release-build measurements are in
   `DatabaseHandle`s to one shared core via `DatabaseManager::open_shared`
   (Stage 1A); a second independent open, including path aliases, returns
   `DatabaseLocked` immediately.
-- **SQL surface:** DataFusion 54 with `WITH RECURSIVE` CTEs, window functions
+- **SQL surface:** DataFusion 55 with `WITH RECURSIVE` CTEs, window functions
   (`OVER`/`PARTITION BY`), `CREATE TABLE AS SELECT`, session-scoped
   `CREATE VIEW` plus `CREATE MATERIALIZED VIEW`, multi-statement execution in a
   single `run()` call, and an FTS ranking UDF
@@ -409,14 +409,14 @@ Prebuilt `libmongreldb` (core engine) and `libmongreldb_kit` (Kit layer) archive
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.64.18-linux-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.64.19-linux-x64.jar` |
 | Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | — |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.64.18-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.64.18-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.64.18-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.64.18-windows-x64.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.64.19-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.64.19-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.64.19-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.64.19-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.64.18.jar`) with all five JVM targets bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.64.19.jar`) with all five JVM targets bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 
@@ -487,7 +487,7 @@ crates/mongreldb-core/    WAL, memtable, Bε-tree, sorted runs (mmap'd), vectori
                           columnar codec, six secondary index kinds (Bitmap/PGM/FM/
                           ANN/Sparse/MinHash), page stats, encryption, constraints,
                           compaction, GC, check/doctor
-crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projection
+crates/mongreldb-query/   DataFusion 55 SQL + Arrow frontend (predicate/projection
                           pushdown, multi-table joins, ann_search/sparse_match UDF,
                           result cache, Arrow IPC shadow, materialized views)
 crates/mongreldb-types/   shared durable/network types: cluster-wide identifiers,

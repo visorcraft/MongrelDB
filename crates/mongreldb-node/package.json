@@ -1,6 +1,6 @@
 {
   "name": "@visorcraft/mongreldb",
-  "version": "0.64.18",
+  "version": "0.64.19",
   "description": "High-performance Node.js bindings for MongrelDB with native in-process storage, sub-ms writes, and hybrid indexing.",
   "homepage": "https://www.mongreldb.com",
   "main": "index.js",
@@ -31,7 +31,7 @@
     "mongreldb.*.node"
   ],
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^2.18.4"
   },
   "engines": {
     "node": ">= 16"

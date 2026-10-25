@@ -4961,7 +4961,7 @@ fn parse_stmt_ident(s: &str) -> Option<String> {
 }
 
 /// Whether `sql` is an `EXPLAIN ANALYZE ...` statement. EXPLAIN ANALYZE falls
-/// through to DataFusion 54 (which executes the plan and reports per-operator
+/// through to DataFusion 55 (which executes the plan and reports per-operator
 /// timing), but its output must never be result-cached: the timing metrics are
 /// request-specific and would be misleading on a cache hit.
 fn is_explain_analyze(sql: &str) -> bool {

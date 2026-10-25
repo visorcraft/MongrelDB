@@ -1,6 +1,6 @@
 //! Integration tests for EXPLAIN ANALYZE (#8 observability).
 //!
-//! `EXPLAIN ANALYZE` falls through to DataFusion 54's native execution-time
+//! `EXPLAIN ANALYZE` falls through to DataFusion 55's native execution-time
 //! plan introspection (it is NOT the SQLite-style `EXPLAIN QUERY PLAN`, which
 //! is intercepted separately). These tests verify it runs against a real table
 //! and that its output is never served from the result cache — timing metrics
