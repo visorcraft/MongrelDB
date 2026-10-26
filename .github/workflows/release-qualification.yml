@@ -91,6 +91,7 @@ jobs:
             "$QUAL_DIR/ci-benchmark-thresholds.json" \
             --expected-sha "$source_sha"
           MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
+            MONGRELDB_AI_CONCURRENCY_DEADLINE_SECS=180 \
             cargo run --locked -p mongreldb-core --release --all-features \
             --example ai_concurrency_bench \
             > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"

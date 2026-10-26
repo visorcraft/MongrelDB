@@ -105,6 +105,10 @@ fn main() {
         if read_kind == "long" { 10_000 } else { 100 },
     )
     .min(rows);
+    let deadline = std::time::Duration::from_secs(env_usize(
+        "MONGRELDB_AI_CONCURRENCY_DEADLINE_SECS",
+        30,
+    ) as u64);
     let dir = tempfile::tempdir().unwrap();
     let database = Arc::new(Database::create(dir.path()).unwrap());
     database.create_table("docs", schema(dimension)).unwrap();
@@ -159,6 +163,31 @@ fn main() {
         limit: 10,
         metric: VectorMetric::Cosine,
     };
+    // The table lock is exclusive. A cold index rebuild inside the first
+    // reader holds it long enough for every other reader's deadline to expire.
+    {
+        let context = AiExecutionContext::with_timeout(deadline, 1_000_000);
+        database
+            .with_authorized_scored_read_context_at(
+                "docs",
+                Some(&principal),
+                false,
+                Some(&authorization),
+                Some(&context),
+                None,
+                |table, snapshot, candidate_authorization, _| {
+                    table
+                        .ann_rerank_at_with_candidate_authorization_on_generation(
+                            &request,
+                            snapshot,
+                            candidate_authorization,
+                            Some(&context),
+                        )
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+    }
     let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(rows));
     let mut scenarios = Vec::new();
     for readers in [1usize, 4, 16, 32] {
@@ -177,10 +206,8 @@ fn main() {
                         (0..operations)
                             .map(|_| {
                                 let started = Instant::now();
-                                let context = AiExecutionContext::with_timeout(
-                                    std::time::Duration::from_secs(30),
-                                    1_000_000,
-                                );
+                                let context =
+                                    AiExecutionContext::with_timeout(deadline, 1_000_000);
                                 database
                                     .with_authorized_scored_read_context_at(
                                         "docs",
