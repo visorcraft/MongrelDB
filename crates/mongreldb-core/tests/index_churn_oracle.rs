@@ -6799,7 +6799,7 @@ fn physical_ttl_reclaim_survives_clear_ttl() {
 }
 
 #[test]
-fn physical_ttl_reclaim_respects_model_pins() {
+fn physical_ttl_reclaim_ignores_model_pins() {
     let mut model = model::Model::default();
     let seq = model.advance();
     model.upsert_with_rid(
@@ -6809,19 +6809,20 @@ fn physical_ttl_reclaim_respects_model_pins() {
         8,
         seq,
     );
-    // FF-02: pin AFTER further advances so commit < pin sequence.
+    // FF-02: a later pin observes the commit, but compaction still drops a
+    // TTL-expired version. Pins do not shield expired rows.
     let _ = model.advance();
     let _ = model.advance();
-    let pin = model.snapshot(); // seq 3, row committed at 1
+    let pin = model.snapshot();
     model.push_pin(pin);
     model.set_ttl(3, 1);
     model.compact_physical(now_nanos());
     assert!(
-        !model
+        model
             .rows
             .iter()
             .any(|r| r.rid == 8 && r.physically_reclaimed),
-        "pin after commit must retain boundary expired version (FF-02)"
+        "a pin must not retain a TTL-expired version (FF-02)"
     );
     model.pins.clear();
     model.compact_physical(now_nanos());
@@ -6830,13 +6831,13 @@ fn physical_ttl_reclaim_respects_model_pins() {
             .rows
             .iter()
             .any(|r| r.rid == 8 && r.physically_reclaimed),
-        "unpinned expired version must reclaim"
+        "releasing the pin must not resurrect a reclaimed version"
     );
 }
 
 #[test]
-fn pin_after_commit_retains_boundary_expired_version() {
-    physical_ttl_reclaim_respects_model_pins();
+fn pin_after_commit_does_not_retain_expired_version() {
+    physical_ttl_reclaim_ignores_model_pins();
 }
 
 #[test]
