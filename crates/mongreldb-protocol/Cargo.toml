@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "MongrelDB versioned protocol messages and service definitions (S1D)."
 
 [dependencies]
-mongreldb-types = { path = "../mongreldb-types", version = "0.65.0" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.65.1" }
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"

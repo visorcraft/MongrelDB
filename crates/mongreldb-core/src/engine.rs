@@ -3830,10 +3830,12 @@ impl Table {
             db.build_learned_ranges()?;
         }
 
-        // 3. Index the replayed WAL rows on top so updates overwrite. Within a
-        //    single transaction epoch duplicate PKs are upserted: only the last
-        //    winner is indexed, losers are tombstoned in the already-replayed
-        //    memtable.
+        // 3. Replay overlay: PK winner/loser tombstone maintenance always
+        //    runs (rebuild is per-RowId and does not apply same-PK replace
+        //    tombstones). Index the replayed rows only when the checkpoint
+        //    was loaded — a full rebuild already folded the memtable, which
+        //    already contains these rows. Re-inserting would double Sparse
+        //    scores and duplicate ANN nodes.
         for (epoch, group) in replayed_puts {
             let (losers, winner_pks) = db.partition_pk_winners(&group);
             for (key, &row_id) in &winner_pks {
@@ -3854,9 +3856,11 @@ impl Table {
                     db.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
                 }
             }
-            for r in &group {
-                if !losers.contains(&r.row_id) {
-                    db.index_row(r);
+            if checkpoint_valid {
+                for r in &group {
+                    if !losers.contains(&r.row_id) {
+                        db.index_row(r);
+                    }
                 }
             }
         }
@@ -4422,11 +4426,16 @@ impl Table {
         // Pin-aware historical discovery for EVERY active pin source that
         // compact honors via min_active_snapshot — local pin_snapshot pins,
         // Database SnapshotRegistry pins, PinRegistry (backup/replication/
-        // read-generation/…), and history_floor. Registry-only pins must not
-        // lose BitmapEq after compact rebuild.
+        // read-generation/…), and history_floor. Winner-takes-all at the
+        // unbounded snapshot drops rows only pinned readers still need;
+        // restore those rows into every secondary (not just Bitmap) so
+        // retrieve_at / BitmapEq / FmContains still answer at the pin.
+        // Dedup by RowId: Sparse/MinHash/ANN insert is additive, and the
+        // same historical rid can be visible at more than one pin epoch.
         let pin_epochs = self.active_pin_epochs_for_rebuild();
         if !pin_epochs.is_empty() {
             let current_snap = Snapshot::at(Epoch(u64::MAX));
+            let mut historical: HashMap<RowId, Row> = HashMap::new();
             for pin_epoch in pin_epochs {
                 if let Some(control) = control {
                     control.checkpoint()?;
@@ -4441,8 +4450,11 @@ impl Table {
                         if row.deleted || self.row_expired_at(&row, ttl_now) {
                             continue;
                         }
+                        if historical.contains_key(&row.row_id) {
+                            continue;
+                        }
                         if self.get(row.row_id, current_snap).is_none() {
-                            self.index_bitmap_membership_only(&row);
+                            historical.insert(row.row_id, row);
                         }
                     }
                 }
@@ -4455,15 +4467,66 @@ impl Table {
                     if row.deleted || self.row_expired_at(&row, ttl_now) {
                         continue;
                     }
+                    if historical.contains_key(&row.row_id) {
+                        continue;
+                    }
                     if self.get(row.row_id, current_snap).is_none() {
-                        self.index_bitmap_membership_only(&row);
+                        historical.insert(row.row_id, row);
                     }
                 }
+            }
+            for row in historical.into_values() {
+                self.index_secondary_membership_only(&row);
             }
         }
         self.recent_delete_preimages.clear();
         self.refresh_pk_by_row_from_hot();
         Ok(())
+    }
+
+    /// Index every secondary for `row` without touching HOT. Used to restore
+    /// pin-needed discovery / retrieval keys after a live-only rebuild.
+    /// Bitmap keeps the HMAC-aware `bitmap_key_for_column` path; other kinds
+    /// go through `index_into_single` so Sparse/MinHash/ANN/FM match put.
+    fn index_secondary_membership_only(&mut self, row: &Row) {
+        if row.deleted {
+            return;
+        }
+        self.index_bitmap_membership_only(row);
+        let effective = if self.column_keys.is_empty() {
+            None
+        } else {
+            Some(self.tokenized_for_indexes(row))
+        };
+        let source = effective.as_ref().unwrap_or(row);
+        let columns_map: HashMap<u16, &Value> = row.columns.iter().map(|(k, v)| (*k, v)).collect();
+        let name_to_id: HashMap<&str, u16> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.id))
+            .collect();
+        for idef in &self.schema.indexes {
+            if idef.kind == crate::schema::IndexKind::Bitmap {
+                continue;
+            }
+            if let Some(pred) = &idef.predicate {
+                if !eval_partial_predicate(pred, &columns_map, &name_to_id) {
+                    continue;
+                }
+            }
+            index_into_single(
+                idef,
+                &self.schema,
+                source,
+                &mut self.hot,
+                &mut self.bitmap,
+                &mut self.ann,
+                &mut self.fm,
+                &mut self.sparse,
+                &mut self.minhash,
+            );
+        }
     }
 
     /// Index Bitmap secondaries for `row` without touching HOT / ANN / etc.
@@ -11271,8 +11334,8 @@ impl Table {
         snap
     }
 
-    /// Every epoch that pin-aware index rebuild must restore Bitmap discovery
-    /// for — the full set of reader/retention pins that
+    /// Every epoch that pin-aware index rebuild must restore secondary
+    /// discovery / retrieval for — the full set of reader/retention pins that
     /// [`Self::min_active_snapshot`] folds into compaction GC, not just the
     /// oldest and not just the standalone `pin_snapshot` map.
     ///

@@ -5320,7 +5320,9 @@ fn churn_oracle_sparse_snapshot_history() {
         .expect("put b")
         .0;
     table.commit().expect("commit");
-    table.flush().expect("flush");
+    // Default flush only coalesces into the in-memory mutable run (8 MiB
+    // watermark), so compact() would be a no-op (gate: run_refs < 2).
+    table.force_flush().expect("flush");
     // rid_a scores 1*1 + 1*2 = 3.0; rid_b scores 0.5.
     let baseline = [(rid_a, 3.0), (rid_b, 0.5)];
 
@@ -5372,9 +5374,20 @@ fn churn_oracle_sparse_snapshot_history() {
     );
 
     // Flush + compaction must not disturb the pinned historical answer
-    // (the local pin holds the GC floor).
-    table.flush().expect("flush");
+    // (the local pin holds the GC floor). force_flush so the second spill
+    // is a real `.sr` run; compact is a no-op below two runs.
+    table.force_flush().expect("flush");
+    assert!(
+        table.run_count() >= 2,
+        "need two runs so compact actually merges (got {})",
+        table.run_count()
+    );
     table.compact().expect("compact");
+    assert_eq!(
+        table.run_count(),
+        1,
+        "compact must merge pinned historical versions into one run"
+    );
     assert_sparse_hits(
         &sparse_hits(&mut table, pinned2),
         &after_update,
@@ -5449,7 +5462,7 @@ fn churn_oracle_minhash_snapshot_history() {
         ])
         .expect("put noise");
     table.commit().expect("commit");
-    table.flush().expect("flush");
+    table.force_flush().expect("flush");
 
     let pinned = table.pin_snapshot();
     let baseline = minhash_hits(&mut table, pinned, 10);
@@ -5516,8 +5529,18 @@ fn churn_oracle_minhash_snapshot_history() {
     );
 
     // Flush + compaction with the pin held, then close + reopen.
-    table.flush().expect("flush");
+    table.force_flush().expect("flush");
+    assert!(
+        table.run_count() >= 2,
+        "need two runs so compact actually merges (got {})",
+        table.run_count()
+    );
     table.compact().expect("compact");
+    assert_eq!(
+        table.run_count(),
+        1,
+        "compact must merge pinned historical versions into one run"
+    );
     let at_pinned2 = minhash_hits(&mut table, pinned2, 10);
     assert!(
         at_pinned2.iter().any(|(r, est)| *r == rid_b && *est == 1.0),

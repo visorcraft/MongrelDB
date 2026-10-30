@@ -3,7 +3,7 @@
 //! Focus areas: record loss/corruption/hiding, count correctness, reopen
 //! durability, schema evolution, partial puts, duplicate PKs, and visibility.
 
-use mongreldb_core::query::{Condition, Query};
+use mongreldb_core::query::{Condition, Query, Retriever, RetrieverScore};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::{RowId, Table, Value};
 use tempfile::tempdir;
@@ -34,6 +34,64 @@ fn base_schema() -> Schema {
         constraints: Default::default(),
         clustered: false,
     }
+}
+
+fn schema_with_sparse() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "terms".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "terms_sparse".into(),
+            column_id: 2,
+            kind: IndexKind::Sparse,
+            predicate: None,
+            options: Default::default(),
+        }],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
+fn pack_sparse_terms(terms: &[(u32, f32)]) -> Vec<u8> {
+    bincode::serialize(terms).expect("sparse terms")
+}
+
+fn sparse_dot_scores(table: &mut Table) -> Vec<(u64, f64)> {
+    table
+        .retrieve_at(
+            &Retriever::Sparse {
+                column_id: 2,
+                query: vec![(1, 1.0), (3, 2.0)],
+                k: 10,
+            },
+            table.snapshot(),
+            None,
+        )
+        .expect("sparse retrieve")
+        .into_iter()
+        .map(|h| match h.score {
+            RetrieverScore::SparseDotProduct(d) => (h.row_id.0, d),
+            _ => (h.row_id.0, 0.0),
+        })
+        .collect()
 }
 
 fn schema_with_bitmap() -> Schema {
@@ -1150,4 +1208,152 @@ fn bulk_load_fast_rejects_not_null_violation() {
     let res = t.bulk_load_fast(vec![(1, pk), (2, v)]);
     assert!(res.is_err(), "bulk_load_fast must enforce NOT NULL");
     assert_eq!(t.count(), 0);
+}
+
+/// Crash after commit (no close/flush) with the index checkpoint missing:
+/// WAL replay + rebuild_indexes_from_runs must not both insert the same
+/// Sparse postings (additive scores would double).
+#[test]
+fn crash_reopen_with_invalid_checkpoint_does_not_double_index_sparse() {
+    let dir = tempdir().unwrap();
+    let (rid_a, rid_b) = {
+        let mut t = Table::create(dir.path(), schema_with_sparse(), 1).unwrap();
+        let rid_a = t
+            .put(vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 1.0), (3, 1.0)]))),
+            ])
+            .unwrap()
+            .0;
+        let rid_b = t
+            .put(vec![
+                (1, Value::Int64(2)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 0.5)]))),
+            ])
+            .unwrap()
+            .0;
+        t.commit().unwrap();
+        // Crash: drop without close() so committed rows stay unflushed and
+        // WAL replay is non-empty. close() would force-flush and hide the bug.
+        (rid_a, rid_b)
+    };
+    let _ = std::fs::remove_dir_all(dir.path().join("_idx"));
+
+    let mut t = Table::open(dir.path()).unwrap();
+    let scores = sparse_dot_scores(&mut t);
+    assert_eq!(scores.len(), 2, "expected two hits, got {scores:?}");
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_a && (score - 3.0).abs() <= 1e-5),
+        "rid {rid_a} must score 3.0 once, not 6.0: {scores:?}"
+    );
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_b && (score - 0.5).abs() <= 1e-5),
+        "rid {rid_b} must score 0.5 once, not 1.0: {scores:?}"
+    );
+}
+
+/// Valid checkpoint + committed-but-unflushed WAL: replay must still index
+/// the unflushed row exactly once (rebuild did not run).
+#[test]
+fn crash_reopen_with_valid_checkpoint_indexes_unflushed_sparse_once() {
+    let dir = tempdir().unwrap();
+    let (rid_a, rid_b, rid_c) = {
+        let mut t = Table::create(dir.path(), schema_with_sparse(), 1).unwrap();
+        let rid_a = t
+            .put(vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 1.0), (3, 1.0)]))),
+            ])
+            .unwrap()
+            .0;
+        let rid_b = t
+            .put(vec![
+                (1, Value::Int64(2)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 0.5)]))),
+            ])
+            .unwrap()
+            .0;
+        t.commit().unwrap();
+        t.force_flush().unwrap();
+        let rid_c = t
+            .put(vec![
+                (1, Value::Int64(3)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 4.0)]))),
+            ])
+            .unwrap()
+            .0;
+        t.commit().unwrap();
+        (rid_a, rid_b, rid_c)
+    };
+
+    let mut t = Table::open(dir.path()).unwrap();
+    let scores = sparse_dot_scores(&mut t);
+    assert_eq!(scores.len(), 3, "expected three hits, got {scores:?}");
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_a && (score - 3.0).abs() <= 1e-5),
+        "flushed rid {rid_a} must score 3.0: {scores:?}"
+    );
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_b && (score - 0.5).abs() <= 1e-5),
+        "flushed rid {rid_b} must score 0.5: {scores:?}"
+    );
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_c && (score - 4.0).abs() <= 1e-5),
+        "unflushed rid {rid_c} must be indexed once (score 4.0), not missing or 8.0: {scores:?}"
+    );
+}
+
+/// Flushed runs + unflushed WAL + deleted checkpoint: rebuild folds both
+/// tiers, so replay must not re-insert the unflushed Sparse postings.
+#[test]
+fn crash_reopen_after_flush_with_invalid_checkpoint_indexes_sparse_once() {
+    let dir = tempdir().unwrap();
+    let (rid_a, rid_c) = {
+        let mut t = Table::create(dir.path(), schema_with_sparse(), 1).unwrap();
+        let rid_a = t
+            .put(vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 1.0), (3, 1.0)]))),
+            ])
+            .unwrap()
+            .0;
+        t.commit().unwrap();
+        t.force_flush().unwrap();
+        let rid_c = t
+            .put(vec![
+                (1, Value::Int64(3)),
+                (2, Value::Bytes(pack_sparse_terms(&[(1, 4.0)]))),
+            ])
+            .unwrap()
+            .0;
+        t.commit().unwrap();
+        (rid_a, rid_c)
+    };
+    let _ = std::fs::remove_dir_all(dir.path().join("_idx"));
+
+    let mut t = Table::open(dir.path()).unwrap();
+    let scores = sparse_dot_scores(&mut t);
+    assert_eq!(scores.len(), 2, "expected two hits, got {scores:?}");
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_a && (score - 3.0).abs() <= 1e-5),
+        "run-resident rid {rid_a} must score 3.0 once: {scores:?}"
+    );
+    assert!(
+        scores
+            .iter()
+            .any(|(rid, score)| *rid == rid_c && (score - 4.0).abs() <= 1e-5),
+        "replayed rid {rid_c} must score 4.0 once, not 8.0: {scores:?}"
+    );
 }

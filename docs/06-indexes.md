@@ -43,7 +43,8 @@ materialize paths filter tombstones via MVCC visibility (and
 `had_deletes`-aware count materialization). Kit delete+put re-points Bitmap
 keys on the subsequent put using a retained pre-image. Compaction /
 `rebuild_indexes` rebuilds live memberships and re-indexes pin-needed
-historical discovery keys when pins are active.
+historical discovery / retrieval keys for every secondary kind (not just
+Bitmap) when pins are active.
 
 ### Rebuild after desync
 
