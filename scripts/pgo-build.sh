@@ -96,17 +96,29 @@ else
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "+ $INSTR_TARGET/release/deps/scale_test-* loopback_point_query_p95_baseline --nocapture"
     else
-        scale_bin=""
-        shopt -s nullglob
-        for candidate in "$INSTR_TARGET/release/deps"/scale_test-*; do
-            if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-                scale_bin=$candidate
-                break
-            fi
-        done
-        shopt -u nullglob
-        if [ -z "$scale_bin" ]; then
-            echo "error: no instrumented scale_test binary under $INSTR_TARGET/release/deps" >&2
+        # Ask cargo for the harness path. A name glob misses the binary when
+        # the hash suffix or deps layout differs from the one this script assumed.
+        scale_bin=$(
+            env RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" CARGO_TARGET_DIR="$INSTR_TARGET" \
+                cargo +stable test --no-run --release -p mongreldb-server --test scale_test \
+                --message-format=json "${features_args[@]}" \
+                | python3 -c 'import json,sys
+found=""
+for line in sys.stdin:
+    line=line.strip()
+    if not line.startswith("{"):
+        continue
+    event=json.loads(line)
+    target=(event.get("target") or {}).get("name")
+    if event.get("reason")=="compiler-artifact" and target=="scale_test" and event.get("executable"):
+        found=event["executable"]
+if found:
+    print(found)
+'
+        )
+        if [ -z "$scale_bin" ] || [ ! -x "$scale_bin" ]; then
+            echo "error: no instrumented scale_test binary under $INSTR_TARGET" >&2
+            find "$INSTR_TARGET" -name 'scale_test*' -print >&2 || true
             exit 1
         fi
         run "$scale_bin" loopback_point_query_p95_baseline --nocapture

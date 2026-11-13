@@ -204,16 +204,26 @@ async fn failover_detection_and_availability_meets_p95_target() {
             tokio::time::sleep(POLL).await;
         };
 
-        // Availability: the group commits a client write again.
-        cluster
-            .group(new_leader)
-            .propose(
-                CommandKind::Transaction,
-                envelope(kill as u64 + 1),
-                &ExecutionControl::default(),
-            )
-            .await
-            .unwrap();
+        // Availability: the group commits a client write again. openraft 0.10
+        // can report the new leader before that node accepts a client write.
+        let write_deadline = Instant::now() + CONVERGE_TIMEOUT;
+        loop {
+            match cluster
+                .group(new_leader)
+                .propose(
+                    CommandKind::Transaction,
+                    envelope(kill as u64 + 1),
+                    &ExecutionControl::default(),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(ConsensusError::NotLeader { .. }) if Instant::now() < write_deadline => {
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(error) => panic!("post-failover propose failed: {error}"),
+            }
+        }
         samples.push(start.elapsed());
 
         // Restore the third voter for the next kill.

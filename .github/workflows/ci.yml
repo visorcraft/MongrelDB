@@ -67,6 +67,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --all-targets --all-features
       # Standalone variant (default features): the deployment measured by the

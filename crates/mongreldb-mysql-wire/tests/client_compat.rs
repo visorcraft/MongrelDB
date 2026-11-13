@@ -126,8 +126,20 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
         ))
         .max_allowed_packet(Some(16 * 1024 * 1024))
         .wait_timeout(Some(60));
-    let pool = Pool::new(options);
-    let mut connection = pool.get_conn().await.unwrap();
+    // The listener is bound before the TLS task is scheduled. A client that
+    // handshakes in that gap sees EOF. Retry until the server accepts.
+    let mut connected = None;
+    for _ in 0..50 {
+        let pool = Pool::new(options.clone());
+        match pool.get_conn().await {
+            Ok(connection) => {
+                connected = Some((pool, connection));
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    let (pool, mut connection) = connected.expect("mysql wire listener did not accept TLS");
     connection
         .query_drop("CREATE TABLE wire_items (id BIGINT PRIMARY KEY, name TEXT)")
         .await
