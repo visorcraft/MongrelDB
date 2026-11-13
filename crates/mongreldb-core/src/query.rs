@@ -99,7 +99,7 @@ impl AiExecutionContext {
 
     pub fn consume(&self, work: usize) -> crate::Result<()> {
         self.checkpoint()?;
-        let result = self.remaining_work.fetch_update(
+        let result = self.remaining_work.try_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |remaining| remaining.checked_sub(work),

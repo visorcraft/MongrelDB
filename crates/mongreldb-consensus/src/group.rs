@@ -38,13 +38,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, RaftError};
+use openraft::async_runtime::WatchReceiver;
+use openraft::error::{
+    ChangeMembershipError, ClientWriteError, Fatal, LinearizableReadError, RaftError,
+};
 use openraft::{BasicNode, ChangeMembers, SnapshotPolicy};
-use tokio::sync::watch;
 
 use crate::error::ConsensusError;
 use crate::identity::{
-    log_position_of, ApplyResponse, CommandKind, MongrelRaft, RaftNodeId, ReplicatedCommand,
+    log_position_of, ApplyResponse, CommandKind, MongrelRaft, MongrelRaftConfig, RaftNodeId,
+    ReplicatedCommand,
 };
 use crate::network::{RaftTransport, TransportNetworkFactory};
 use crate::read::{ReadConsistency, ReadConsistencyError, ReadWatermark};
@@ -450,7 +453,12 @@ impl<T: RaftTransport> ConsensusGroup<T> {
             .last_applied
             .as_ref()
             .map_or(0, |log_id| log_id.index);
-        let last_log_index = self.raft.metrics().borrow().last_log_index.unwrap_or(0);
+        let last_log_index = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_log_index
+            .unwrap_or(0);
         if last_log_index > applied_index {
             let span = usize::try_from(last_log_index - applied_index).unwrap_or(usize::MAX);
             let tail = self
@@ -552,7 +560,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         // replication could otherwise surface a LeaderDisk receipt whose
         // durability is honest (local fsync) but not "leader-local".
         {
-            let metrics = self.raft.metrics().borrow().clone();
+            let metrics = self.raft.metrics().borrow_watched().clone();
             if metrics.current_leader != Some(self.config.node_id) {
                 return Err(ConsensusError::NotLeader {
                     leader: metrics.current_leader,
@@ -567,13 +575,14 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         // Register before proposing so the append cannot bind ahead of the
         // registration; the signal itself fires strictly post-fsync.
         let mut fsync_rx = self.shared_log.register_leader_disk_waiter(command_id)?;
-        let mut ff_rx = match self.raft.client_write_ff(command).await {
-            Ok(receiver) => receiver,
-            Err(fatal) => {
-                self.shared_log.deregister_leader_disk_waiter(command_id);
-                return Err(map_fatal(fatal));
-            }
-        };
+        let (responder, mut ff_rx) = openraft::impls::ProgressResponder::<
+            MongrelRaftConfig,
+            openraft::raft::ClientWriteResult<MongrelRaftConfig>,
+        >::complete_only();
+        if let Err(fatal) = self.raft.client_write_ff(command, Some(responder)).await {
+            self.shared_log.deregister_leader_disk_waiter(command_id);
+            return Err(map_fatal(fatal));
+        }
 
         tokio::select! {
             biased;
@@ -606,7 +615,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                         quorum_committed: false,
                     }),
                     Ok(Err(LeaderDiskDrop::Truncated)) => Err(ConsensusError::NotLeader {
-                        leader: self.raft.metrics().borrow().current_leader,
+                        leader: self.raft.metrics().borrow_watched().current_leader,
                     }),
                     Ok(Err(LeaderDiskDrop::Closed)) => Err(ConsensusError::Closed),
                     Err(_) => Err(ConsensusError::Raft(
@@ -633,12 +642,10 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         self.check_control(control)?;
         let (read_log_id, applied) = self
             .raft
-            .get_read_log_id()
+            .get_read_log_id(openraft::ReadPolicy::ReadIndex)
             .await
             .map_err(map_check_is_leader_error)?;
-        let Some(read_log_id) = read_log_id else {
-            return Ok(LogPosition::ZERO);
-        };
+        let read_log_id = *read_log_id.log_id();
         let applied_index = applied.as_ref().map_or(0, |log_id| log_id.index);
         if read_log_id.index > applied_index {
             let wait = self.raft.wait(remaining(control));
@@ -751,7 +758,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
             // caught-up read.
             ReadConsistency::BoundedStaleness { max_lag_ms } => {
                 let watermark = self.read_watermark()?;
-                let last_known_index = self.raft.metrics().borrow().last_log_index;
+                let last_known_index = self.raft.metrics().borrow_watched().last_log_index;
                 crate::read::evaluate_bounded_staleness(
                     &watermark,
                     last_known_index,
@@ -901,30 +908,48 @@ impl<T: RaftTransport> ConsensusGroup<T> {
 
     /// Adds a node as a learner and blocks until it is line-rate (spec
     /// section 11.6 step "add learner, catch up").
+    ///
+    /// A freshly established leader cannot append a membership entry until
+    /// its blank log is committed. This waits that condition out.
     pub async fn add_learner(
         &self,
         node_id: RaftNodeId,
         node: BasicNode,
     ) -> Result<(), ConsensusError> {
         self.ensure_open()?;
-        self.raft
-            .add_learner(node_id, node, true)
-            .await
-            .map_err(map_client_write_error)?;
-        Ok(())
+        let deadline = Instant::now() + MEMBERSHIP_COMMIT_WAIT;
+        loop {
+            let result = self.raft.add_learner(node_id, node.clone(), true).await;
+            if self
+                .accept_membership_write(result, deadline)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
     }
 
     /// Promotes a learner to voter through joint consensus (openraft's
     /// two-step `change_membership`).
     pub async fn promote(&self, node_id: RaftNodeId) -> Result<(), ConsensusError> {
         self.ensure_open()?;
-        let mut voters = BTreeSet::new();
-        voters.insert(node_id);
-        self.raft
-            .change_membership(ChangeMembers::AddVoterIds(voters), true)
-            .await
-            .map_err(map_client_write_error)?;
-        Ok(())
+        let deadline = Instant::now() + MEMBERSHIP_COMMIT_WAIT;
+        loop {
+            let mut voters = BTreeSet::new();
+            voters.insert(node_id);
+            let result = self
+                .raft
+                .change_membership(ChangeMembers::AddVoterIds(voters), true)
+                .await;
+            if self
+                .accept_membership_write(result, deadline)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
     }
 
     /// Removes a voter (or learner) through joint consensus; the node is not
@@ -932,23 +957,55 @@ impl<T: RaftTransport> ConsensusGroup<T> {
     /// leader (spec section 11.6).
     pub async fn remove(&self, node_id: RaftNodeId) -> Result<(), ConsensusError> {
         self.ensure_open()?;
-        let mut voters = BTreeSet::new();
-        voters.insert(node_id);
-        self.raft
-            .change_membership(ChangeMembers::RemoveVoters(voters), false)
-            .await
-            .map_err(map_client_write_error)?;
-        Ok(())
+        let deadline = Instant::now() + MEMBERSHIP_COMMIT_WAIT;
+        loop {
+            let mut voters = BTreeSet::new();
+            voters.insert(node_id);
+            let result = self
+                .raft
+                .change_membership(ChangeMembers::RemoveVoters(voters), false)
+                .await;
+            if self
+                .accept_membership_write(result, deadline)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// `Ok(Some)` when the membership write committed. `Ok(None)` when the
+    /// leader has not yet committed a log of its own term and the caller
+    /// should retry. Any other rejection is returned.
+    async fn accept_membership_write<R>(
+        &self,
+        result: Result<R, RaftError<MongrelRaftConfig, ClientWriteError<MongrelRaftConfig>>>,
+        deadline: Instant,
+    ) -> Result<Option<R>, ConsensusError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::UncommittedLeaderLog(_),
+            ))) => {
+                if Instant::now() >= deadline {
+                    return Err(ConsensusError::DeadlineExceeded);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(None)
+            }
+            Err(other) => Err(map_client_write_error(other)),
+        }
     }
 
     /// Current membership as seen by this node: `(voters, learners)`.
     pub fn members(&self) -> (Vec<RaftNodeId>, Vec<RaftNodeId>) {
         let metrics_rx = self.raft.metrics();
-        let metrics = metrics_rx.borrow();
+        let metrics = metrics_rx.borrow_watched();
         let membership = metrics.membership_config.membership();
         (
             membership.voter_ids().collect(),
-            membership.learner_ids().collect(),
+            membership.non_write_voter_ids().collect(),
         )
     }
 
@@ -956,7 +1013,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
     /// config.
     pub fn is_joint_membership(&self) -> bool {
         let metrics_rx = self.raft.metrics();
-        let metrics = metrics_rx.borrow();
+        let metrics = metrics_rx.borrow_watched();
         metrics
             .membership_config
             .membership()
@@ -976,7 +1033,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         loop {
             {
                 let metrics_rx = self.raft.metrics();
-                let metrics = metrics_rx.borrow();
+                let metrics = metrics_rx.borrow_watched();
                 let settled = metrics.membership_config.log_id().is_some()
                     && metrics
                         .membership_config
@@ -1002,7 +1059,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         timeout: Duration,
     ) -> Result<(), ConsensusError> {
         self.ensure_open()?;
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         if metrics.current_leader != Some(self.config.node_id) {
             return Err(ConsensusError::NotLeader {
                 leader: metrics.current_leader,
@@ -1055,7 +1112,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
 
     /// Observability metrics (spec section 14.4).
     pub fn metrics(&self) -> GroupMetrics {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         GroupMetrics {
             node_id: self.config.node_id,
             state: metrics.state,
@@ -1065,13 +1122,21 @@ impl<T: RaftTransport> ConsensusGroup<T> {
             last_applied: metrics.last_applied.as_ref().map(log_position_of),
             snapshot: metrics.snapshot.as_ref().map(log_position_of),
             purged: metrics.purged.as_ref().map(log_position_of),
+            // openraft 0.10 stores an absolute ack time and still fills this
+            // derived field for callers that report milliseconds.
+            #[allow(deprecated)]
             millis_since_quorum_ack: metrics.millis_since_quorum_ack,
         }
     }
 
     /// A watch receiver of openraft's raw metrics (event-driven waits in
     /// tests and the server wave).
-    pub fn raw_metrics(&self) -> watch::Receiver<openraft::RaftMetrics<RaftNodeId, BasicNode>> {
+    pub fn raw_metrics(
+        &self,
+    ) -> openraft::type_config::alias::WatchReceiverOf<
+        MongrelRaftConfig,
+        openraft::RaftMetrics<MongrelRaftConfig>,
+    > {
         self.raft.metrics()
     }
 
@@ -1108,6 +1173,11 @@ fn remaining(control: &ExecutionControl) -> Option<Duration> {
 /// snapshot-read apply wait (ExecutionControl has no async notification).
 const BARRIER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How long a membership change waits for the leader to commit a log entry
+/// of its own term. Openraft 0.10 rejects the change until that blank log is
+/// quorum-committed, which a freshly elected leader has not done yet.
+const MEMBERSHIP_COMMIT_WAIT: Duration = Duration::from_secs(30);
+
 /// Resolves when `control` fires (cancellation or deadline); pends forever
 /// when neither is configured. Used to bound the LeaderDisk fsync race.
 async fn wait_control(control: &ExecutionControl) -> ConsensusError {
@@ -1126,7 +1196,7 @@ async fn wait_control(control: &ExecutionControl) -> ConsensusError {
 }
 
 /// Maps a fatal raft-core failure (returned by `client_write_ff`).
-fn map_fatal(err: Fatal<RaftNodeId>) -> ConsensusError {
+fn map_fatal(err: Fatal<MongrelRaftConfig>) -> ConsensusError {
     match err {
         Fatal::Stopped => ConsensusError::Closed,
         other => ConsensusError::Raft(other.to_string()),
@@ -1135,11 +1205,15 @@ fn map_fatal(err: Fatal<RaftNodeId>) -> ConsensusError {
 
 /// Maps the raft core's client-write answer (the `ForwardToLeader` reply a
 /// non-leader sends through the responder, spec section 11.7).
-fn map_client_write_api_error(err: ClientWriteError<RaftNodeId, BasicNode>) -> ConsensusError {
+fn map_client_write_api_error(err: ClientWriteError<MongrelRaftConfig>) -> ConsensusError {
     match err {
-        ClientWriteError::ForwardToLeader(forward) => ConsensusError::NotLeader {
+        ClientWriteError::ForwardToLeader(forward)
+        | ClientWriteError::LogEntryDiscarded(forward) => ConsensusError::NotLeader {
             leader: forward.leader_id,
         },
+        ClientWriteError::PreconditionFailed(error) => {
+            ConsensusError::InvalidRequest(error.to_string())
+        }
         ClientWriteError::ChangeMembershipError(e) => match e {
             openraft::error::ChangeMembershipError::InProgress(_) => {
                 ConsensusError::MembershipInProgress
@@ -1150,7 +1224,7 @@ fn map_client_write_api_error(err: ClientWriteError<RaftNodeId, BasicNode>) -> C
 }
 
 fn map_client_write_error(
-    err: RaftError<RaftNodeId, ClientWriteError<RaftNodeId, BasicNode>>,
+    err: RaftError<MongrelRaftConfig, ClientWriteError<MongrelRaftConfig>>,
 ) -> ConsensusError {
     match err {
         RaftError::APIError(api) => map_client_write_api_error(api),
@@ -1160,15 +1234,15 @@ fn map_client_write_error(
 }
 
 fn map_check_is_leader_error(
-    err: RaftError<RaftNodeId, CheckIsLeaderError<RaftNodeId, BasicNode>>,
+    err: RaftError<MongrelRaftConfig, LinearizableReadError<MongrelRaftConfig>>,
 ) -> ConsensusError {
     match err {
-        RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)) => {
+        RaftError::APIError(LinearizableReadError::ForwardToLeader(forward)) => {
             ConsensusError::NotLeader {
                 leader: forward.leader_id,
             }
         }
-        RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)) => {
+        RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
             ConsensusError::NotLeader { leader: None }
         }
         RaftError::Fatal(Fatal::Stopped) => ConsensusError::Closed,

@@ -193,7 +193,7 @@ fn client_config(
 async fn real_tls_http2_listener_validates_ca_and_hostname() {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let certificate_pem = certified.cert.pem().into_bytes();
-    let private_key_pem = certified.key_pair.serialize_pem().into_bytes();
+    let private_key_pem = certified.signing_key.serialize_pem().into_bytes();
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     drop(socket);
@@ -335,15 +335,14 @@ async fn native_mtls_accepts_client_certificate() {
         .push(rcgen::DnType::CommonName, "test-ca");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
     let server_key = rcgen::KeyPair::generate().unwrap();
     let mut server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "localhost");
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
     let client_key = rcgen::KeyPair::generate().unwrap();
     let mut client_params = rcgen::CertificateParams::new(vec!["client".into()]).unwrap();
@@ -351,9 +350,7 @@ async fn native_mtls_accepts_client_certificate() {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "client");
     client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .unwrap();
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
 
     let ca_pem = ca_cert.pem().into_bytes();
     let server_cert_pem = server_cert.pem().into_bytes();

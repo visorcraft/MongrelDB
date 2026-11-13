@@ -1475,7 +1475,7 @@ fn sign_manifest_mac(
     use hmac::Mac as _;
 
     let key = kek.derive_subkey(MANIFEST_KEY_DOMAIN);
-    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key.as_ref())
+    let mut mac = <hmac::Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key.as_ref())
         .map_err(|error| MongrelError::Encryption(format!("PITR HMAC key: {error}")))?;
     mac.update(MANIFEST_AUTH_DOMAIN);
     mac.update(&manifest_auth_bytes(manifest)?);
@@ -1491,7 +1491,7 @@ fn verify_manifest_mac(manifest: &PitrArchiveManifest, kek: &crate::encryption::
         .ok_or_else(|| MongrelError::InvalidArgument("missing PITR authentication".into()))?;
     let expected = decode_sha256(authentication, "PITR manifest authentication")?;
     let key = kek.derive_subkey(MANIFEST_KEY_DOMAIN);
-    let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(key.as_ref())
+    let mut mac = <hmac::Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key.as_ref())
         .map_err(|error| MongrelError::Encryption(format!("PITR HMAC key: {error}")))?;
     mac.update(MANIFEST_AUTH_DOMAIN);
     mac.update(&manifest_auth_bytes(manifest)?);
@@ -1512,7 +1512,7 @@ fn decode_sha256(value: &str, label: &str) -> Result<[u8; 32]> {
         return invalid_pitr(format!("{label} is not lowercase SHA-256 hex"));
     }
     let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         bytes[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(bytes)

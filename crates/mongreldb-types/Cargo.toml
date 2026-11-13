@@ -10,8 +10,8 @@ description = "MongrelDB shared identifiers, HLC timestamps, durability primitiv
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
-getrandom = "0.2"
+thiserror = "2"
+getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

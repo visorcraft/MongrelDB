@@ -328,7 +328,7 @@ impl IdempotencyIntegrity {
     }
 
     pub(crate) fn authenticate(&self, domain: &[u8], bytes: &[u8]) -> [u8; 32] {
-        let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(self.key.as_ref())
+        let mut mac = <hmac::Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.key.as_ref())
             .expect("HMAC accepts a 32-byte key");
         mac.update(domain);
         mac.update(bytes);
@@ -336,7 +336,7 @@ impl IdempotencyIntegrity {
     }
 
     pub(crate) fn verify(&self, domain: &[u8], bytes: &[u8], tag: &[u8; 32]) -> bool {
-        let mut mac = <hmac::Hmac<Sha256> as hmac::Mac>::new_from_slice(self.key.as_ref())
+        let mut mac = <hmac::Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.key.as_ref())
             .expect("HMAC accepts a 32-byte key");
         mac.update(domain);
         mac.update(bytes);

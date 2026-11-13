@@ -9,24 +9,27 @@ homepage.workspace = true
 description = "MongrelDB consensus adapter over openraft (Stage 2; see docs/architecture/adr/0004)."
 
 [dependencies]
-# storage-v2: split RaftLogStorage/RaftStateMachine traits are implementable
-# by downstream crates only with this feature. serde: serde derives on openraft
-# wire/durable types (Vote, LogId, Entry, Membership) which our checksummed
-# on-disk frames serialize.
-openraft = { version = "0.9", features = ["storage-v2", "serde"] }
-tokio = { version = "1.54.1", features = ["sync", "rt", "time", "macros"] }
+# serde: Serialize/Deserialize on openraft wire and durable types (Vote,
+# LogId, Entry, Membership) which the checksummed on-disk frames use.
+# The split log and state-machine traits are unconditional in 0.10.
+openraft = { version = "0.10", features = ["serde"] }
+# v1 chunked snapshot RPCs. openraft 0.10 moved that wire protocol here and
+# adapts it to RaftNetworkV2.
+openraft-legacy = { version = "0.10", features = ["serde"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "time", "macros", "io-util"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = "1"
-sha2 = "0.10"
-thiserror = "1"
-mongreldb-types = { path = "../mongreldb-types", version = "0.65.1" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.65.1" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.65.1" }
+sha2 = "0.11"
+thiserror = "2"
+mongreldb-types = { path = "../mongreldb-types", version = "0.66.0" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.66.0" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.66.0" }
 # Stage 2E engine binding: the apply sink drives a core DatabaseCore through
 # the replicated apply path (engine_sink.rs).
-mongreldb-core = { path = "../mongreldb-core", version = "0.65.1" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.66.0" }
 
 [dev-dependencies]
-mongreldb-sim = { path = "../mongreldb-sim", version = "0.65.1" }
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.66.0" }
 tempfile = "3"

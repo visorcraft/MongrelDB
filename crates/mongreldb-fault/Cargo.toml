@@ -9,4 +9,4 @@ homepage.workspace = true
 description = "MongrelDB named fault-injection hooks (FND-006). Disabled unless activated."
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"

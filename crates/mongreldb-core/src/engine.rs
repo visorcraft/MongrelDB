@@ -5010,7 +5010,7 @@ impl Table {
                 crate::schema::DefaultExpr::Now => Value::Bytes(iso_now_bytes()),
                 crate::schema::DefaultExpr::Uuid => {
                     let mut buf = [0u8; 16];
-                    getrandom::getrandom(&mut buf)
+                    getrandom::fill(&mut buf)
                         .map_err(|e| MongrelError::Other(format!("UUID generation failed: {e}")))?;
                     Value::Uuid(buf)
                 }

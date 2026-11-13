@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-jni"
-version = "0.65.1"
+version = "0.66.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -25,7 +25,7 @@ mongreldb-kit-core = "=0.65.1"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
 mongreldb-types = "0.65.1"
 # The jni crate provides Rust bindings to the JNI API.
-jni = { version = "0.21", features = ["invocation"] }
+jni = { version = "0.22", features = ["invocation"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 # Standalone release unit (ADR-0011). Re-add [patch.crates-io] for local

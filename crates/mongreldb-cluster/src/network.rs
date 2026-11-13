@@ -68,11 +68,11 @@ use mongreldb_protocol::envelope::{
 };
 use mongreldb_types::ids::NodeId;
 use openraft::error::{NetworkError, RPCError, Timeout, Unreachable};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
 use openraft::RPCTypes;
+use openraft_legacy::network_v1::{
+    ChunkedSnapshotReceiver, InstallSnapshotRequest, InstallSnapshotResponse,
+};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1154,7 +1154,7 @@ impl RaftTransport for TcpTransport {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: AppendEntriesRequest<MongrelRaftConfig>,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, AppendRpcError> {
+    ) -> Result<AppendEntriesResponse<MongrelRaftConfig>, AppendRpcError> {
         let result = async {
             let payload = Self::encode_payload(target, &rpc)?;
             self.round_trip(
@@ -1181,8 +1181,8 @@ impl RaftTransport for TcpTransport {
         &self,
         from: RaftNodeId,
         target: RaftNodeId,
-        rpc: VoteRequest<RaftNodeId>,
-    ) -> Result<VoteResponse<RaftNodeId>, VoteRpcError> {
+        rpc: VoteRequest<MongrelRaftConfig>,
+    ) -> Result<VoteResponse<MongrelRaftConfig>, VoteRpcError> {
         let result = async {
             let payload = Self::encode_payload(target, &rpc)?;
             self.round_trip(
@@ -1210,7 +1210,7 @@ impl RaftTransport for TcpTransport {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: InstallSnapshotRequest<MongrelRaftConfig>,
-    ) -> Result<InstallSnapshotResponse<RaftNodeId>, SnapshotRpcError> {
+    ) -> Result<InstallSnapshotResponse<MongrelRaftConfig>, SnapshotRpcError> {
         let result = async {
             let payload = Self::encode_payload(target, &rpc)?;
             self.round_trip(
@@ -1498,7 +1498,11 @@ impl TransportServer {
                     registry,
                     RAFT_MSG_APPEND_ENTRIES_RESPONSE,
                     payload,
-                    |raft, rpc| async move { raft.append_entries(rpc).await },
+                    |raft, rpc| async move {
+                        raft.append_entries(rpc)
+                            .await
+                            .map(AppendEntriesResponse::from)
+                    },
                 )
                 .await
             }
@@ -1516,7 +1520,9 @@ impl TransportServer {
                     registry,
                     RAFT_MSG_INSTALL_SNAPSHOT_RESPONSE,
                     payload,
-                    |raft, rpc| async move { raft.install_snapshot(rpc).await },
+                    |raft, rpc| async move {
+                        ChunkedSnapshotReceiver::install_snapshot(&raft, rpc).await
+                    },
                 )
                 .await
             }
@@ -1531,7 +1537,7 @@ impl TransportServer {
                             "node {} is not attached to this transport",
                             request.target
                         )),
-                        Some(raft) => match raft.trigger().elect().await {
+                        Some(raft) => match raft.trigger().elect(false).await {
                             Ok(()) => (RAFT_MSG_TRIGGER_ELECTION_RESPONSE, Vec::new()),
                             Err(error) => Self::error_frame(format!("raft core error: {error}")),
                         },
@@ -1580,7 +1586,9 @@ impl TransportServer {
         Resp: Serialize,
         E: fmt::Display,
         F: FnOnce(MongrelRaft, Req) -> Fut,
-        Fut: std::future::Future<Output = Result<Resp, openraft::error::RaftError<RaftNodeId, E>>>,
+        Fut: std::future::Future<
+            Output = Result<Resp, openraft::error::RaftError<MongrelRaftConfig, E>>,
+        >,
     {
         let request = serde_json::from_slice::<RpcPayload<Req>>(payload);
         match request {

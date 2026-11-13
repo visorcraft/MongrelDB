@@ -638,7 +638,10 @@ impl MigrateIo for MemoryMigrateIo {
                 }
                 h.update([1]);
             }
-            format!("{:x}", h.finalize())
+            h.finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
         }
         let s = self.source.get(table).map(|r| sum(r)).unwrap_or_default();
         let t = self.target.get(table).map(|r| sum(r)).unwrap_or_default();

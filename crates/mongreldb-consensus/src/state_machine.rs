@@ -45,17 +45,19 @@
 //! `raft.snapshot.install.before` / `raft.snapshot.install.after`.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{ErrorSubject, ErrorVerb, Snapshot, StorageIOError};
+use futures::StreamExt;
+use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
+use openraft::type_config::TypeConfigExt;
+use openraft::{ErrorSubject, ErrorVerb, Snapshot};
+use openraft_legacy::network_v1::SnapshotReceiverFactory;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::identity::{
-    log_position_of, MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftNodeId, RaftSnapshotMeta,
+    log_position_of, MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftSnapshotMeta,
     RaftStorageError, RaftStoredMembership, ReplicatedCommand,
 };
 use crate::storage::{
@@ -96,13 +98,11 @@ pub enum StateMachineError {
 }
 
 fn raft_sm_error(
-    subject: ErrorSubject<RaftNodeId>,
+    subject: ErrorSubject<MongrelRaftConfig>,
     verb: ErrorVerb,
     err: StateMachineError,
 ) -> RaftStorageError {
-    RaftStorageError::IO {
-        source: StorageIOError::new(subject, verb, openraft::AnyError::new(&err)),
-    }
+    RaftStorageError::new(subject, verb, MongrelRaftConfig::err_from_error(&err))
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +386,14 @@ impl SharedStateMachine {
         )?;
         let meta = RaftSnapshotMeta {
             last_log_id: record.last_applied,
+            last_membership: membership.clone(),
+        };
+        let stored = CurrentSnapshot {
+            last_log_id: meta.last_log_id,
             last_membership: membership,
             snapshot_id: snapshot_id.clone(),
         };
-        let meta_body = encode_versioned(&meta)?;
+        let meta_body = encode_versioned(&stored)?;
         write_frame_file(
             &self.snapshot_dir(),
             "CURRENT",
@@ -408,10 +412,14 @@ impl SharedStateMachine {
         let Some(meta_body) = read_frame_file(&current_path, SNAP_CURRENT_MAGIC)? else {
             return Ok(None);
         };
-        let meta: RaftSnapshotMeta = decode_versioned(&current_path, &meta_body)?;
+        let stored: CurrentSnapshot = decode_versioned(&current_path, &meta_body)?;
+        let meta = RaftSnapshotMeta {
+            last_log_id: stored.last_log_id,
+            last_membership: stored.last_membership,
+        };
         let snap_path = self
             .snapshot_dir()
-            .join(format!("snap-{}.snap", meta.snapshot_id));
+            .join(format!("snap-{}.snap", stored.snapshot_id));
         let framed = std::fs::read(&snap_path).map_err(StoreError::io(&snap_path, "read"))?;
         // Verify the data frame before handing it out (fail closed).
         parse_framed(SNAP_MAGIC, &framed).map_err(|e| match e {
@@ -502,12 +510,12 @@ impl SharedStateMachine {
         if let Some(commit_ts) = snapshot.record.last_applied_commit_ts {
             self.observe_commit_ts(commit_ts);
         }
-        let meta = RaftSnapshotMeta {
+        let stored = CurrentSnapshot {
             last_log_id: snapshot.record.last_applied,
             last_membership: snapshot.membership,
             snapshot_id: snapshot_id.to_owned(),
         };
-        let meta_body = encode_versioned(&meta)?;
+        let meta_body = encode_versioned(&stored)?;
         write_frame_file(
             &self.snapshot_dir(),
             "CURRENT",
@@ -542,6 +550,17 @@ impl SharedStateMachine {
 
 /// Deterministic snapshot id from the checkpoint position and content hash,
 /// so identical snapshots install under identical names everywhere.
+/// On-disk CURRENT record. Field order matches the 0.9 `SnapshotMeta`
+/// bincode layout (`last_log_id`, `last_membership`, `snapshot_id`) so an
+/// existing snapshot pointer still opens. openraft 0.10 dropped `snapshot_id`
+/// from its metadata type; the filename still needs it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CurrentSnapshot {
+    last_log_id: Option<RaftLogId>,
+    last_membership: RaftStoredMembership,
+    snapshot_id: String,
+}
+
 fn snapshot_id_of(record: &AppliedRecord, body: &[u8]) -> String {
     let hash = Sha256::digest(body);
     let (term, index) = record
@@ -715,55 +734,103 @@ impl MongrelStateMachine {
         inner.record.last_applied = Some(entry.log_id);
         Ok(response)
     }
-}
 
-impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
-    type SnapshotBuilder = MongrelSnapshotBuilder;
-
-    async fn applied_state(
+    /// Applies a batch and returns each entry's response. Tests use this
+    /// directly; openraft's `apply` sends the same responses to waiters.
+    pub async fn apply_entries(
         &mut self,
-    ) -> Result<(Option<RaftLogId>, RaftStoredMembership), RaftStorageError> {
-        let inner = self
-            .shared
-            .lock()
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        Ok((inner.record.last_applied, inner.membership.clone()))
-    }
-
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<crate::identity::ApplyResponse>, RaftStorageError>
-    where
-        I: IntoIterator<Item = RaftLogEntry> + Send,
-        I::IntoIter: Send,
-    {
-        let entries: Vec<RaftLogEntry> = entries.into_iter().collect();
+        entries: Vec<RaftLogEntry>,
+    ) -> Result<Vec<crate::identity::ApplyResponse>, io::Error> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
         mongreldb_fault::inject("raft.sm.apply.before")
             .map_err(|f| StateMachineError::Sink(f.to_string()))
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            .map_err(|e| {
+                sm_io(raft_sm_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    e,
+                ))
+            })?;
         let mut responses = Vec::with_capacity(entries.len());
         for entry in &entries {
-            responses.push(
-                self.apply_one(entry)
-                    .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?,
-            );
+            responses.push(self.apply_one(entry).map_err(|e| {
+                sm_io(raft_sm_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    e,
+                ))
+            })?);
         }
-        // Checkpoint the applied record once per batch, fsynced.
-        let record = self
-            .shared
-            .applied_record()
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        self.shared
-            .persist_record(&record)
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+        let record = self.shared.applied_record().map_err(|e| {
+            sm_io(raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Read,
+                e,
+            ))
+        })?;
+        self.shared.persist_record(&record).map_err(|e| {
+            sm_io(raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                e,
+            ))
+        })?;
         mongreldb_fault::inject("raft.sm.apply.after")
             .map_err(|f| StateMachineError::Sink(f.to_string()))
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            .map_err(|e| {
+                sm_io(raft_sm_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    e,
+                ))
+            })?;
         Ok(responses)
+    }
+}
+
+fn sm_io(error: RaftStorageError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
+    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotBuilder = MongrelSnapshotBuilder;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<RaftLogId>, RaftStoredMembership), io::Error> {
+        let inner = self.shared.lock().map_err(|e| {
+            sm_io(raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Read,
+                e,
+            ))
+        })?;
+        Ok((inner.record.last_applied, inner.membership.clone()))
+    }
+
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
+    where
+        Strm: futures::Stream<Item = Result<EntryResponder<MongrelRaftConfig>, io::Error>>
+            + Unpin
+            + Send,
+    {
+        let mut batch = Vec::new();
+        let mut responders = Vec::new();
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
+            batch.push(entry);
+            responders.push(responder);
+        }
+        let responses = self.apply_entries(batch).await?;
+        for (responder, response) in responders.into_iter().zip(responses) {
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -772,65 +839,73 @@ impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, RaftStorageError> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &RaftSnapshotMeta,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), RaftStorageError> {
+        mut snapshot: Self::SnapshotData,
+    ) -> Result<(), io::Error> {
         // The received cursor is positioned at the end after the chunk
         // writes; rewind before reading.
-        let mut bytes = snapshot;
-        bytes.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| {
-            raft_sm_error(
-                ErrorSubject::StateMachine,
-                ErrorVerb::Seek,
-                StateMachineError::Corrupt(format!("seeking snapshot: {e}")),
-            )
-        })?;
+        snapshot.seek(io::SeekFrom::Start(0))?;
         let mut framed = Vec::new();
-        bytes.read_to_end(&mut framed).await.map_err(|e| {
-            raft_sm_error(
+        snapshot.read_to_end(&mut framed)?;
+        let body = parse_framed(SNAP_MAGIC, &framed).map_err(|error| {
+            sm_io(raft_sm_error(
                 ErrorSubject::StateMachine,
                 ErrorVerb::Read,
-                StateMachineError::Corrupt(format!("reading snapshot: {e}")),
-            )
+                StateMachineError::Store(error),
+            ))
         })?;
+        let decoded: SmSnapshot =
+            decode_versioned(Path::new("<snapshot>"), &body).map_err(|error| {
+                sm_io(raft_sm_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    StateMachineError::Store(error),
+                ))
+            })?;
+        let snapshot_id = snapshot_id_of(&decoded.record, &body);
         let record = self
             .shared
-            .install_framed_snapshot(&meta.snapshot_id, &framed)
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+            .install_framed_snapshot(&snapshot_id, &framed)
+            .map_err(|e| {
+                sm_io(raft_sm_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Write,
+                    e,
+                ))
+            })?;
         // The installed checkpoint must agree with the metadata openraft
         // committed to (fail closed on divergence).
         if record.last_applied != meta.last_log_id {
-            return Err(raft_sm_error(
+            return Err(sm_io(raft_sm_error(
                 ErrorSubject::StateMachine,
                 ErrorVerb::Write,
                 StateMachineError::Corrupt(format!(
                     "snapshot metadata last_log_id {:?} != checkpoint {:?}",
                     meta.last_log_id, record.last_applied
                 )),
-            ));
+            )));
         }
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<MongrelRaftConfig>>, RaftStorageError> {
-        let Some((meta, framed)) = self
-            .shared
-            .current_snapshot()
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Read, e))?
+    ) -> Result<Option<crate::identity::RaftSnapshot>, io::Error> {
+        let Some((meta, framed)) = self.shared.current_snapshot().map_err(|e| {
+            sm_io(raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Read,
+                e,
+            ))
+        })?
         else {
             return Ok(None);
         };
         Ok(Some(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(framed)),
+            snapshot: Cursor::new(framed),
         }))
     }
 }
@@ -841,15 +916,28 @@ pub struct MongrelSnapshotBuilder {
     shared: SharedStateMachine,
 }
 
+impl SnapshotReceiverFactory<MongrelRaftConfig> for MongrelStateMachine {
+    type SnapshotReceiver = Cursor<Vec<u8>>;
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Self::SnapshotReceiver, io::Error> {
+        Ok(Cursor::new(Vec::new()))
+    }
+}
+
 impl RaftSnapshotBuilder<MongrelRaftConfig> for MongrelSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<MongrelRaftConfig>, RaftStorageError> {
-        let (meta, framed) = self
-            .shared
-            .build_snapshot_now()
-            .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn build_snapshot(&mut self) -> Result<crate::identity::RaftSnapshot, io::Error> {
+        let (meta, framed) = self.shared.build_snapshot_now().map_err(|e| {
+            sm_io(raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                e,
+            ))
+        })?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(framed)),
+            snapshot: Cursor::new(framed),
         })
     }
 }
@@ -872,7 +960,7 @@ mod tests {
     fn command(index: u64, id: u8) -> RaftLogEntry {
         let envelope = CommandEnvelope::new(1, [id; 16], vec![id; 4]);
         RaftLogEntry {
-            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            log_id: crate::identity::test_log_id(1, 1, index),
             payload: openraft::EntryPayload::Normal(ReplicatedCommand::new(
                 CommandKind::Transaction,
                 envelope,
@@ -896,14 +984,17 @@ mod tests {
         let sink: Arc<Mutex<dyn ApplySink>> = test_sink.clone();
         let mut sm = machine(tmp.path(), sink);
 
-        let responses = sm.apply(vec![command(1, 7), command(2, 8)]).await.unwrap();
+        let responses = sm
+            .apply_entries(vec![command(1, 7), command(2, 8)])
+            .await
+            .unwrap();
         assert_eq!(responses.len(), 2);
         assert!(!responses[0].duplicate);
         assert_eq!(test_sink.lock().unwrap().len(), 2);
 
         // Client retry of command id 8 under a new log index: skipped.
         let retry = command(3, 8);
-        let responses = sm.apply(vec![retry]).await.unwrap();
+        let responses = sm.apply_entries(vec![retry]).await.unwrap();
         assert!(responses[0].duplicate);
         assert_eq!(test_sink.lock().unwrap().len(), 2);
 
@@ -927,12 +1018,12 @@ mod tests {
         let test_sink = Arc::new(Mutex::new(InMemoryApplySink::new()));
         {
             let mut sm = machine(tmp.path(), test_sink.clone());
-            sm.apply(vec![command(1, 42)]).await.unwrap();
+            sm.apply_entries(vec![command(1, 42)]).await.unwrap();
         }
         // Reopen: replaying the same command id is skipped even though the
         // in-memory set was lost.
         let mut sm = machine(tmp.path(), test_sink.clone());
-        let responses = sm.apply(vec![command(2, 42)]).await.unwrap();
+        let responses = sm.apply_entries(vec![command(2, 42)]).await.unwrap();
         assert!(responses[0].duplicate);
         assert_eq!(test_sink.lock().unwrap().len(), 1);
     }
@@ -942,11 +1033,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let test_sink = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let mut sm = machine(tmp.path(), test_sink.clone());
-        sm.apply(vec![command(5, 1)]).await.unwrap();
+        sm.apply_entries(vec![command(5, 1)]).await.unwrap();
         // openraft re-delivers index 5 (e.g. after a crash before the
         // checkpoint fsync of a later batch): skipped by the watermark even
         // with a fresh command id.
-        let responses = sm.apply(vec![command(5, 99)]).await.unwrap();
+        let responses = sm.apply_entries(vec![command(5, 99)]).await.unwrap();
         assert!(responses[0].duplicate);
         assert_eq!(test_sink.lock().unwrap().len(), 1);
     }
@@ -958,13 +1049,13 @@ mod tests {
         let sink_a = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let sink_b = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let mut sm_a = machine(tmp_a.path(), sink_a.clone());
-        sm_a.apply(vec![command(1, 1), command(2, 2)])
+        sm_a.apply_entries(vec![command(1, 1), command(2, 2)])
             .await
             .unwrap();
         let (meta, framed) = sm_a.shared.build_snapshot_now().unwrap();
 
         let mut sm_b = machine(tmp_b.path(), sink_b.clone());
-        sm_b.install_snapshot(&meta, Box::new(Cursor::new(framed)))
+        sm_b.install_snapshot(&meta, Cursor::new(framed))
             .await
             .unwrap();
         assert_eq!(
@@ -978,7 +1069,7 @@ mod tests {
 
         // Idempotency traveled with the snapshot: re-applying command 2 is a
         // duplicate on the fresh machine too.
-        let responses = sm_b.apply(vec![command(3, 2)]).await.unwrap();
+        let responses = sm_b.apply_entries(vec![command(3, 2)]).await.unwrap();
         assert!(responses[0].duplicate);
         assert_eq!(sink_b.lock().unwrap().len(), 2);
     }
@@ -992,7 +1083,7 @@ mod tests {
         let last = framed.len() - 1;
         framed[last] ^= 0x01;
         assert!(sm
-            .install_snapshot(&meta, Box::new(Cursor::new(framed)))
+            .install_snapshot(&meta, Cursor::new(framed))
             .await
             .is_err());
     }
@@ -1011,7 +1102,7 @@ mod tests {
     fn command_at(index: u64, id: u8, commit_ts: HlcTimestamp) -> RaftLogEntry {
         let envelope = CommandEnvelope::new(1, [id; 16], vec![id; 4]);
         RaftLogEntry {
-            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            log_id: crate::identity::test_log_id(1, 1, index),
             payload: openraft::EntryPayload::Normal(ReplicatedCommand::new(
                 CommandKind::Transaction,
                 envelope,
@@ -1040,7 +1131,9 @@ mod tests {
             logical: 0,
             node_tiebreaker: 9,
         };
-        sm.apply(vec![command_at(1, 7, ahead)]).await.unwrap();
+        sm.apply_entries(vec![command_at(1, 7, ahead)])
+            .await
+            .unwrap();
         let stamped = clock.now().unwrap();
         assert!(
             stamped > ahead,
@@ -1067,7 +1160,9 @@ mod tests {
             logical: 0,
             node_tiebreaker: 9,
         };
-        sm.apply(vec![command_at(1, 7, far_ahead)]).await.unwrap();
+        sm.apply_entries(vec![command_at(1, 7, far_ahead)])
+            .await
+            .unwrap();
         assert_eq!(sink.lock().unwrap().len(), 1);
         // ...but allocation through that clock now fails closed (spec
         // section 8.2: excessive skew rejects timestamp allocation).
@@ -1088,7 +1183,9 @@ mod tests {
             node_tiebreaker: 1,
         };
         let mut sm_a = machine(tmp_a.path(), sink_a);
-        sm_a.apply(vec![command_at(1, 1, ahead)]).await.unwrap();
+        sm_a.apply_entries(vec![command_at(1, 1, ahead)])
+            .await
+            .unwrap();
         let (meta, framed) = sm_a.shared.build_snapshot_now().unwrap();
 
         let mut sm_b = MongrelStateMachine::open_with_clock(
@@ -1098,7 +1195,7 @@ mod tests {
             Some(observing(&clock_b)),
         )
         .unwrap();
-        sm_b.install_snapshot(&meta, Box::new(Cursor::new(framed)))
+        sm_b.install_snapshot(&meta, Cursor::new(framed))
             .await
             .unwrap();
         let stamped = clock_b.now().unwrap();

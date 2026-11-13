@@ -22,9 +22,6 @@ use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::NodeId;
 
-// Referenced by the `declare_raft_types!` expansion (default `SnapshotData`).
-use std::io::Cursor;
-
 /// Node identifier type used inside the raft group.
 ///
 /// See the module documentation for the deterministic mapping from
@@ -169,6 +166,15 @@ pub struct ApplyResponse {
     pub duplicate: bool,
 }
 
+impl std::fmt::Display for ReplicatedCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind() {
+            Some(kind) => write!(f, "{kind:?}"),
+            None => f.write_str("noop"),
+        }
+    }
+}
+
 openraft::declare_raft_types!(
     /// MongrelDB's openraft type configuration (ADR-0004).
     ///
@@ -184,21 +190,33 @@ openraft::declare_raft_types!(
 );
 
 /// The running raft node handle.
-pub type MongrelRaft = openraft::Raft<MongrelRaftConfig>;
+pub type MongrelRaft = openraft::Raft<MongrelRaftConfig, crate::state_machine::MongrelStateMachine>;
 /// A raft log entry of the MongrelDB configuration.
-pub type RaftLogEntry = openraft::Entry<MongrelRaftConfig>;
+pub type RaftLogEntry = <MongrelRaftConfig as openraft::RaftTypeConfig>::Entry;
 /// A raft log id (term + index) of the MongrelDB configuration.
-pub type RaftLogId = openraft::LogId<RaftNodeId>;
+pub type RaftLogId = openraft::type_config::alias::LogIdOf<MongrelRaftConfig>;
 /// A raft vote of the MongrelDB configuration.
-pub type RaftVote = openraft::Vote<RaftNodeId>;
+pub type RaftVote = <MongrelRaftConfig as openraft::RaftTypeConfig>::Vote;
 /// The effective membership (joint or uniform) of the group.
-pub type RaftMembership = openraft::Membership<RaftNodeId, openraft::BasicNode>;
+pub type RaftMembership = <MongrelRaftConfig as openraft::RaftTypeConfig>::Membership;
 /// The membership as persisted by the state machine.
-pub type RaftStoredMembership = openraft::StoredMembership<RaftNodeId, openraft::BasicNode>;
+pub type RaftStoredMembership = openraft::type_config::alias::StoredMembershipOf<MongrelRaftConfig>;
 /// openraft snapshot metadata of the MongrelDB configuration.
-pub type RaftSnapshotMeta = openraft::SnapshotMeta<RaftNodeId, openraft::BasicNode>;
+pub type RaftSnapshotMeta = openraft::type_config::alias::SnapshotMetaOf<MongrelRaftConfig>;
+/// In-memory snapshot handle produced by the state machine.
+pub type RaftSnapshot =
+    openraft::type_config::alias::SnapshotOf<MongrelRaftConfig, std::io::Cursor<Vec<u8>>>;
 /// openraft storage error of the MongrelDB configuration.
-pub type RaftStorageError = openraft::StorageError<RaftNodeId>;
+pub type RaftStorageError = openraft::StorageError<MongrelRaftConfig>;
+
+/// Builds a log id. The committed leader id is the advanced `(term, node_id)`
+/// pair openraft 0.10 stores in every entry.
+pub(crate) fn test_log_id(term: u64, node_id: RaftNodeId, index: u64) -> RaftLogId {
+    RaftLogId {
+        leader_id: openraft::impls::leader_id_adv::LeaderId { term, node_id },
+        index,
+    }
+}
 
 /// Bridges an openraft log id to the commit-log [`LogPosition`]
 /// (`term`/`index`; S2B-003's leader-assigned term and log index).

@@ -6,8 +6,9 @@
 //! more realistic "table at rest" case). The update is `put` (new version) +
 //! `commit` (one fsync) — the durable-update cost.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use mongreldb_core::{schema::*, Table, Value};
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::tempdir;
 

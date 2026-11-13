@@ -991,6 +991,7 @@ enum TypedInsertFallback {
     Response(Response),
 }
 
+#[allow(clippy::result_large_err)] // axum `Response` is the fallback error
 async fn execute_insert_typed(
     runtime: &ClusterRuntimeHandle,
     tablet_id: TabletId,
@@ -1105,6 +1106,7 @@ async fn execute_select(
     Json(out).into_response()
 }
 
+#[allow(clippy::result_large_err)] // axum `Response` is the HTTP error
 async fn load_table_rows_json(
     runtime: &ClusterRuntimeHandle,
     tablet_id: TabletId,
@@ -1146,6 +1148,7 @@ async fn load_table_rows_json(
 
 /// Ensure the hosted tablet is bound to `table` with a schema covering
 /// `col_names` (inferred from sample values on first bind).
+#[allow(clippy::result_large_err)] // axum `Response` is the HTTP error
 async fn ensure_table_binding(
     runtime: &ClusterRuntimeHandle,
     tablet_id: TabletId,
@@ -1289,6 +1292,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+#[allow(clippy::result_large_err)] // axum `Response` is the HTTP error
 async fn first_hosted_tablet(runtime: &ClusterRuntimeHandle) -> Result<TabletId, Response> {
     let ids = runtime
         .tablet_ids()

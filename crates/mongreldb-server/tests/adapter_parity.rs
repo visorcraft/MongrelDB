@@ -51,7 +51,7 @@ async fn packaged_http_and_native_clients_have_query_and_write_parity() {
         NativeRpcServer::new(NativeRpcServerConfig {
             address: native_address,
             certificate_pem: certificate_pem.clone(),
-            private_key_pem: certified.key_pair.serialize_pem().into_bytes(),
+            private_key_pem: certified.signing_key.serialize_pem().into_bytes(),
             client_ca_pem: None,
             max_connections: 16,
             max_concurrent_streams: 16,

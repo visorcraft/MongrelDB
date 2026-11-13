@@ -32,7 +32,7 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
     let runtime = control.native_runtime(db, Arc::clone(&sessions));
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let certificate_pem = certificate.cert.pem().into_bytes();
-    let private_key_pem = certificate.key_pair.serialize_pem().into_bytes();
+    let private_key_pem = certificate.signing_key.serialize_pem().into_bytes();
 
     let native_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let native_address = native_socket.local_addr().unwrap();

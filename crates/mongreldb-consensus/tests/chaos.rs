@@ -17,9 +17,9 @@
 //! - no committed entry ever lost or reordered on any node (`read_committed`
 //!   streams agree exactly, first occurrences are monotone, and every
 //!   acknowledged receipt is present at its recorded position);
-//! - no split-brain commit: proposals attempted on the quorum-less side of a
-//!   partition are rejected and never appear in any committed stream
-//!   post-heal;
+//! - no split-brain commit: a proposal a quorum-less node rejects with
+//!   `NotLeader` never appears in a committed stream. A leader-local proposal
+//!   that only hits its deadline may still commit after the partition heals;
 //! - state-machine applied sequences are identical on all live nodes.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -397,11 +397,18 @@ impl ChaosCluster {
                 &deadline_control(STEP_DEADLINE_MS),
             )
             .await;
-        assert!(
-            result.is_err(),
-            "split-brain commit on quorum-less node {node}: {result:?} (chaos seed {seed})"
-        );
-        client.tainted.push(tainted);
+        match result {
+            Err(ConsensusError::NotLeader { .. }) => client.tainted.push(tainted),
+            // The leader appended, then the deadline fired. That suffix can
+            // commit once a quorum is reachable again.
+            Err(ConsensusError::DeadlineExceeded) => {
+                client.ambiguous.insert(seq_of(&tainted));
+            }
+            Err(_) => client.tainted.push(tainted),
+            Ok(receipt) => panic!(
+                "split-brain commit on quorum-less node {node}: {receipt:?} (chaos seed {seed})"
+            ),
+        }
     }
 
     /// Transfers leadership to `target` with retries. Transfer is best-effort
@@ -469,6 +476,9 @@ struct Client {
     last_receipt_index: u64,
     /// Quorum-less-side proposals that were rejected and must stay uncommitted.
     tainted: Vec<CommandEnvelope>,
+    /// Leader-local proposals whose deadline fired. Raft may still commit
+    /// them after the partition heals; they are not split-brain commits.
+    ambiguous: BTreeSet<u64>,
     taint_seq: u64,
 }
 
@@ -480,6 +490,7 @@ impl Client {
             acknowledged: BTreeMap::new(),
             last_receipt_index: 0,
             tainted: Vec::new(),
+            ambiguous: BTreeSet::new(),
             taint_seq: 0,
         }
     }
@@ -499,10 +510,10 @@ fn check_invariants(cluster: &ChaosCluster, client: &Client, round: usize, seed:
     for (_, entry) in &reference {
         let seq = seq_of(entry);
         assert!(
-            seq < TAINT_BASE,
+            seq < TAINT_BASE || client.ambiguous.contains(&seq),
             "minority-side proposal committed: {entry:?} (chaos seed {seed}, round {round})"
         );
-        if seen.insert(seq) {
+        if seq < TAINT_BASE && seen.insert(seq) {
             first_occurrence.push(seq);
         }
     }

@@ -8,9 +8,10 @@
 //!
 //! Run: `cargo bench -p mongreldb-core --bench filtered_query`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::{schema::*, Table, Value};
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::tempdir;
 

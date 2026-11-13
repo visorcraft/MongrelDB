@@ -9,31 +9,34 @@ homepage.workspace = true
 description = "DataFusion SQL + Arrow frontend for MongrelDB."
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.65.1" }
-mongreldb-types = { path = "../mongreldb-types", version = "0.65.1" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.66.0" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.66.0" }
 datafusion = { version = "55.2.0", default-features = false, features = ["nested_expressions", "crypto_expressions", "datetime_expressions", "encoding_expressions", "regex_expressions", "string_expressions", "unicode_expressions", "compression", "recursive_protection", "sql"] }
 datafusion-datasource = "55.2.0"
+# arrow 60 and sqlparser 0.64 are newer, but datafusion 55.2 (latest)
+# requires arrow ^59.2 and sqlparser ^0.62. A second copy would not unify
+# with DataFusion's Arrow arrays or SQL dialect.
 arrow = "59"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = "0.62.0"
-parking_lot = "0.12"
+parking_lot = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 regex = "1"
-getrandom = "0.2"
-sha2 = "0.10"
-aes-gcm = "0.10"
+getrandom = "0.4"
+sha2 = "0.11"
+aes-gcm = "0.11"
 bincode = "1"
 tempfile = "3"
 
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
-criterion = { version = "0.5", features = ["async_tokio"] }
-mongreldb-core = { path = "../mongreldb-core", version = "0.65.1" }
+rusqlite = { version = "0.42", features = ["bundled"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.66.0" }
 
 [[bench]]
 name = "sql_cancellation"

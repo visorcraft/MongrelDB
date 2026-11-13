@@ -18,7 +18,7 @@ pub const DEK_LEN: usize = 32;
 
 /// Fill a buffer with OS CSPRNG bytes. Always available.
 pub fn fill_random(buf: &mut [u8]) -> Result<()> {
-    getrandom::getrandom(buf).map_err(|error| MongrelError::EntropyUnavailable(error.to_string()))
+    getrandom::fill(buf).map_err(|error| MongrelError::EntropyUnavailable(error.to_string()))
 }
 
 /// Symmetric page cipher.
@@ -79,6 +79,10 @@ mod aes {
     use aes_gcm::aead::{Aead, Payload};
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
+    fn nonce_of(bytes: &[u8; 12]) -> &Nonce<aes_gcm::aead::consts::U12> {
+        <&Nonce<_>>::try_from(bytes.as_slice()).expect("nonce is 12 bytes")
+    }
+
     /// AES-256-GCM page cipher over an (unwrapped) per-run DEK. Per-page nonces
     /// are derived outside and passed in.
     pub struct AesCipher {
@@ -103,14 +107,14 @@ mod aes {
 
     impl Cipher for AesCipher {
         fn encrypt_page(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
-            let nonce = Nonce::from_slice(nonce);
+            let nonce = nonce_of(nonce);
             self.cipher
                 .encrypt(nonce, plaintext)
                 .map_err(|e| MongrelError::Encryption(format!("aes encrypt: {e}")))
         }
 
         fn decrypt_page(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
-            let nonce = Nonce::from_slice(nonce);
+            let nonce = nonce_of(nonce);
             self.cipher
                 .decrypt(nonce, ciphertext)
                 .map_err(|e| MongrelError::Decryption(format!("aes decrypt: {e}")))
@@ -124,7 +128,7 @@ mod aes {
         ) -> Result<Vec<u8>> {
             self.cipher
                 .encrypt(
-                    Nonce::from_slice(nonce),
+                    nonce_of(nonce),
                     Payload {
                         msg: plaintext,
                         aad,
@@ -141,7 +145,7 @@ mod aes {
         ) -> Result<Vec<u8>> {
             self.cipher
                 .decrypt(
-                    Nonce::from_slice(nonce),
+                    nonce_of(nonce),
                     Payload {
                         msg: ciphertext,
                         aad,
@@ -158,6 +162,10 @@ mod key {
     use super::{fill_random, Cipher, MongrelError, Result, DEK_LEN};
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
+
+    fn nonce_of(bytes: &[u8; 12]) -> &Nonce<aes_gcm::aead::consts::U12> {
+        <&Nonce<_>>::try_from(bytes.as_slice()).expect("nonce is 12 bytes")
+    }
     use serde::{Deserialize, Serialize};
     use zeroize::Zeroizing;
 
@@ -273,7 +281,7 @@ mod key {
             let cipher = Aes256Gcm::new_from_slice(&self.0[..])
                 .map_err(|e| MongrelError::Encryption(format!("kek aes init: {e}")))?;
             cipher
-                .encrypt(Nonce::from_slice(wrap_nonce), dek.as_slice())
+                .encrypt(nonce_of(wrap_nonce), dek.as_slice())
                 .map_err(|e| MongrelError::Encryption(format!("dek wrap: {e}")))
         }
 
@@ -287,7 +295,7 @@ mod key {
                 .map_err(|e| MongrelError::Encryption(format!("kek aes init: {e}")))?;
             let pt = Zeroizing::new(
                 cipher
-                    .decrypt(Nonce::from_slice(wrap_nonce), wrapped)
+                    .decrypt(nonce_of(wrap_nonce), wrapped)
                     .map_err(|e| MongrelError::Decryption(format!("dek unwrap: {e}")))?,
             );
             if pt.len() != DEK_LEN {
@@ -348,8 +356,8 @@ mod key {
     /// plaintexts collide; unequal plaintexts (cryptographically) do not. Used
     /// for equality indexes (bitmap / PK) over ENCRYPTED_INDEXABLE columns.
     pub fn hmac_token(col_key: &[u8; DEK_LEN], msg: &[u8]) -> [u8; 32] {
-        use hmac::Mac;
-        let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(col_key)
+        use hmac::{KeyInit, Mac};
+        let mut mac = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(col_key)
             .expect("HMAC accepts any key size");
         mac.update(msg);
         mac.finalize().into_bytes().into()
@@ -475,8 +483,8 @@ mod key {
         dir: &[u8],
         descriptor: &[u8],
     ) -> [u8; 32] {
-        use hmac::Mac;
-        let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(mac_key)
+        use hmac::{KeyInit, Mac};
+        let mut mac = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(mac_key)
             .expect("HMAC accepts any key size");
         mac.update(b"mongreldb/run-meta-mac/v1");
         for part in [header, dir, descriptor] {

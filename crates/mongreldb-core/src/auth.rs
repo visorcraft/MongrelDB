@@ -304,20 +304,16 @@ pub enum ColumnAccess {
 /// and hash — suitable for storage as `UserEntry::password_hash` and verifiable
 /// via [`verify_password`].
 pub fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::{
-        password_hash::{PasswordHasher, SaltString},
-        Algorithm, Argon2, Version,
-    };
-    use getrandom::getrandom;
+    use argon2::{password_hash::PasswordHasher, Algorithm, Argon2, Version};
+    use getrandom::fill;
     // Reuse the same OWASP-minimum parameters as the encryption KEK derivation.
     let params = argon2::Params::new(19 * 1024, 2, 1, None).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     // Generate salt via getrandom (always available in core, no feature gate).
     let mut salt_bytes = [0u8; 32];
-    getrandom(&mut salt_bytes).map_err(|e| e.to_string())?;
-    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| e.to_string())?;
+    fill(&mut salt_bytes).map_err(|e| e.to_string())?;
     let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map_err(|e| e.to_string())?;
     Ok(hash.to_string())
 }
@@ -325,7 +321,7 @@ pub fn hash_password(password: &str) -> Result<String, String> {
 /// Build independently salted SCRAM-SHA-256 verifier material.
 pub fn scram_verifier(password: &str) -> Result<crate::security_hardening::ScramVerifier, String> {
     let mut salt = [0_u8; 16];
-    getrandom::getrandom(&mut salt).map_err(|error| error.to_string())?;
+    getrandom::fill(&mut salt).map_err(|error| error.to_string())?;
     crate::security_hardening::ScramVerifier::from_password(
         password,
         &salt,

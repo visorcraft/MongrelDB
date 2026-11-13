@@ -19,6 +19,11 @@ members = [
 ]
 resolver = "2"
 
+# Held at the newest release that still builds with the rest of the graph:
+# bincode 1.3 (2.x rejects `#[serde(skip)]` on the WAL row codec; 3.0.0 does
+# not compile), arrow 59 and sqlparser 0.62 (datafusion 55.2's latest
+# compatible pair; arrow 60 and sqlparser 0.64 do not unify).
+#
 # opensrv-mysql 0.7.0 (latest crates.io release) pins tokio-rustls 0.25 /
 # rustls 0.22, which pulls the vulnerable rustls-webpki 0.102 line. Upstream
 # commit 3142eb5 ("feat: update rustls to 0.23") is the same 0.7.0 with
@@ -27,9 +32,9 @@ resolver = "2"
 opensrv-mysql = { git = "https://github.com/datafuselabs/opensrv.git", rev = "3142eb545fab811bc9289091781ce6d771cf0bf7" }
 
 [workspace.package]
-version = "0.65.1"
+version = "0.66.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.95"
 repository = "https://github.com/visorcraft/MongrelDB"
 homepage = "https://www.mongreldb.com"

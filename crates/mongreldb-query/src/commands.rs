@@ -136,13 +136,13 @@ struct PendingSqlSpill {
 impl PendingSqlSpill {
     fn new() -> Result<Self> {
         let mut key = [0_u8; 32];
-        getrandom::getrandom(&mut key)
+        getrandom::fill(&mut key)
             .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
         key.fill(0);
         let mut nonce_prefix = [0_u8; 4];
-        getrandom::getrandom(&mut nonce_prefix)
+        getrandom::fill(&mut nonce_prefix)
             .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
         Ok(Self {
             file: tempfile::tempfile().map_err(mongreldb_core::MongrelError::from)?,
@@ -185,7 +185,8 @@ impl PendingSqlSpill {
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                <&Nonce<aes_gcm::aead::consts::U12>>::try_from(nonce.as_slice())
+                    .expect("nonce is 12 bytes"),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -472,7 +473,8 @@ impl Iterator for PendingSqlOpReader {
                     let aad = pending_sql_spill_aad(*frame_index, frame_len as u32, nonce_counter);
                     let plaintext = cipher
                         .decrypt(
-                            Nonce::from_slice(&nonce),
+                            <&Nonce<aes_gcm::aead::consts::U12>>::try_from(nonce.as_slice())
+                                .expect("nonce is 12 bytes"),
                             Payload {
                                 msg: &ciphertext,
                                 aad: &aad,

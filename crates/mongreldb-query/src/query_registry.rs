@@ -22,7 +22,7 @@ pub struct QueryId([u8; 16]);
 impl QueryId {
     pub fn random() -> Result<Self> {
         let mut bytes = [0; 16];
-        getrandom::getrandom(&mut bytes).map_err(|error| {
+        getrandom::fill(&mut bytes).map_err(|error| {
             MongrelQueryError::Core(mongreldb_core::MongrelError::Other(format!(
                 "query id randomness failed: {error}"
             )))
@@ -62,7 +62,7 @@ impl FromStr for QueryId {
             ));
         }
         let mut bytes = [0; 16];
-        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let text = std::str::from_utf8(chunk).map_err(|_| {
                 MongrelQueryError::Core(mongreldb_core::MongrelError::InvalidArgument(
                     "query id is not valid UTF-8".into(),

@@ -2325,7 +2325,7 @@ fn now_timestamp() -> HlcTimestamp {
 /// Mints a tablet-data command id.
 fn new_data_command_id() -> Result<[u8; 16], RuntimeError> {
     let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id)
+    getrandom::fill(&mut id)
         .map_err(|error| RuntimeError::InvalidRequest(format!("CSPRNG failed: {error}")))?;
     Ok(id)
 }
@@ -2502,13 +2502,27 @@ impl RuntimeChildSink {
             new_data_command_id().map_err(|error| TabletDataError::Sink(error.to_string()))?,
             TabletDataCommandRecord::new(command).encode(),
         );
-        self.handle
-            .block_on(
-                self.group
-                    .propose(CommandKind::Catalog, envelope, &self.control),
-            )
-            .map(|_| ())
-            .map_err(|error| TabletDataError::Sink(error.to_string()))
+        // A child group created or reopened in this step may still be
+        // electing. Wait out a leaderless window; a known other leader is
+        // the caller's to move (the install goes through this replica).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.handle.block_on(self.group.propose(
+                CommandKind::Catalog,
+                envelope.clone(),
+                &self.control,
+            )) {
+                Ok(_) => return Ok(()),
+                Err(ConsensusError::NotLeader { leader: None })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    let _ = self
+                        .handle
+                        .block_on(self.group.wait_leader(Duration::from_millis(500)));
+                }
+                Err(error) => return Err(TabletDataError::Sink(error.to_string())),
+            }
+        }
     }
 }
 

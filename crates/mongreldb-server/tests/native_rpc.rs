@@ -87,7 +87,7 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
         NativeRpcServer::new(NativeRpcServerConfig {
             address,
             certificate_pem: certificate_pem.clone(),
-            private_key_pem: certified.key_pair.serialize_pem().into_bytes(),
+            private_key_pem: certified.signing_key.serialize_pem().into_bytes(),
             client_ca_pem: None,
             max_connections: 32,
             max_concurrent_streams: 32,

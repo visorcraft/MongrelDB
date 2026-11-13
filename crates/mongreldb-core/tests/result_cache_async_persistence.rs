@@ -144,7 +144,7 @@ impl PersistentCacheIo for FailingPersistentCacheIo {
     fn write_atomic(&self, key: u64, frame: &[u8]) -> Result<(), IoError> {
         if self
             .fail_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 if v > 0 {
                     Some(v - 1)
                 } else {

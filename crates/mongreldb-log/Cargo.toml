@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "MongrelDB commit-log abstraction and versioned command envelope."
 
 [dependencies]
-mongreldb-types = { path = "../mongreldb-types", version = "0.65.1" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.66.0" }
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
-thiserror = "1"
+sha2 = "0.11"
+thiserror = "2"

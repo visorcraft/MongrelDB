@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-kit-ffi"
-version = "0.65.1"
+version = "0.66.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -29,7 +29,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # next engine release.
 kit = { package = "mongreldb-kit", version = "=0.65.1" }
 mongreldb-kit-core = "=0.65.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]

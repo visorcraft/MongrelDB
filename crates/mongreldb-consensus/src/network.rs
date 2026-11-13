@@ -22,25 +22,26 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
-};
-use openraft::network::{RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
+use openraft::error::{NetworkError, RPCError, RaftError, RemoteError, Unreachable};
+use openraft::network::RaftNetworkFactory;
+use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
 use openraft::BasicNode;
+use openraft_legacy::network_v1::{
+    Adapter, ChunkedSnapshotReceiver, InstallSnapshotError, InstallSnapshotRequest,
+    InstallSnapshotResponse, RaftNetwork,
+};
 
 use crate::identity::{MongrelRaft, MongrelRaftConfig, RaftNodeId};
 
 /// RPC error types (openraft-native, so remote raft errors keep their type).
-pub type AppendRpcError = RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>;
+pub type AppendRpcError = RPCError<MongrelRaftConfig, RaftError<MongrelRaftConfig>>;
 /// Vote RPC error type.
-pub type VoteRpcError = RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>;
+pub type VoteRpcError = RPCError<MongrelRaftConfig, RaftError<MongrelRaftConfig>>;
 /// Install-snapshot RPC error type.
 pub type SnapshotRpcError =
-    RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, InstallSnapshotError>>;
+    RPCError<MongrelRaftConfig, RaftError<MongrelRaftConfig, InstallSnapshotError>>;
+/// Snapshot bytes the v1 chunk adapter and the state machine share.
+pub type SnapshotCursor = std::io::Cursor<Vec<u8>>;
 
 /// Transport-level failures (management operations and link policies; RPC
 /// delivery itself reports openraft-native [`RPCError`]s).
@@ -76,15 +77,15 @@ pub trait RaftTransport: Send + Sync + 'static {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: AppendEntriesRequest<MongrelRaftConfig>,
-    ) -> impl Future<Output = Result<AppendEntriesResponse<RaftNodeId>, AppendRpcError>> + Send;
+    ) -> impl Future<Output = Result<AppendEntriesResponse<MongrelRaftConfig>, AppendRpcError>> + Send;
 
     /// Delivers a RequestVote RPC from `from` to `target`.
     fn vote(
         &self,
         from: RaftNodeId,
         target: RaftNodeId,
-        rpc: VoteRequest<RaftNodeId>,
-    ) -> impl Future<Output = Result<VoteResponse<RaftNodeId>, VoteRpcError>> + Send;
+        rpc: VoteRequest<MongrelRaftConfig>,
+    ) -> impl Future<Output = Result<VoteResponse<MongrelRaftConfig>, VoteRpcError>> + Send;
 
     /// Delivers an InstallSnapshot chunk RPC from `from` to `target`.
     fn install_snapshot(
@@ -92,7 +93,7 @@ pub trait RaftTransport: Send + Sync + 'static {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: InstallSnapshotRequest<MongrelRaftConfig>,
-    ) -> impl Future<Output = Result<InstallSnapshotResponse<RaftNodeId>, SnapshotRpcError>> + Send;
+    ) -> impl Future<Output = Result<InstallSnapshotResponse<MongrelRaftConfig>, SnapshotRpcError>> + Send;
 
     /// Registers a running raft node (in-process transports route to it;
     /// RPC transports resolve peers by membership address and ignore this).
@@ -129,7 +130,7 @@ impl<T: RaftTransport> TransportNetworkFactory<T> {
 }
 
 impl<T: RaftTransport> RaftNetworkFactory<MongrelRaftConfig> for TransportNetworkFactory<T> {
-    type Network = TransportNetwork<T>;
+    type Network = Adapter<MongrelRaftConfig, TransportNetwork<T>, SnapshotCursor>;
 
     async fn new_client(&mut self, target: RaftNodeId, _node: &BasicNode) -> Self::Network {
         TransportNetwork {
@@ -137,6 +138,7 @@ impl<T: RaftTransport> RaftNetworkFactory<MongrelRaftConfig> for TransportNetwor
             from: self.local,
             target,
         }
+        .into_v2()
     }
 }
 
@@ -152,7 +154,7 @@ impl<T: RaftTransport> RaftNetwork<MongrelRaftConfig> for TransportNetwork<T> {
         &mut self,
         rpc: AppendEntriesRequest<MongrelRaftConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, AppendRpcError> {
+    ) -> Result<AppendEntriesResponse<MongrelRaftConfig>, AppendRpcError> {
         self.transport
             .append_entries(self.from, self.target, rpc)
             .await
@@ -162,7 +164,7 @@ impl<T: RaftTransport> RaftNetwork<MongrelRaftConfig> for TransportNetwork<T> {
         &mut self,
         rpc: InstallSnapshotRequest<MongrelRaftConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<InstallSnapshotResponse<RaftNodeId>, SnapshotRpcError> {
+    ) -> Result<InstallSnapshotResponse<MongrelRaftConfig>, SnapshotRpcError> {
         self.transport
             .install_snapshot(self.from, self.target, rpc)
             .await
@@ -170,9 +172,9 @@ impl<T: RaftTransport> RaftNetwork<MongrelRaftConfig> for TransportNetwork<T> {
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<RaftNodeId>,
+        rpc: VoteRequest<MongrelRaftConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<VoteResponse<RaftNodeId>, VoteRpcError> {
+    ) -> Result<VoteResponse<MongrelRaftConfig>, VoteRpcError> {
         self.transport.vote(self.from, self.target, rpc).await
     }
 }
@@ -247,11 +249,11 @@ impl InMemoryTransport {
         }
     }
 
-    fn down_error(&self, from: RaftNodeId, to: RaftNodeId) -> Unreachable {
+    fn down_error(&self, from: RaftNodeId, to: RaftNodeId) -> Unreachable<MongrelRaftConfig> {
         Unreachable::new(&TransportError::LinkDown { from, to })
     }
 
-    fn no_route_error(&self, to: RaftNodeId) -> Unreachable {
+    fn no_route_error(&self, to: RaftNodeId) -> Unreachable<MongrelRaftConfig> {
         Unreachable::new(&TransportError::NoRoute(to))
     }
 
@@ -266,7 +268,7 @@ impl RaftTransport for InMemoryTransport {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: AppendEntriesRequest<MongrelRaftConfig>,
-    ) -> Result<AppendEntriesResponse<RaftNodeId>, AppendRpcError> {
+    ) -> Result<AppendEntriesResponse<MongrelRaftConfig>, AppendRpcError> {
         if let Err(fault) = mongreldb_fault::inject("raft.net.append_entries.before") {
             return Err(RPCError::Network(NetworkError::new(&fault)));
         }
@@ -283,6 +285,7 @@ impl RaftTransport for InMemoryTransport {
         let result = raft
             .append_entries(rpc)
             .await
+            .map(AppendEntriesResponse::from)
             .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)));
         if let Err(fault) = mongreldb_fault::inject("raft.net.append_entries.after") {
             return Err(RPCError::Network(NetworkError::new(&fault)));
@@ -294,8 +297,8 @@ impl RaftTransport for InMemoryTransport {
         &self,
         from: RaftNodeId,
         target: RaftNodeId,
-        rpc: VoteRequest<RaftNodeId>,
-    ) -> Result<VoteResponse<RaftNodeId>, VoteRpcError> {
+        rpc: VoteRequest<MongrelRaftConfig>,
+    ) -> Result<VoteResponse<MongrelRaftConfig>, VoteRpcError> {
         if let Err(fault) = mongreldb_fault::inject("raft.net.vote.before") {
             return Err(RPCError::Network(NetworkError::new(&fault)));
         }
@@ -324,7 +327,7 @@ impl RaftTransport for InMemoryTransport {
         from: RaftNodeId,
         target: RaftNodeId,
         rpc: InstallSnapshotRequest<MongrelRaftConfig>,
-    ) -> Result<InstallSnapshotResponse<RaftNodeId>, SnapshotRpcError> {
+    ) -> Result<InstallSnapshotResponse<MongrelRaftConfig>, SnapshotRpcError> {
         if let Err(fault) = mongreldb_fault::inject("raft.net.install_snapshot.before") {
             return Err(RPCError::Network(NetworkError::new(&fault)));
         }
@@ -338,8 +341,7 @@ impl RaftTransport for InMemoryTransport {
         let Some(raft) = self.lookup(target) else {
             return Err(RPCError::Unreachable(self.no_route_error(target)));
         };
-        let result = raft
-            .install_snapshot(rpc)
+        let result = ChunkedSnapshotReceiver::install_snapshot(&raft, rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)));
         if let Err(fault) = mongreldb_fault::inject("raft.net.install_snapshot.after") {
@@ -361,7 +363,7 @@ impl RaftTransport for InMemoryTransport {
             return Err(TransportError::NoRoute(target));
         };
         raft.trigger()
-            .elect()
+            .elect(false)
             .await
             .map_err(|e| TransportError::Fault(e.to_string()))
     }

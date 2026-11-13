@@ -2736,7 +2736,16 @@ mod tests {
                 .await
                 .unwrap();
         group.wait_leader(LEADER_TIMEOUT).await.unwrap();
-        assert_eq!(group.applied_position(), applied_before);
+        // Re-election in openraft 0.10 commits one blank leadership entry in
+        // the new term. User rows must stay put; the watermark may advance
+        // by that single barrier and must not rewind.
+        let applied_after = group.applied_position();
+        assert!(
+            applied_after == applied_before
+                || (applied_after.term > applied_before.term
+                    && applied_after.index == applied_before.index + 1),
+            "restart applied {applied_after:?}, before {applied_before:?}"
+        );
         let db = sink.lock().unwrap().database().unwrap();
         assert_eq!(visible_ids(&db, "items"), vec![10, 20]);
 
@@ -3007,7 +3016,15 @@ mod tests {
         // A real spilled commit, translated at proposal construction.
         let (_dir, records, table_id) = standalone_spilled_commit();
         let envelope = build_transaction_envelope([7u8; 16], &records).unwrap();
-        let receipt = group_a
+        // openraft 0.10 may transfer leadership before this payload is
+        // proposed. Send it through whichever node is leader.
+        let leader_id = group_a.wait_leader(LEADER_TIMEOUT).await.unwrap();
+        let leader = if leader_id == group_a.node_id() {
+            &group_a
+        } else {
+            &group_b
+        };
+        let receipt = leader
             .propose(
                 CommandKind::Transaction,
                 envelope,

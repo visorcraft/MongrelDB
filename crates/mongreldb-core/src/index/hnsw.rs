@@ -25,9 +25,9 @@ fn hamming(a: &[u8], b: &[u8]) -> Dist {
     let chunks = a.len() / 8;
     let (ah, at) = a.split_at(chunks * 8);
     let (bh, bt) = b.split_at(chunks * 8);
-    for (x, y) in ah.chunks_exact(8).zip(bh.chunks_exact(8)) {
-        let xw = u64::from_le_bytes([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]]);
-        let yw = u64::from_le_bytes([y[0], y[1], y[2], y[3], y[4], y[5], y[6], y[7]]);
+    for (x, y) in ah.as_chunks::<8>().0.iter().zip(bh.as_chunks::<8>().0) {
+        let xw = u64::from_le_bytes(*x);
+        let yw = u64::from_le_bytes(*y);
         d += (xw ^ yw).count_ones();
     }
     for (x, y) in at.iter().zip(bt.iter()) {

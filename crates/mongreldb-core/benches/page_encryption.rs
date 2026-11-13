@@ -7,8 +7,9 @@
 //!
 //! Run: `cargo bench -p mongreldb-core --bench page_encryption`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mongreldb_core::encryption::{AesCipher, Cipher};
+use std::hint::black_box;
 
 fn bench_page_encryption(c: &mut Criterion) {
     let key = [0x42u8; 32];

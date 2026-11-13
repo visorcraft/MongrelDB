@@ -4,8 +4,9 @@
 //!
 //! Run: `cargo bench -p mongreldb-core --bench scale`
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use mongreldb_core::{columnar::NativeColumn, schema::*, Table, Value};
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::tempdir;
 

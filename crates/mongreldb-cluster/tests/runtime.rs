@@ -73,7 +73,7 @@ fn trust() -> TrustConfig {
 }
 
 fn csprng() -> impl FnMut(&mut [u8]) -> Result<(), getrandom::Error> {
-    getrandom::getrandom
+    getrandom::fill
 }
 
 /// A free loopback address (`127.0.0.1:<port>`), pre-allocated by binding

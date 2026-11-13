@@ -11,7 +11,7 @@ use crate::rowid::RowId;
 use crate::schema::{ColumnDef, Schema};
 use crate::{MongrelError, Result};
 use crc::{Crc, CRC_32_ISCSI};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs::{File, OpenOptions};
@@ -725,7 +725,7 @@ fn wal_head_auth(
 ) -> Result<[u8; 32]> {
     if let Some(key) = wal_dek {
         {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..])
+            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key[..])
                 .map_err(|error| MongrelError::Encryption(error.to_string()))?;
             mac.update(WAL_HEAD_AUTH_DOMAIN);
             mac.update(body);

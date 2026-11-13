@@ -4464,7 +4464,9 @@ fn decode_tagged_hex(value: &serde_json::Value, expected_kind: &str) -> Result<V
     }
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0])?;
             let low = hex_nibble(pair[1])?;
@@ -5415,6 +5417,7 @@ struct SqlIdempotencyContext<'a> {
     query_id: QueryId,
 }
 
+#[allow(clippy::result_large_err)] // axum `Response` is the HTTP error
 async fn begin_sql_idempotency(
     state: &AppState,
     context: SqlIdempotencyContext<'_>,

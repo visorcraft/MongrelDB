@@ -1,8 +1,8 @@
 [package]
 name = "mongreldb-node"
-version = "0.65.1"
+version = "0.66.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "High-performance Node.js bindings for MongrelDB with native in-process storage and hybrid indexing."
 publish = false
@@ -12,13 +12,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bincode = "1"
-mongreldb-core = { path = "../mongreldb-core", version = "0.65.1" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.65.1" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.66.0" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.66.0" }
+# napi 3 and ureq 3 are newer, and both break this addon's public JS
+# error objects and HTTP client. 2.x is the latest line that preserves them.
 napi = { version = "2", default-features = false, features = ["dyn-symbols", "napi8", "tokio_rt"] }
 napi-derive = "2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 arrow = "59"
-base64 = "0.22"
+base64 = "0.23"
 bytemuck = "1"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

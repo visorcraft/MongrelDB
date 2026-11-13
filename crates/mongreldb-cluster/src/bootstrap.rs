@@ -126,6 +126,7 @@ impl TrustConfig {
             .self_signed(&ca_key)
             .map_err(|_| ClusterError::InvalidTrustMaterial("CA self-sign failed"))?;
         let ca_cert_pem = ca_cert.pem();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
 
         let node_id = allowed_node_ids[0];
         let node_name = crate::network::node_cert_name(&node_id);
@@ -145,7 +146,7 @@ impl TrustConfig {
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         ];
         let node_cert = node_params
-            .signed_by(&node_key, &ca_cert, &ca_key)
+            .signed_by(&node_key, &issuer)
             .map_err(|_| ClusterError::InvalidTrustMaterial("node certificate signing failed"))?;
         let config = Self {
             ca_cert_pem,

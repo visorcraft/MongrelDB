@@ -9,11 +9,12 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -688,11 +689,9 @@ impl ServiceToken {
         expires_unix: u64,
     ) -> Result<Self, SecurityHardeningError> {
         let mut salt_bytes = [0_u8; 16];
-        getrandom::getrandom(&mut salt_bytes).map_err(|_| SecurityHardeningError::Random)?;
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|_| SecurityHardeningError::PasswordHash)?;
+        getrandom::fill(&mut salt_bytes).map_err(|_| SecurityHardeningError::Random)?;
         let secret_hash_phc = Argon2::default()
-            .hash_password(raw_secret.as_bytes(), &salt)
+            .hash_password_with_salt(raw_secret.as_bytes(), &salt_bytes)
             .map_err(|_| SecurityHardeningError::PasswordHash)?
             .to_string();
         Ok(Self {
@@ -724,7 +723,7 @@ impl ServiceToken {
         expires_unix: u64,
     ) -> Result<IssuedServiceToken, SecurityHardeningError> {
         let mut secret_bytes = [0_u8; 32];
-        getrandom::getrandom(&mut secret_bytes).map_err(|_| SecurityHardeningError::Random)?;
+        getrandom::fill(&mut secret_bytes).map_err(|_| SecurityHardeningError::Random)?;
         let secret = Zeroizing::new(URL_SAFE_NO_PAD.encode(secret_bytes));
         let metadata = Self::mint(token_id, principal, scopes, &secret, expires_unix)?;
         Ok(IssuedServiceToken { metadata, secret })

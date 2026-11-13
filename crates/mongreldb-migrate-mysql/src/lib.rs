@@ -1240,7 +1240,7 @@ impl MigrationCheckpoint {
         let encoded = serde_json::to_vec(schema).expect("SourceSchema serializes");
         Self {
             source_id: source.source_id.clone(),
-            schema_sha256: format!("{:x}", Sha256::digest(encoded)),
+            schema_sha256: hex(Sha256::digest(&encoded).as_slice()),
             stage: MigrationStage::Planned,
             snapshot_position: position.clone(),
             table_offsets: BTreeMap::new(),
@@ -1474,7 +1474,7 @@ fn validate_checkpoint(
 
 fn schema_sha256(schema: &SourceSchema) -> String {
     let encoded = serde_json::to_vec(schema).expect("SourceSchema serializes");
-    format!("{:x}", Sha256::digest(encoded))
+    hex(Sha256::digest(&encoded).as_slice())
 }
 
 async fn refresh_source_validation(
@@ -1668,7 +1668,7 @@ fn source_checksum(previous: &str, table: &SourceTable, rows: &[Vec<Value>]) -> 
             hash.update(encoded);
         }
         hash.update(0_u64.to_le_bytes());
-        checksum = format!("{:x}", hash.finalize());
+        checksum = hex(hash.finalize().as_slice());
     }
     Ok(checksum)
 }
@@ -1746,7 +1746,7 @@ pub async fn validate_target(
                     hash.update(encoded);
                 }
                 hash.update(0_u64.to_le_bytes());
-                checksum = format!("{:x}", hash.finalize());
+                checksum = hex(hash.finalize().as_slice());
                 count += 1;
             }
         }

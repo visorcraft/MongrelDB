@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
 use parking_lot::RwLock;
 
@@ -32,13 +33,10 @@ impl ServicePrincipalDefinition {
         expires_unix: u64,
     ) -> Result<Self> {
         let mut salt_bytes = [0_u8; 16];
-        getrandom::getrandom(&mut salt_bytes)
+        getrandom::fill(&mut salt_bytes)
             .map_err(|e| MongrelError::InvalidArgument(format!("service principal salt: {e}")))?;
-        let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| {
-            MongrelError::InvalidArgument(format!("service principal salt encode: {e}"))
-        })?;
         let secret_hash_phc = Argon2::default()
-            .hash_password(raw_secret.as_bytes(), &salt)
+            .hash_password_with_salt(raw_secret.as_bytes(), &salt_bytes)
             .map_err(|e| MongrelError::InvalidArgument(format!("service principal hash: {e}")))?
             .to_string();
         Ok(Self {

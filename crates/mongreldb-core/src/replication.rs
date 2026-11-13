@@ -620,7 +620,7 @@ pub(crate) fn replication_identity_durable(
     root.create_directory_all("_meta")?;
     let mut source_id = [0_u8; REPLICATION_ID_LEN];
     loop {
-        getrandom::getrandom(&mut source_id)
+        getrandom::fill(&mut source_id)
             .map_err(|error| MongrelError::EntropyUnavailable(error.to_string()))?;
         if source_id.iter().any(|byte| *byte != 0) {
             break;

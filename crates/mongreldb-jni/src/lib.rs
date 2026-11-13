@@ -20,7 +20,7 @@
 
 use jni::objects::{JClass, JObject, JString, JThrowable, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned};
 use mongreldb_kit::Database as KitDatabase;
 use mongreldb_kit_core::Migration;
 use mongreldb_types::errors::ErrorCategory;
@@ -81,50 +81,79 @@ pub(crate) fn kit_error_category(e: &mongreldb_kit::KitError) -> ErrorCategory {
 
 // ── JNI helpers ───────────────────────────────────────────────────────────
 
-/// Convert a JNI JString to a Rust String.
-fn jstring_to_string(env: &mut JNIEnv, s: JString) -> String {
-    match env.get_string(&s) {
-        Ok(js) => js.to_str().unwrap_or("").to_owned(),
-        Err(_) => String::new(),
+/// Borrows the JNI 0.22 [`Env`] API from the FFI-safe pointer the JVM passes
+/// into a native method. The guard does not detach the thread.
+struct JniEnv<'local> {
+    guard: jni::AttachGuard<'local>,
+}
+
+impl<'local> JniEnv<'local> {
+    fn new(env: &EnvUnowned<'local>) -> Self {
+        Self {
+            // SAFETY: the JVM passes a non-null `EnvUnowned` attached to this
+            // thread for the native call. `from_unowned` does not detach.
+            guard: unsafe { jni::AttachGuard::from_unowned(env.as_raw()) },
+        }
     }
+
+    fn env(&mut self) -> &mut Env<'local> {
+        self.guard.borrow_env_mut()
+    }
+}
+
+/// Rebinds `env` from the FFI pointer to a mutable [`Env`] for the rest of
+/// the native method.
+macro_rules! jni_env {
+    ($env:ident) => {
+        let mut frame = JniEnv::new(&$env);
+        let $env = frame.env();
+    };
+}
+
+/// Convert a JNI JString to a Rust String.
+fn jstring_to_string(env: &mut Env, s: JString) -> String {
+    s.try_to_string(env).unwrap_or_default()
 }
 
 /// Throw a Java exception with the given class and message. The class should
 /// be a fully-qualified JVM class name using slashes (e.g. "com/visorcraft/
 /// mongreldb/QueryException").
-fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
+fn throw_java(env: &mut Env, class: &str, message: &str) {
+    let class = jni::strings::JNIString::new(class);
+    let message = jni::strings::JNIString::new(message);
     let _ = env.throw_new(class, message);
 }
 
 /// Throw `QueryException(message, category, categoryCode)` when the class is
 /// available; fall back to the single-string constructor / `throw_new`.
-fn throw_query_exception(env: &mut JNIEnv, message: &str, category: ErrorCategory) {
+fn throw_query_exception(env: &mut Env, message: &str, category: ErrorCategory) {
     const CLASS: &str = "com/visorcraft/mongreldb/QueryException";
     let ok = (|| -> jni::errors::Result<()> {
-        let class = env.find_class(CLASS)?;
+        let class = env.find_class(jni::jni_str!("com/visorcraft/mongreldb/QueryException"))?;
         let msg = env.new_string(message)?;
         let cat = env.new_string(category.name())?;
         let obj = env.new_object(
             class,
-            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;I)V"),
             &[
                 JValue::Object(&JObject::from(msg)),
                 JValue::Object(&JObject::from(cat)),
                 JValue::Int(category.code() as i32),
             ],
         )?;
-        env.throw(JThrowable::from(obj))?;
+        let throwable = env.cast_local::<JThrowable>(obj)?;
+        env.throw(throwable)?;
         Ok(())
     })();
     if ok.is_err() {
         // Class missing or constructor unavailable: message-only fallback.
-        throw_java(env, CLASS, message);
+        throw_java(&mut *env, CLASS, message);
     }
 }
 
 /// Map a KitError to a Java exception and throw it. Surfaces the FND-007
 /// taxonomy on `QueryException.category` / `categoryCode`.
-fn throw_kit_error(env: &mut JNIEnv, e: &mongreldb_kit::KitError) {
+fn throw_kit_error(env: &mut Env, e: &mongreldb_kit::KitError) {
     throw_query_exception(env, &format!("{e}"), kit_error_category(e));
 }
 
@@ -143,14 +172,15 @@ fn db_to_handle(db: JniDatabase) -> jlong {
 
 // ── JNI exported functions ────────────────────────────────────────────────
 //
-// All follow the signature: extern "system" fn(JNIEnv, JClass, ...) -> ret
+// All follow the signature: extern "system" fn(EnvUnowned, JClass, ...) -> ret
 // The `system` calling convention matches the JNI ABI on each platform.
 
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeBuildInfo(
-    env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
+    jni_env!(env);
     let json = serde_json::json!({
         "artifact_version": env!("CARGO_PKG_VERSION"),
         "engine_version": env!("CARGO_PKG_VERSION"),
@@ -168,17 +198,18 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Opens an existing Kit database. Java: `native long open(String path)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpen(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
     match KitDatabase::open(Path::new(&path_str)) {
         Ok(db) => db_to_handle(JniDatabase {
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -188,18 +219,19 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native long create(String path, String schemaJson)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreate(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     schema_json: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let schema_str = jstring_to_string(&mut env, schema_json);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let schema_str = jstring_to_string(&mut *env, schema_json);
     let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
         Ok(s) => s,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse schema JSON: {e}"),
             );
@@ -211,7 +243,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -220,19 +252,20 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Open encrypted Kit database. Java: `native long nativeOpenEncrypted(String path, String passphrase)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenEncrypted(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     passphrase: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let pass = jstring_to_string(&mut env, passphrase);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let pass = jstring_to_string(&mut *env, passphrase);
     match KitDatabase::open_encrypted(Path::new(&path_str), &pass) {
         Ok(db) => db_to_handle(JniDatabase {
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -242,20 +275,21 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native long nativeCreateEncrypted(String path, String schemaJson, String passphrase)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateEncrypted(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     schema_json: JString,
     passphrase: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let schema_str = jstring_to_string(&mut env, schema_json);
-    let pass = jstring_to_string(&mut env, passphrase);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let schema_str = jstring_to_string(&mut *env, schema_json);
+    let pass = jstring_to_string(&mut *env, passphrase);
     let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
         Ok(s) => s,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse schema JSON: {e}"),
             );
@@ -267,7 +301,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -276,21 +310,22 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Open with credentials. Java: `native long nativeOpenWithCredentials(String path, String user, String password)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenWithCredentials(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     user: JString,
     password: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let user_str = jstring_to_string(&mut env, user);
-    let pass_str = jstring_to_string(&mut env, password);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let user_str = jstring_to_string(&mut *env, user);
+    let pass_str = jstring_to_string(&mut *env, password);
     match KitDatabase::open_with_credentials(Path::new(&path_str), &user_str, &pass_str) {
         Ok(db) => db_to_handle(JniDatabase {
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -300,22 +335,23 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native long nativeCreateWithCredentials(String path, String schemaJson, String user, String password)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateWithCredentials(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     schema_json: JString,
     user: JString,
     password: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let schema_str = jstring_to_string(&mut env, schema_json);
-    let user_str = jstring_to_string(&mut env, user);
-    let pass_str = jstring_to_string(&mut env, password);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let schema_str = jstring_to_string(&mut *env, schema_json);
+    let user_str = jstring_to_string(&mut *env, user);
+    let pass_str = jstring_to_string(&mut *env, password);
     let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
         Ok(s) => s,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse schema JSON: {e}"),
             );
@@ -327,7 +363,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -337,17 +373,18 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native long nativeOpenEncryptedWithCredentials(String path, String passphrase, String user, String password)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenEncryptedWithCredentials(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     passphrase: JString,
     user: JString,
     password: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let pass = jstring_to_string(&mut env, passphrase);
-    let user_str = jstring_to_string(&mut env, user);
-    let pass_str = jstring_to_string(&mut env, password);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let pass = jstring_to_string(&mut *env, passphrase);
+    let user_str = jstring_to_string(&mut *env, user);
+    let pass_str = jstring_to_string(&mut *env, password);
     match KitDatabase::open_encrypted_with_credentials(
         Path::new(&path_str),
         &pass,
@@ -358,7 +395,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -368,7 +405,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native long nativeCreateEncryptedWithCredentials(String path, String schemaJson, String passphrase, String user, String password)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateEncryptedWithCredentials(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     path: JString,
     schema_json: JString,
@@ -376,16 +413,17 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     user: JString,
     password: JString,
 ) -> jlong {
-    let path_str = jstring_to_string(&mut env, path);
-    let schema_str = jstring_to_string(&mut env, schema_json);
-    let pass = jstring_to_string(&mut env, passphrase);
-    let user_str = jstring_to_string(&mut env, user);
-    let pass_str = jstring_to_string(&mut env, password);
+    jni_env!(env);
+    let path_str = jstring_to_string(&mut *env, path);
+    let schema_str = jstring_to_string(&mut *env, schema_json);
+    let pass = jstring_to_string(&mut *env, passphrase);
+    let user_str = jstring_to_string(&mut *env, user);
+    let pass_str = jstring_to_string(&mut *env, password);
     let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
         Ok(s) => s,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse schema JSON: {e}"),
             );
@@ -403,7 +441,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             db: Rc::new(RefCell::new(db)),
         }),
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             0
         }
     }
@@ -412,7 +450,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Closes and frees the database handle. Java: `native void close(long handle)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeClose(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -429,28 +467,29 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native String sqlRows(long handle, String sql)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlRows(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     sql: JString,
 ) -> jstring {
+    jni_env!(env);
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database handle is null",
             );
             return std::ptr::null_mut();
         }
     };
-    let sql_str = jstring_to_string(&mut env, sql);
+    let sql_str = jstring_to_string(&mut *env, sql);
 
     let rows = match db.db.borrow().sql_rows(&sql_str) {
         Ok(r) => r,
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             return std::ptr::null_mut();
         }
     };
@@ -459,7 +498,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Ok(s) => s,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("JSON serialization failed: {e}"),
             );
@@ -476,28 +515,29 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native byte[] sqlArrow(long handle, String sql)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlArrow(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     sql: JString,
 ) -> jbyteArray {
+    jni_env!(env);
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database handle is null",
             );
             return std::ptr::null_mut();
         }
     };
-    let sql_str = jstring_to_string(&mut env, sql);
+    let sql_str = jstring_to_string(&mut *env, sql);
 
     let ipc = match db.db.borrow().sql_arrow(&sql_str) {
         Ok(bytes) => bytes,
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             return std::ptr::null_mut();
         }
     };
@@ -511,29 +551,30 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native void migrate(long handle, String migrationsJson)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeMigrate(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     migrations_json: JString,
 ) {
+    jni_env!(env);
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database handle is null",
             );
             return;
         }
     };
-    let json_str = jstring_to_string(&mut env, migrations_json);
+    let json_str = jstring_to_string(&mut *env, migrations_json);
 
     let migrations: Vec<Migration> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse migrations JSON: {e}"),
             );
@@ -546,7 +587,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Ok(g) => g,
         Err(_) => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database is in use (borrow conflict)",
             );
@@ -555,7 +596,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     };
 
     if let Err(e) = mongreldb_kit::migrate(&mut guard, &migrations) {
-        throw_kit_error(&mut env, &e);
+        throw_kit_error(&mut *env, &e);
     }
 }
 
@@ -563,15 +604,16 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native String appliedMigrations(long handle)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeAppliedMigrations(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jstring {
+    jni_env!(env);
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
             throw_java(
-                &mut env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database handle is null",
             );
@@ -582,7 +624,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let migrations = match db.db.borrow().applied_migrations() {
         Ok(m) => m,
         Err(e) => {
-            throw_kit_error(&mut env, &e);
+            throw_kit_error(&mut *env, &e);
             return std::ptr::null_mut();
         }
     };
@@ -597,16 +639,17 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native void refreshSqlSession(long handle)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeRefreshSqlSession(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
+    jni_env!(env);
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => return,
     };
     if let Err(e) = db.db.borrow().refresh_sql_session() {
-        throw_kit_error(&mut env, &e);
+        throw_kit_error(&mut *env, &e);
     }
 }
 
@@ -614,96 +657,103 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Java: `native String querySelect(long handle, String queryJson)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQuerySelect(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "select")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "select")
 }
 
 /// Runs a JOIN query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryJoin(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "join")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "join")
 }
 
 /// Runs an AGGREGATE query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryAggregate(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "aggregate")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "aggregate")
 }
 
 /// Runs an INSERT query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryInsert(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "insert")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "insert")
 }
 
 /// Runs an UPDATE query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpdate(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "update")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "update")
 }
 
 /// Runs an UPSERT query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpsert(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "upsert")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "upsert")
 }
 
 /// Runs a DELETE query.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryDelete(
-    mut env: JNIEnv,
+    env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     query_json: JString,
 ) -> jstring {
-    query_dispatch(&mut env, handle, query_json, "delete")
+    jni_env!(env);
+    query_dispatch(&mut *env, handle, query_json, "delete")
 }
 
 /// Dispatch a query builder call. Each variant parses the JSON into the
 /// appropriate kit-core AST type, runs it in a short-lived transaction, and
 /// returns the result as a JSON string.
-fn query_dispatch(env: &mut JNIEnv, handle: jlong, query_json: JString, kind: &str) -> jstring {
+fn query_dispatch(env: &mut Env, handle: jlong, query_json: JString, kind: &str) -> jstring {
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
             throw_java(
-                env,
+                &mut *env,
                 "com/visorcraft/mongreldb/QueryException",
                 "database handle is null",
             );
             return std::ptr::null_mut();
         }
     };
-    let json_str = jstring_to_string(env, query_json);
+    let json_str = jstring_to_string(&mut *env, query_json);
 
     use mongreldb_kit_core::{
         AggregateQuery, Delete, Insert, JoinQuery, Query, Select, Update, Upsert,
@@ -777,7 +827,7 @@ fn query_dispatch(env: &mut JNIEnv, handle: jlong, query_json: JString, kind: &s
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut()),
         Err(e) => {
-            throw_kit_error(env, &e);
+            throw_kit_error(&mut *env, &e);
             std::ptr::null_mut()
         }
     }

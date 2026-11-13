@@ -45,7 +45,7 @@ pub const IDENTITY_FILENAME: &str = "identity.json";
 pub(crate) const MAX_META_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Caller-supplied source of cryptographic randomness used to mint
-/// identifiers; production passes `getrandom::getrandom`, tests pass a
+/// identifiers; production passes `getrandom::fill`, tests pass a
 /// deterministic filler.
 pub type Csprng<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 

@@ -10,11 +10,12 @@
 //!
 //! Run: `cargo bench -p mongreldb-core --bench path_matrix`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use mongreldb_core::query::Query;
 use mongreldb_core::schema::*;
 use mongreldb_core::trace::ScanMode;
 use mongreldb_core::{Condition as C, Table, Value};
+use std::hint::black_box;
 use std::time::Duration;
 use tempfile::tempdir;
 

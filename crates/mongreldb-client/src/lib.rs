@@ -2936,7 +2936,7 @@ fn valid_flat_kit_cells(cells: &[serde_json::Value]) -> bool {
         return false;
     }
     let mut column_ids = std::collections::HashSet::new();
-    cells.chunks_exact(2).all(|pair| {
+    cells.as_chunks::<2>().0.iter().all(|pair| {
         pair[0]
             .as_u64()
             .and_then(|column_id| u16::try_from(column_id).ok())
@@ -3020,7 +3020,7 @@ fn validate_kit_query_response(
             || !row_ids.insert(row.row_id.as_str())
             || !valid_flat_kit_cells(&row.cells)
             || projection.as_ref().is_some_and(|projection| {
-                row.cells.chunks_exact(2).any(|pair| {
+                row.cells.as_chunks::<2>().0.iter().any(|pair| {
                     pair[0]
                         .as_u64()
                         .and_then(|column_id| u16::try_from(column_id).ok())

@@ -4,7 +4,7 @@
 //!
 //! - Random 128-bit IDs ([`ClusterId`], [`NodeId`], [`DatabaseId`],
 //!   [`TabletId`], [`RaftGroupId`], [`TransactionId`], [`QueryId`]). They are
-//!   drawn from the operating-system CSPRNG via [`getrandom`], are never
+//!   drawn from the operating-system CSPRNG via `getrandom::fill`, are never
 //!   derived only from timestamps, and are never reused within a database.
 //! - Numeric 64-bit IDs ([`TableId`], [`SchemaVersion`], [`MetadataVersion`])
 //!   allocated through replicated catalog state; they are likewise never
@@ -94,7 +94,7 @@ macro_rules! id128 {
             /// bits the result is never reused within a database.
             pub fn new_random() -> Self {
                 let mut bytes = [0u8; 16];
-                getrandom::getrandom(&mut bytes)
+                getrandom::fill(&mut bytes)
                     .expect("operating-system CSPRNG unavailable");
                 Self(bytes)
             }

@@ -645,8 +645,7 @@ impl DurableRoot {
         let (_, name) = checked_parent(relative)?;
         for _ in 0..128 {
             let mut nonce = [0_u8; 8];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
             let suffix = nonce
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
@@ -751,7 +750,7 @@ impl DurableRoot {
         let mut after_publish = Some(after_publish);
         for _ in 0..128 {
             let mut nonce = [0_u8; 8];
-            getrandom::getrandom(&mut nonce)
+            getrandom::fill(&mut nonce)
                 .map_err(|error| E::from(io::Error::other(error.to_string())))?;
             let suffix = nonce
                 .iter()

@@ -22,7 +22,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::embedding::EmbeddingSource;
 use mongreldb_core::query::{
@@ -1996,8 +1996,8 @@ fn cursor_verified_payload<'a>(
     kind: &str,
 ) -> Result<&'a str, MongrelError> {
     let invalid = || MongrelError::InvalidArgument(format!("invalid {kind} cursor"));
-    let (payload, tag) = value.rsplit_once(':').ok_or_else(&invalid)?;
-    let tag = cursor_unhex::<32>(tag).ok_or_else(&invalid)?;
+    let (payload, tag) = value.rsplit_once(':').ok_or_else(invalid)?;
+    let tag = cursor_unhex::<32>(tag).ok_or_else(invalid)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
     mac.update(payload.as_bytes());
     mac.verify_slice(&tag).map_err(|_| invalid())?;
@@ -2038,13 +2038,13 @@ fn parse_cursor_binding(
         query_time_nanos: parts[start + 5].parse().map_err(|_| invalid())?,
         issued_at_nanos: parts[start + 6].parse().map_err(|_| invalid())?,
         expires_at_nanos: parts[start + 7].parse().map_err(|_| invalid())?,
-        principal_hash: cursor_unhex(parts[start + 8]).ok_or_else(&invalid)?,
-        request_hash: cursor_unhex(parts[start + 9]).ok_or_else(&invalid)?,
+        principal_hash: cursor_unhex(parts[start + 8]).ok_or_else(invalid)?,
+        request_hash: cursor_unhex(parts[start + 9]).ok_or_else(invalid)?,
     };
     let lifetime = binding
         .expires_at_nanos
         .checked_sub(binding.issued_at_nanos)
-        .ok_or_else(&invalid)?;
+        .ok_or_else(invalid)?;
     let now = cursor_now_nanos();
     if lifetime <= 0
         || lifetime > CURSOR_TTL_NANOS
@@ -2129,12 +2129,12 @@ fn parse_kit_query_cursor(value: &str, key: &[u8; 32]) -> Result<KitQueryCursor,
     Ok(KitQueryCursor {
         epoch: parts
             .get(1)
-            .ok_or_else(&invalid)?
+            .ok_or_else(invalid)?
             .parse()
             .map_err(|_| invalid())?,
         row_id: parts
             .get(2)
-            .ok_or_else(&invalid)?
+            .ok_or_else(invalid)?
             .parse()
             .map_err(|_| invalid())?,
         binding: parse_cursor_binding(&parts, 3, "query")?,
@@ -2563,14 +2563,14 @@ fn parse_kit_search_cursor(value: &str, key: &[u8; 32]) -> Result<KitSearchCurso
     }
     let epoch = parts
         .get(1)
-        .ok_or_else(&invalid)?
+        .ok_or_else(invalid)?
         .parse()
         .map_err(|_| invalid())?;
     let score_bits =
-        u64::from_str_radix(parts.get(2).ok_or_else(&invalid)?, 16).map_err(|_| invalid())?;
+        u64::from_str_radix(parts.get(2).ok_or_else(invalid)?, 16).map_err(|_| invalid())?;
     let row_id = parts
         .get(3)
-        .ok_or_else(&invalid)?
+        .ok_or_else(invalid)?
         .parse()
         .map_err(|_| invalid())?;
     let final_score = f64::from_bits(score_bits);

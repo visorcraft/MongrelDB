@@ -2018,8 +2018,8 @@ fn take_u64_be(p: &[u8], n: usize) -> Result<Vec<u64>> {
         Ok(native.iter().map(|v| v.swap_bytes()).collect())
     } else {
         let mut out = Vec::with_capacity(n);
-        for chunk in bytes.chunks_exact(8) {
-            out.push(u64::from_be_bytes(chunk.try_into().unwrap()));
+        for chunk in bytes.as_chunks::<8>().0 {
+            out.push(u64::from_be_bytes(*chunk));
         }
         Ok(out)
     }
@@ -2065,13 +2065,17 @@ fn take_u64_le(p: &[u8], n: usize) -> Result<Vec<u64>> {
             return Ok(native.to_vec());
         }
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect())
     } else {
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect())
     }
 }

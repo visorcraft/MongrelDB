@@ -61,14 +61,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage};
-use openraft::{EntryPayload, ErrorSubject, ErrorVerb, StorageIOError};
+use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
+use openraft::type_config::TypeConfigExt;
+use openraft::{EntryPayload, ErrorSubject, ErrorVerb};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
-use crate::identity::{
-    MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftNodeId, RaftStorageError, RaftVote,
-};
+use crate::identity::{MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftStorageError, RaftVote};
 
 /// Current durable format version written by this module.
 const FORMAT_VERSION: u32 = 1;
@@ -131,13 +130,11 @@ impl StoreError {
 
 /// Converts a [`StoreError`] into openraft's storage error type.
 pub(crate) fn raft_storage_error(
-    subject: ErrorSubject<RaftNodeId>,
+    subject: ErrorSubject<MongrelRaftConfig>,
     verb: ErrorVerb,
     err: StoreError,
 ) -> RaftStorageError {
-    RaftStorageError::IO {
-        source: StorageIOError::new(subject, verb, openraft::AnyError::new(&err)),
-    }
+    RaftStorageError::new(subject, verb, MongrelRaftConfig::err_from_error(&err))
 }
 
 /// Log-append fsync policy (S2B-002). The default is durable.
@@ -336,7 +333,7 @@ struct LogInner {
     /// Entries stored in the active segment (drives rolling).
     active_entry_count: u64,
     /// Flush callbacks waiting for the next Deferred fsync.
-    pending: Vec<LogFlushed<MongrelRaftConfig>>,
+    pending: Vec<IOFlushed<MongrelRaftConfig>>,
     /// LeaderDisk waiters (command id → post-fsync signal), S2C.
     leader_disk: HashMap<[u8; 16], LeaderDiskWaiter>,
     flusher_spawned: bool,
@@ -592,7 +589,7 @@ impl SharedLog {
                 inner.leader_disk.drain().map(|(_, w)| w).collect();
             drop(inner);
             for callback in pending {
-                callback.log_io_completed(Ok(()));
+                callback.io_completed(Ok(()));
             }
             for waiter in signaled {
                 if let Some(log_id) = waiter.log_id {
@@ -609,6 +606,7 @@ impl SharedLog {
 /// The openraft log reader (replication tasks read entries through it).
 pub struct MongrelLogReader {
     shared: SharedLog,
+    hard_dir: PathBuf,
 }
 
 /// Shared range-read used by both log-reader implementations.
@@ -616,7 +614,7 @@ pub struct MongrelLogReader {
 fn read_entries_range<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
     shared: &SharedLog,
     range: RB,
-) -> Result<Vec<RaftLogEntry>, RaftStorageError> {
+) -> Result<Vec<RaftLogEntry>, io::Error> {
     let start = match range.start_bound() {
         std::ops::Bound::Included(i) => *i,
         std::ops::Bound::Excluded(i) => *i + 1,
@@ -629,15 +627,24 @@ fn read_entries_range<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
     };
     shared
         .read_entries(start, end, usize::MAX)
-        .map_err(|e| raft_storage_error(ErrorSubject::Logs, ErrorVerb::Read, e))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 impl RaftLogReader<MongrelRaftConfig> for MongrelLogReader {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<RaftLogEntry>, RaftStorageError> {
+    ) -> Result<Vec<RaftLogEntry>, io::Error> {
         read_entries_range(&self.shared, range)
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<RaftVote>, io::Error> {
+        HardStateStore {
+            dir: self.hard_dir.clone(),
+        }
+        .load()
+        .map(|state| state.vote)
+        .map_err(|error| io::Error::other(error.to_string()))
     }
 }
 
@@ -975,12 +982,12 @@ impl MongrelLogStore {
 
     /// Queues a flush callback for the Deferred policy, spawning the
     /// background flusher on first use.
-    fn defer_callback(&self, callback: LogFlushed<MongrelRaftConfig>, interval: Duration) {
+    fn defer_callback(&self, callback: IOFlushed<MongrelRaftConfig>, interval: Duration) {
         let spawn = {
             let mut inner = match self.shared.lock() {
                 Ok(inner) => inner,
                 Err(_) => {
-                    callback.log_io_completed(Err(io::Error::other("log lock poisoned")));
+                    callback.io_completed(Err(io::Error::other("log lock poisoned")));
                     return;
                 }
             };
@@ -1117,7 +1124,7 @@ async fn deferred_flush_loop(
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let (drained, signaled): (Vec<LogFlushed<MongrelRaftConfig>>, Vec<LeaderDiskWaiter>) = {
+        let (drained, signaled): (Vec<IOFlushed<MongrelRaftConfig>>, Vec<LeaderDiskWaiter>) = {
             let mut guard = match inner.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -1141,7 +1148,7 @@ async fn deferred_flush_loop(
                     let pending = std::mem::take(&mut guard.pending);
                     drop(guard);
                     for callback in pending {
-                        callback.log_io_completed(Err(io::Error::new(
+                        callback.io_completed(Err(io::Error::new(
                             error.kind(),
                             format!("deferred fsync: {error}"),
                         )));
@@ -1151,7 +1158,7 @@ async fn deferred_flush_loop(
             }
         };
         for callback in drained {
-            callback.log_io_completed(Ok(()));
+            callback.io_completed(Ok(()));
         }
         for waiter in signaled {
             if let Some(log_id) = waiter.log_id {
@@ -1165,20 +1172,27 @@ impl RaftLogReader<MongrelRaftConfig> for MongrelLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<RaftLogEntry>, RaftStorageError> {
+    ) -> Result<Vec<RaftLogEntry>, io::Error> {
         read_entries_range(&self.shared, range)
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<RaftVote>, io::Error> {
+        self.hard
+            .load()
+            .map(|state| state.vote)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 }
 
 impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
     type LogReader = MongrelLogReader;
 
-    async fn get_log_state(&mut self) -> Result<LogState<MongrelRaftConfig>, RaftStorageError> {
+    async fn get_log_state(&mut self) -> Result<LogState<MongrelRaftConfig>, io::Error> {
         let (last_purged, last) = {
             let inner = self
                 .shared
                 .lock()
-                .map_err(|e| raft_storage_error(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             (inner.last_purged, inner.last_indexed())
         };
         Ok(LogState {
@@ -1190,42 +1204,33 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
     async fn get_log_reader(&mut self) -> Self::LogReader {
         MongrelLogReader {
             shared: self.shared.clone(),
+            hard_dir: self.hard.dir.clone(),
         }
     }
 
     /// Persists the vote and fsyncs **before returning** (S2B-002).
-    async fn save_vote(&mut self, vote: &RaftVote) -> Result<(), RaftStorageError> {
+    async fn save_vote(&mut self, vote: &RaftVote) -> Result<(), io::Error> {
         self.save_hard_state(Some(*vote), None)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    async fn read_vote(&mut self) -> Result<Option<RaftVote>, RaftStorageError> {
-        Ok(self
-            .hard
-            .load()
-            .map_err(|e| raft_storage_error(ErrorSubject::Vote, ErrorVerb::Read, e))?
-            .vote)
-    }
-
-    async fn save_committed(
-        &mut self,
-        committed: Option<RaftLogId>,
-    ) -> Result<(), RaftStorageError> {
+    async fn save_committed(&mut self, committed: Option<RaftLogId>) -> Result<(), io::Error> {
         self.save_hard_state(None, committed)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    async fn read_committed(&mut self) -> Result<Option<RaftLogId>, RaftStorageError> {
-        Ok(self
-            .hard
+    async fn read_committed(&mut self) -> Result<Option<RaftLogId>, io::Error> {
+        self.hard
             .load()
-            .map_err(|e| raft_storage_error(ErrorSubject::Vote, ErrorVerb::Read, e))?
-            .committed)
+            .map(|state| state.committed)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<MongrelRaftConfig>,
-    ) -> Result<(), RaftStorageError>
+        callback: IOFlushed<MongrelRaftConfig>,
+    ) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = RaftLogEntry> + Send,
         I::IntoIter: Send,
@@ -1236,16 +1241,26 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
             .map(|i| i.dir.clone())
             .unwrap_or_default();
         self.append_inner(entries.into_iter().collect(), callback, &path)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    async fn truncate(&mut self, log_id: RaftLogId) -> Result<(), RaftStorageError> {
-        self.truncate_log(log_id)
-            .map_err(|e| raft_storage_error(ErrorSubject::Logs, ErrorVerb::Write, e))
+    async fn truncate_after(&mut self, last_log_id: Option<RaftLogId>) -> Result<(), io::Error> {
+        // `truncate_log` drops entries at and after an index. openraft 0.10
+        // asks to drop entries strictly after `last_log_id`.
+        let cutoff = match last_log_id {
+            Some(mut log_id) => {
+                log_id.index = log_id.index.saturating_add(1);
+                log_id
+            }
+            None => crate::identity::test_log_id(0, 0, 0),
+        };
+        self.truncate_log(cutoff)
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
-    async fn purge(&mut self, log_id: RaftLogId) -> Result<(), RaftStorageError> {
+    async fn purge(&mut self, log_id: RaftLogId) -> Result<(), io::Error> {
         self.purge_log(log_id)
-            .map_err(|e| raft_storage_error(ErrorSubject::Logs, ErrorVerb::Write, e))
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 }
 
@@ -1254,7 +1269,7 @@ impl MongrelLogStore {
     fn append_inner(
         &self,
         entries: Vec<RaftLogEntry>,
-        callback: LogFlushed<MongrelRaftConfig>,
+        callback: IOFlushed<MongrelRaftConfig>,
         path: &Path,
     ) -> Result<(), RaftStorageError> {
         let result: Result<Option<Duration>, StoreError> = (|| {
@@ -1282,10 +1297,10 @@ impl MongrelLogStore {
         })();
         match result {
             Ok(Some(interval)) => self.defer_callback(callback, interval),
-            Ok(None) => callback.log_io_completed(Ok(())),
+            Ok(None) => callback.io_completed(Ok(())),
             Err(err) => {
                 let io_err = io::Error::other(err.to_string());
-                callback.log_io_completed(Err(io_err));
+                callback.io_completed(Err(io_err));
                 return Err(raft_storage_error(
                     ErrorSubject::Logs,
                     ErrorVerb::Write,
@@ -1304,13 +1319,12 @@ mod tests {
     use mongreldb_log::envelope::CommandEnvelope;
     use mongreldb_types::hlc::HlcTimestamp;
     use openraft::entry::EntryPayload;
-    use openraft::CommittedLeaderId;
-    use openraft::{LogId, Vote};
+    use openraft::Vote;
 
     fn entry(term: u64, index: u64, id_byte: u8) -> RaftLogEntry {
         let envelope = CommandEnvelope::new(1, [id_byte; 16], vec![id_byte; 4]);
         RaftLogEntry {
-            log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+            log_id: crate::identity::test_log_id(term, 1, index),
             payload: EntryPayload::Normal(ReplicatedCommand::new(
                 CommandKind::Transaction,
                 envelope,
@@ -1321,7 +1335,7 @@ mod tests {
 
     fn blank_entry(term: u64, index: u64) -> RaftLogEntry {
         RaftLogEntry {
-            log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+            log_id: crate::identity::test_log_id(term, 1, index),
             payload: EntryPayload::Blank,
         }
     }
@@ -1363,17 +1377,14 @@ mod tests {
         store
             .save_hard_state(
                 Some(Vote::new(3, 2)),
-                Some(LogId::new(CommittedLeaderId::new(3, 2), 9)),
+                Some(crate::identity::test_log_id(3, 2, 9)),
             )
             .unwrap();
         drop(store);
         let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
         let state = store.hard.load().unwrap();
         assert_eq!(state.vote, Some(Vote::new(3, 2)));
-        assert_eq!(
-            state.committed,
-            Some(LogId::new(CommittedLeaderId::new(3, 2), 9))
-        );
+        assert_eq!(state.committed, Some(crate::identity::test_log_id(3, 2, 9)));
     }
 
     #[test]
@@ -1385,7 +1396,7 @@ mod tests {
         let shared = store.shared_log();
         assert_eq!(
             shared.last_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(1, 1), 3))
+            Some(crate::identity::test_log_id(1, 1, 3))
         );
         let read = shared.read_entries(1, 4, 10).unwrap();
         assert_eq!(read, entries);
@@ -1410,7 +1421,7 @@ mod tests {
         append_and_sync(&store, vec![entry(2, 4, 4)]);
         assert_eq!(
             shared.last_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(2, 1), 4))
+            Some(crate::identity::test_log_id(2, 1, 4))
         );
         assert_eq!(shared.read_entries(1, 10, 10).unwrap().len(), 4);
     }
@@ -1481,12 +1492,12 @@ mod tests {
 
         // Purge through index 6: earlier entries disappear, later stay.
         store
-            .purge_log(LogId::new(CommittedLeaderId::new(1, 1), 6))
+            .purge_log(crate::identity::test_log_id(1, 1, 6))
             .unwrap();
         let shared = store.shared_log();
         assert_eq!(
             shared.last_purged_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(1, 1), 6))
+            Some(crate::identity::test_log_id(1, 1, 6))
         );
         assert_eq!(shared.read_entries(1, 7, 10).unwrap().len(), 0);
         assert_eq!(shared.read_entries(7, 11, 10).unwrap().len(), 4);
@@ -1500,7 +1511,7 @@ mod tests {
         // Log state reports the purge point when asked.
         assert_eq!(
             shared.last_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(1, 1), 10))
+            Some(crate::identity::test_log_id(1, 1, 10))
         );
     }
 
@@ -1510,7 +1521,7 @@ mod tests {
         let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
         append_and_sync(&store, (1..=5u64).map(|i| entry(1, i, i as u8)).collect());
         store
-            .truncate_log(LogId::new(CommittedLeaderId::new(1, 1), 3))
+            .truncate_log(crate::identity::test_log_id(1, 1, 3))
             .unwrap();
         let shared = store.shared_log();
         assert_eq!(shared.read_entries(1, 10, 10).unwrap().len(), 2);
@@ -1545,13 +1556,13 @@ mod tests {
         let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
         append_and_sync(&store, (1..=4u64).map(|i| entry(1, i, i as u8)).collect());
         store
-            .purge_log(LogId::new(CommittedLeaderId::new(1, 1), 4))
+            .purge_log(crate::identity::test_log_id(1, 1, 4))
             .unwrap();
         let shared = store.shared_log();
         assert_eq!(shared.read_entries(1, 100, 100).unwrap().len(), 0);
         assert_eq!(
             shared.last_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(1, 1), 4))
+            Some(crate::identity::test_log_id(1, 1, 4))
         );
         // Appends after a full purge roll a fresh segment.
         append_and_sync(&store, vec![entry(1, 5, 5)]);
@@ -1562,7 +1573,7 @@ mod tests {
         assert_eq!(shared.read_entries(1, 100, 100).unwrap().len(), 1);
         assert_eq!(
             shared.last_purged_log_id().unwrap(),
-            Some(LogId::new(CommittedLeaderId::new(1, 1), 4))
+            Some(crate::identity::test_log_id(1, 1, 4))
         );
     }
 
@@ -1615,7 +1626,7 @@ mod tests {
         assert_eq!(watermark, 2);
         shared.signal_durable(watermark);
         let signaled = receiver.try_recv().unwrap().unwrap();
-        assert_eq!(signaled, LogId::new(CommittedLeaderId::new(1, 1), 2));
+        assert_eq!(signaled, crate::identity::test_log_id(1, 1, 2));
     }
 
     #[tokio::test]
@@ -1637,7 +1648,7 @@ mod tests {
         shared.signal_durable(watermark);
         assert_eq!(
             receiver.try_recv().unwrap().unwrap(),
-            LogId::new(CommittedLeaderId::new(1, 1), 2)
+            crate::identity::test_log_id(1, 1, 2)
         );
     }
 
@@ -1658,7 +1669,7 @@ mod tests {
         // Truncate away index 2 before any fsync: its waiter fails with
         // Truncated; the index-1 waiter stays pending.
         store
-            .truncate_log(LogId::new(CommittedLeaderId::new(1, 1), 2))
+            .truncate_log(crate::identity::test_log_id(1, 1, 2))
             .unwrap();
         assert_eq!(
             truncated.try_recv().unwrap(),
@@ -1670,7 +1681,7 @@ mod tests {
         shared.signal_durable(watermark);
         assert_eq!(
             survives.try_recv().unwrap().unwrap(),
-            LogId::new(CommittedLeaderId::new(1, 1), 1)
+            crate::identity::test_log_id(1, 1, 1)
         );
     }
 

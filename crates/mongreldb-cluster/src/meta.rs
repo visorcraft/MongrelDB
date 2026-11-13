@@ -3190,7 +3190,7 @@ where
 /// Mints a command id for the workflow's internal proposals.
 pub(crate) fn new_command_id() -> Result<[u8; 16], MetaError> {
     let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id).map_err(|error| MetaError::Rng(error.to_string()))?;
+    getrandom::fill(&mut id).map_err(|error| MetaError::Rng(error.to_string()))?;
     Ok(id)
 }
 

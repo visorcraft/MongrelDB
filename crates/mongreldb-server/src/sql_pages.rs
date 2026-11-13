@@ -1,4 +1,4 @@
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -453,7 +453,7 @@ fn unhex<const N: usize>(value: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut output = [0u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         output[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(output)

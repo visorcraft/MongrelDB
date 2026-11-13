@@ -130,7 +130,7 @@ async fn real_mysql_snapshot_concurrent_binlog_restart_cutover_and_rollback_guar
         NativeRpcServer::new(NativeRpcServerConfig {
             address: native_address,
             certificate_pem: certificate_pem.clone(),
-            private_key_pem: certificate.key_pair.serialize_pem().into_bytes(),
+            private_key_pem: certificate.signing_key.serialize_pem().into_bytes(),
             client_ca_pem: None,
             max_connections: 8,
             max_concurrent_streams: 8,

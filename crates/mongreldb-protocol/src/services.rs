@@ -17,7 +17,7 @@
 //!
 //! The traits use hand-written boxed futures ([`BoxFuture`]) instead of
 //! native `async fn` in traits. Native async-fn-in-trait (stable, and usable
-//! on this workspace's Rust 1.88) desugars to RPITIT, which is NOT
+//! on this workspace's Rust 1.95) desugars to RPITIT, which is NOT
 //! object-safe: `Arc<dyn QueryService>` would be impossible, forcing every
 //! adapter to monomorphize around concrete service types. The adapters
 //! dispatch services dynamically, so object safety is required — and this

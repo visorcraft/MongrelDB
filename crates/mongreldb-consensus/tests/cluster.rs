@@ -477,6 +477,26 @@ async fn lagging_follower_catches_up_via_snapshot() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn membership_change_waits_until_leader_log_commits() {
+    let mut cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
+    let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
+    cluster.start_node(4).await;
+    // No client write yet. Openraft 0.10 rejects a membership change until
+    // the leader commits a log entry of its own term (its blank log).
+    cluster
+        .group(leader)
+        .add_learner(4, BasicNode::new("node-4"))
+        .await
+        .unwrap();
+    let (voters, learners) = cluster.group(leader).members();
+    assert!(
+        learners.contains(&4) || voters.contains(&4),
+        "node 4 never joined: voters={voters:?} learners={learners:?}"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn membership_add_learner_promote_remove() {
     let mut cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
     let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
@@ -745,7 +765,9 @@ async fn crash_durable_entries_survive_restart() {
         )
         .await
         .unwrap();
-    assert_eq!(receipt.position.index, last_before.index + 1);
+    // A restarted leader commits one blank entry in the new term before
+    // the next client write, so the index moves forward and is not reused.
+    assert!(receipt.position.index > last_before.index);
     reopened.shutdown().await.unwrap();
 }
 

@@ -17,6 +17,7 @@ use mongreldb_cluster::network::{
     node_cert_name, PeerEndpoint, TcpTransport, TlsConfig, TransportConfig, TransportSecurity,
     TransportServer, RAFT_MSG_ERROR,
 };
+use mongreldb_consensus::error::ConsensusError;
 use mongreldb_consensus::group::{ConsensusGroup, GroupConfig};
 use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId};
 use mongreldb_consensus::network::RaftTransport;
@@ -207,17 +208,27 @@ impl Cluster {
 
     async fn propose(&self, seq: u64) -> u64 {
         let any = self.nodes.keys().next().unwrap();
-        let leader = self.leader(any).await;
-        let receipt = self
-            .group(&leader)
-            .propose(
-                CommandKind::Transaction,
-                envelope(seq),
-                &ExecutionControl::default(),
-            )
-            .await
-            .unwrap();
-        receipt.position.index
+        let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+        // openraft 0.10 can publish a leader and clear it again before this
+        // write is accepted. Retry through that window.
+        loop {
+            let leader = self.leader(any).await;
+            match self
+                .group(&leader)
+                .propose(
+                    CommandKind::Transaction,
+                    envelope(seq),
+                    &ExecutionControl::default(),
+                )
+                .await
+            {
+                Ok(receipt) => return receipt.position.index,
+                Err(ConsensusError::NotLeader { .. }) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("propose seq={seq} failed: {error}"),
+            }
+        }
     }
 
     async fn wait_applied(&self, raft_id: &RaftNodeId, index: u64) {
