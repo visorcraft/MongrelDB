@@ -17,7 +17,7 @@
 #   linux-x64-gnu      ubuntu-latest     x86_64-unknown-linux-gnu
 #   linux-x64-musl     ubuntu-latest     x86_64-unknown-linux-musl
 #   linux-arm64-gnu    ubuntu-24.04-arm  aarch64-unknown-linux-gnu
-#   darwin-arm64       macos-14          aarch64-apple-darwin
+#   darwin-arm64       macos-15          aarch64-apple-darwin
 #   darwin-x64         macos-15          x86_64-apple-darwin
 #   windows-x64        windows-latest    x86_64-pc-windows-msvc
 name: FFI Release
@@ -94,7 +94,7 @@ jobs:
             linker: aarch64-linux-gnu-gcc
             ar: aarch64-linux-gnu-ar
             zip: false
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             archive: mongreldb-native-darwin-arm64.tar.gz
             apt: ''
@@ -206,7 +206,7 @@ jobs:
             archive: mongreldb-kit-native-linux-arm64-gnu.tar.gz
             apt: gcc-aarch64-linux-gnu
             zip: false
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             archive: mongreldb-kit-native-darwin-arm64.tar.gz
             apt: ''
@@ -337,7 +337,7 @@ jobs:
             os: linux
             arch: arm64
             apt: gcc-aarch64-linux-gnu
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
             os: darwin
             arch: arm64
