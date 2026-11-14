@@ -564,13 +564,11 @@ pub struct PersistentResultCacheWriter {
     errors_total: AtomicU64,
     abandoned_total: AtomicU64,
     queue_depth: AtomicU64,
-    /// Number of I/O operations the worker is currently processing. The
-    /// worker increments this counter before invoking `io.write_atomic` /
-    /// `io.remove` / `io.clear` and decrements after the call returns. A
-    /// drain helper that observes `queue_depth == 0` should also wait for
-    /// this counter to drop to 0 before declaring the writer idle — the
-    /// "queue empty but write still in flight" window is what the
-    /// `flush_persistent_cache(deadline)` test relies on.
+    /// Number of ops the worker has dequeued and not yet finished. Bumped
+    /// inside `drain_one` before the new queue depth is published, and
+    /// dropped when the op is published, rejected, or fails. Covers the
+    /// staleness check as well as the I/O, so a waiter that sees
+    /// `queue_depth == 0` and this counter at 0 is not racing a rename.
     writes_in_flight: AtomicU64,
 }
 
@@ -738,8 +736,13 @@ impl PersistentResultCacheWriter {
                 guard.state.key_generations.remove(&next_key);
                 let clear_gen = guard.state.clear_generation;
                 let depth = guard.state.operations.len() as u64;
+                // Publish the in-flight hold before the queue depth drops.
+                // `flush_persistent_cache` treats "depth 0 and nothing in
+                // flight" as idle; the hold has to be visible in that same
+                // window, including the staleness check that runs before I/O.
+                self.writes_in_flight.fetch_add(1, Ordering::Release);
                 drop(guard);
-                self.queue_depth.store(depth, Ordering::Relaxed);
+                self.queue_depth.store(depth, Ordering::Release);
                 return Some(DrainedOp {
                     key: next_key,
                     op,
@@ -781,8 +784,9 @@ impl PersistentResultCacheWriter {
         guard.state.key_generations.remove(&next_key);
         let clear_gen = guard.state.clear_generation;
         let depth = guard.state.operations.len() as u64;
+        self.writes_in_flight.fetch_add(1, Ordering::Release);
         drop(guard);
-        self.queue_depth.store(depth, Ordering::Relaxed);
+        self.queue_depth.store(depth, Ordering::Release);
         Some(DrainedOp {
             key: next_key,
             op,
@@ -886,11 +890,21 @@ impl PersistentResultCacheWriter {
         self.abandoned_total.load(Ordering::Relaxed)
     }
     pub fn queue_depth(&self) -> usize {
-        self.queue_depth.load(Ordering::Relaxed) as usize
+        self.queue_depth.load(Ordering::Acquire) as usize
     }
-    /// Number of I/O operations the worker has not yet completed.
+    /// Number of dequeued operations the worker has not yet finished.
+    ///
+    /// Incremented inside `drain_one` / `try_drain_one` before the queue
+    /// depth is published, and decremented when the worker finishes the op
+    /// (published, rejected as stale, or failed). A waiter that observes
+    /// depth 0 and this counter 0 knows no write is still between dequeue
+    /// and the directory update.
     pub fn writes_in_flight(&self) -> u64 {
-        self.writes_in_flight.load(Ordering::Relaxed)
+        self.writes_in_flight.load(Ordering::Acquire)
+    }
+
+    fn end_in_flight(&self) {
+        self.writes_in_flight.fetch_sub(1, Ordering::Release);
     }
 
     /// Point-in-time copy of the persistent-cache publish counters. Exposed
@@ -1325,6 +1339,103 @@ mod tests {
         assert_eq!(w.abandoned_total(), 3);
     }
 
+    /// A dequeued op stays visible as in-flight through the staleness check,
+    /// before any I/O. `flush_persistent_cache` treats depth 0 + nothing in
+    /// flight as "the directory is up to date"; that was false while the
+    /// worker had popped the op and not yet started the write.
+    #[test]
+    fn dequeued_op_stays_in_flight_through_staleness_check() {
+        use std::sync::atomic::AtomicBool;
+
+        struct NopIo;
+        impl PersistentCacheIo for NopIo {
+            fn write_atomic(&self, _key: u64, _frame: &[u8]) -> Result<(), IoError> {
+                Ok(())
+            }
+            fn remove(&self, _key: u64) -> Result<(), IoError> {
+                Ok(())
+            }
+            fn clear(&self) -> Result<(), IoError> {
+                Ok(())
+            }
+            fn load(&self, _key: u64) -> Result<Option<Vec<u8>>, IoError> {
+                Ok(None)
+            }
+            fn exists(&self, _key: u64) -> bool {
+                false
+            }
+        }
+
+        struct HoldGuard {
+            parked: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+        impl StalenessGuard for HoldGuard {
+            fn is_current(&self, _key: u64, _key_generation: u64, _clear_generation: u64) -> bool {
+                if !self.parked.swap(true, Ordering::AcqRel) {
+                    while !self.release.load(Ordering::Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(10));
+                    }
+                }
+                true
+            }
+        }
+
+        let writer = Arc::new(PersistentResultCacheWriter::for_test(
+            WriterLimits::default(),
+        ));
+        let parked = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let handle = spawn_persistent_cache_worker(WorkerConfig {
+            writer: Arc::clone(&writer),
+            io: Arc::new(NopIo),
+            cipher: None,
+            staleness: Arc::new(HoldGuard {
+                parked: Arc::clone(&parked),
+                release: Arc::clone(&release),
+            }),
+            max_staleness_retries: 0,
+            completion: None,
+        });
+        struct StopWorker {
+            release: Arc<AtomicBool>,
+            writer: Arc<PersistentResultCacheWriter>,
+            thread: std::thread::Thread,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for StopWorker {
+            fn drop(&mut self) {
+                self.release.store(true, Ordering::Release);
+                self.thread.unpark();
+                self.writer.shutdown();
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let _stop = StopWorker {
+            release: Arc::clone(&release),
+            writer: Arc::clone(&writer),
+            thread: handle.thread().clone(),
+            handle: Some(handle),
+        };
+
+        writer.enqueue_store(entry(1, 32));
+        let start = std::time::Instant::now();
+        while !parked.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "worker did not reach the staleness check"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(writer.queue_depth(), 0, "op has left the queue");
+        assert!(
+            writer.writes_in_flight() >= 1,
+            "dequeued op must stay in flight until the worker finishes it"
+        );
+    }
+
     // --------------------------------------------------------------------
     // REM-E §9.5: exact logical-generation identity on load.
     // --------------------------------------------------------------------
@@ -1473,6 +1584,15 @@ pub fn spawn_persistent_cache_worker(config: WorkerConfig) -> std::thread::JoinH
     std::thread::spawn(move || run_persistent_cache_worker(config))
 }
 
+/// Decrements the writer's in-flight count when the dequeued op is done.
+struct InFlightGuard<'a>(&'a PersistentResultCacheWriter);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_in_flight();
+    }
+}
+
 fn run_persistent_cache_worker(config: WorkerConfig) {
     let WorkerConfig {
         writer,
@@ -1494,6 +1614,9 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
                 return;
             }
         };
+        // The dequeue already counted this op as in flight. Drop the guard
+        // on every exit, including a stale skip that never reaches I/O.
+        let _in_flight = InFlightGuard(&writer);
         // Re-validate staleness after the lock is released. We give the
         // queue a brief moment to settle, but bounded by `max_staleness_retries`
         // to prevent unbounded spinning under heavy contention.
@@ -1542,12 +1665,10 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
         }
         match drained.op {
             PendingCacheOp::Store(entry) => {
-                writer.writes_in_flight.fetch_add(1, Ordering::Relaxed);
                 let payload = match (entry.payload_factory)() {
                     Some(p) => p,
                     None => {
                         writer.record_outcome(DrainOutcome::StoreErrored);
-                        writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
                         continue;
                     }
                 };
@@ -1564,7 +1685,6 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
                     Ok(b) => b,
                     Err(_) => {
                         writer.record_outcome(DrainOutcome::StoreErrored);
-                        writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
                         continue;
                     }
                 };
@@ -1573,25 +1693,20 @@ fn run_persistent_cache_worker(config: WorkerConfig) {
                     Err(_) => DrainOutcome::StoreErrored,
                 };
                 writer.record_outcome(outcome);
-                writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
             }
             PendingCacheOp::Remove => {
-                writer.writes_in_flight.fetch_add(1, Ordering::Relaxed);
                 let outcome = match io.remove(drained.key) {
                     Ok(()) => DrainOutcome::RemoveApplied,
                     Err(_) => DrainOutcome::RemoveErrored,
                 };
                 writer.record_outcome(outcome);
-                writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
             }
             PendingCacheOp::Clear => {
-                writer.writes_in_flight.fetch_add(1, Ordering::Relaxed);
                 let outcome = match io.clear() {
                     Ok(()) => DrainOutcome::ClearApplied,
                     Err(_) => DrainOutcome::ClearErrored,
                 };
                 writer.record_outcome(outcome);
-                writer.writes_in_flight.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }

@@ -15,7 +15,11 @@ use tempfile::tempdir;
 
 #[tokio::test]
 async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let provider_status =
+        match tokio_rustls::rustls::crypto::ring::default_provider().install_default() {
+            Ok(()) => "installed ring".to_string(),
+            Err(provider) => format!("ring install lost to an existing provider: {provider:?}"),
+        };
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.create_user("wire-user", "wire-password").unwrap();
@@ -119,7 +123,7 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
     });
 
     let options = OptsBuilder::default()
-        .ip_or_hostname("localhost")
+        .ip_or_hostname("127.0.0.1")
         .resolved_ips(Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]))
         .tcp_port(wire_address.port())
         .user(Some("wire-user"))
@@ -129,13 +133,15 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
         .ssl_opts(Some(
             SslOpts::default()
                 .with_root_certs(vec![certificate_pem.clone().into()])
-                .with_disable_built_in_roots(true),
+                .with_disable_built_in_roots(true)
+                .with_danger_tls_hostname_override(Some("localhost")),
         ))
         .max_allowed_packet(Some(16 * 1024 * 1024))
         .wait_timeout(Some(60));
     // The listener is bound before the TLS task is scheduled. A client that
     // handshakes in that gap sees EOF. Retry until the server accepts.
     let mut connected = None;
+    let mut last_error = None;
     for _ in 0..50 {
         let pool = Pool::new(options.clone());
         match pool.get_conn().await {
@@ -143,14 +149,20 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
                 connected = Some((pool, connection));
                 break;
             }
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
     }
     let (pool, mut connection) = match connected {
         Some(connected) => connected,
         None => {
             let server = wire_result_rx.try_recv();
-            panic!("mysql wire listener did not accept TLS; server result: {server:?}");
+            let handshake = mongreldb_mysql_wire::last_connection_error();
+            panic!(
+                "mysql wire listener did not accept TLS; server result: {server:?}; provider: {provider_status}; last client error: {last_error:?}; listener: {handshake}"
+            );
         }
     };
     connection

@@ -50,6 +50,25 @@ pub struct MysqlWireConfig {
     pub handshake_timeout: Duration,
 }
 
+/// Latest reason a connection was dropped before a session started.
+/// Empty when no connection has failed in this process.
+static LAST_CONNECTION_ERROR: Mutex<String> = Mutex::new(String::new());
+
+/// Why the most recent MySQL connection was dropped before a session started.
+#[doc(hidden)]
+pub fn last_connection_error() -> String {
+    LAST_CONNECTION_ERROR
+        .lock()
+        .map(|error| error.clone())
+        .unwrap_or_default()
+}
+
+fn note_connection_error(message: impl Into<String>) {
+    if let Ok(mut error) = LAST_CONNECTION_ERROR.lock() {
+        *error = message.into();
+    }
+}
+
 /// Serve MySQL clients until `shutdown` resolves.
 ///
 /// The adapter rejects non-TLS clients before authentication. Its
@@ -102,29 +121,41 @@ where
                 ),
             )
             .await;
-            let Ok(Ok((true, init))) = initialized else {
-                return;
-            };
-            let options = IntermediaryOptions {
-                process_use_statement_on_query: true,
-                reject_connection_on_dbname_absence: false,
-            };
-            let _ =
-                opensrv_mysql::secure_run_with_options(backend, writer, options, tls, init).await;
-            if let Ok(mut active) = active.lock() {
-                active.remove(&connection_id);
+            match initialized {
+                Ok(Ok((true, init))) => {
+                    let options = IntermediaryOptions {
+                        process_use_statement_on_query: true,
+                        reject_connection_on_dbname_absence: false,
+                    };
+                    if let Err(error) =
+                        opensrv_mysql::secure_run_with_options(backend, writer, options, tls, init)
+                            .await
+                    {
+                        note_connection_error(format!("tls session failed: {error}"));
+                    }
+                    if let Ok(mut active) = active.lock() {
+                        active.remove(&connection_id);
+                    }
+                }
+                Ok(Ok((false, _))) => note_connection_error("client did not request TLS"),
+                Ok(Err(error)) => note_connection_error(format!("mysql handshake failed: {error}")),
+                Err(_) => note_connection_error("mysql handshake timed out"),
             }
         });
     }
 }
 
 fn tls13_config(certificate_pem: &[u8], private_key_pem: &[u8]) -> io::Result<ServerConfig> {
-    // Clients in this process call `ClientConfig::builder()`, which uses the
-    // process-default provider. Install ring so that call works even when no
-    // other component has installed one yet. This listener's own config is
-    // built with ring explicitly and does not depend on that default.
+    // `ClientConfig::builder()` (mysql_async) and the native listener both
+    // use the process-default provider. Install ring when nothing else has,
+    // then build this listener from that same installed provider. A second,
+    // freshly constructed ring provider disagrees with the default once the
+    // process also links aws-lc-rs, and the client observes the failure as
+    // a TLS handshake EOF.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| io::Error::other("rustls CryptoProvider is not installed"))?;
     let certificates = rustls_pemfile::certs(&mut BufReader::new(certificate_pem))
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
     if certificates.is_empty() {

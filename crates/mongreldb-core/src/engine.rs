@@ -2367,11 +2367,11 @@ impl ResultCache {
         let start = std::time::Instant::now();
         loop {
             let depth = writer.queue_depth() as u64;
-            // Wait until the queue is empty AND no writes are in flight. The
-            // worker increments `writes_in_flight` before calling I/O and
-            // decrements after; this catches the "queue empty, write still
-            // in progress" race that would otherwise report a half-written
-            // `.tmp` file as the durable state.
+            // Wait until the queue is empty AND no dequeued op is unfinished.
+            // The worker counts an op as in flight from the moment it leaves
+            // the queue, including the staleness check before I/O. Observing
+            // both counters at zero means the directory rename has finished,
+            // not merely that the op was popped.
             let in_flight = writer.writes_in_flight();
             if depth == 0 && in_flight == 0 {
                 return 0;

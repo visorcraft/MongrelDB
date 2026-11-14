@@ -506,8 +506,14 @@ fn production_loader_rejects_future_logical_generation() {
     );
 
     // The cache recovers: after the recompute is published, a fresh frame at
-    // the exact current generation exists and is loadable.
-    let _ = db2.flush_persistent_cache(2_000);
+    // the exact current generation exists and is loadable. Flush must report
+    // the writer idle; a zero depth observed before the rename finishes is
+    // what dropped the republished frame under a busy qualification runner.
+    assert_eq!(
+        db2.flush_persistent_cache(2_000),
+        0,
+        "recomputed frame was still queued when the directory was read"
+    );
     let new_path = first_bin_file(&rcache).expect("fresh frame republished");
     assert_eq!(read_frame_generation(&new_path), current_gen);
 }
