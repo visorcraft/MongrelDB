@@ -875,6 +875,10 @@ fn resolve_pidfile(args: &Args) -> String {
 
 /// Fork into the background (classic double-fork-style daemonization using
 /// `setsid`). The parent writes the child PID to `pidfile` and exits 0.
+///
+/// Windows has no `fork`; `--daemon` is rejected there so the server binary
+/// still builds for the full workspace test.
+#[cfg(unix)]
 fn daemonize(pidfile: &str) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
@@ -914,6 +918,15 @@ fn daemonize(pidfile: &str) -> Result<(), String> {
     std::mem::forget(devnull);
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn daemonize(_pidfile: &str) -> Result<(), String> {
+    Err(
+        "`--daemon` forks the process and is only supported on Unix. \
+         On Windows, run mongreldb-server in the foreground or as a service."
+            .to_string(),
+    )
 }
 
 fn main() {

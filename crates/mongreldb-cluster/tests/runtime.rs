@@ -974,13 +974,32 @@ impl ClusterFixture {
         )
         .await
         .unwrap();
+        // Parallel workspace tests churn meta elections. `add_member` is a
+        // proposal and must be retried on the leader (spec section 11.7);
+        // unwrapping `NotLeader { leader: None }` fails the split-crash
+        // suite before the scenario starts.
         for index in 1..self.dirs.len() {
-            meta.add_member(
-                &descriptor(self.identities[index].node_id, &self.addrs[index]),
-                &control,
-            )
-            .await
-            .unwrap();
+            let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+            loop {
+                ensure_meta_leader(&nodes, 0).await;
+                match nodes[0]
+                    .meta_group()
+                    .unwrap()
+                    .add_member(
+                        &descriptor(self.identities[index].node_id, &self.addrs[index]),
+                        &control,
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(MetaError::Consensus(ConsensusError::NotLeader { .. }))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("add_member failed: {error}"),
+                }
+            }
         }
         nodes
     }

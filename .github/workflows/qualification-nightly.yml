@@ -117,6 +117,28 @@ jobs:
         run: brew install protobuf
       - if: runner.os == 'Windows'
         run: choco install protoc --yes --no-progress
+      # macos-15 images leave only a few GiB free. `mongreldb-perf` builds
+      # bundled DuckDB, and `ar`/`ranlib` fail with "No space left on device"
+      # while writing libduckdb.a. Drop preinstalled SDKs the workspace tests
+      # do not use before that compile.
+      - name: Free disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -eux
+          df -h
+          sudo rm -rf \
+            "$HOME/Library/Android" \
+            "$HOME/Library/Developer/CoreSimulator" \
+            "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+            "$HOME/Library/Developer/Xcode/watchOS DeviceSupport" \
+            "$HOME/Library/Developer/Xcode/tvOS DeviceSupport" \
+            "$HOME/Library/Caches/Homebrew" \
+            /usr/local/lib/android \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /opt/homebrew/Caskroom || true
+          brew cleanup -s || true
+          df -h
       - if: runner.os == 'macOS'
         run: cargo test --workspace --all-features
       - if: runner.os == 'Windows'
