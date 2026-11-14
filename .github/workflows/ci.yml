@@ -59,6 +59,10 @@ jobs:
     defaults:
       run:
         working-directory: crates/mongreldb-server
+    env:
+      # Debug info on the server test harnesses is multiple gigabytes and
+      # fills the hosted runner even after the toolchain cleanup below.
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
@@ -69,7 +73,15 @@ jobs:
           workspaces: crates/mongreldb-server
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/.ghcup || true
+          sudo docker image prune -af || true
           df -h
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --all-targets --all-features

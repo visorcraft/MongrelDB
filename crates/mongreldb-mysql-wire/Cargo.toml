@@ -17,7 +17,7 @@ opensrv-mysql = { version = "0.7", features = ["tls"] }
 rustls-pemfile = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", features = ["ring"] }
 
 [dev-dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.66.0" }

@@ -15,6 +15,7 @@ use tempfile::tempdir;
 
 #[tokio::test]
 async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.create_user("wire-user", "wire-password").unwrap();
@@ -96,20 +97,26 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
     let wire_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let wire_address = wire_listener.local_addr().unwrap();
     let (wire_shutdown_tx, wire_shutdown_rx) = tokio::sync::oneshot::channel();
-    let wire_server = tokio::spawn(serve(
-        wire_listener,
-        MysqlWireConfig {
-            certificate_pem: certificate_pem.clone(),
-            private_key_pem,
-            database_name: "main".into(),
-            max_connections: 8,
-            handshake_timeout: Duration::from_secs(2),
-        },
-        native_client,
-        async move {
-            let _ = wire_shutdown_rx.await;
-        },
-    ));
+    let (wire_result_tx, mut wire_result_rx) = tokio::sync::mpsc::channel(1);
+    let wire_certificate_pem = certificate_pem.clone();
+    let wire_server = tokio::spawn(async move {
+        let result = serve(
+            wire_listener,
+            MysqlWireConfig {
+                certificate_pem: wire_certificate_pem,
+                private_key_pem,
+                database_name: "main".into(),
+                max_connections: 8,
+                handshake_timeout: Duration::from_secs(2),
+            },
+            native_client,
+            async move {
+                let _ = wire_shutdown_rx.await;
+            },
+        )
+        .await;
+        let _ = wire_result_tx.send(result).await;
+    });
 
     let options = OptsBuilder::default()
         .ip_or_hostname("localhost")
@@ -139,7 +146,13 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
             Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
         }
     }
-    let (pool, mut connection) = connected.expect("mysql wire listener did not accept TLS");
+    let (pool, mut connection) = match connected {
+        Some(connected) => connected,
+        None => {
+            let server = wire_result_rx.try_recv();
+            panic!("mysql wire listener did not accept TLS; server result: {server:?}");
+        }
+    };
     connection
         .query_drop("CREATE TABLE wire_items (id BIGINT PRIMARY KEY, name TEXT)")
         .await
@@ -207,7 +220,12 @@ async fn external_mysql_driver_uses_tls_auth_query_prepare_and_transactions() {
     plaintext.disconnect().await.unwrap();
 
     wire_shutdown_tx.send(()).unwrap();
-    wire_server.await.unwrap().unwrap();
+    wire_server.await.unwrap();
+    let server_result = wire_result_rx.recv().await;
+    assert!(
+        matches!(server_result, Some(Ok(()))),
+        "mysql wire server failed: {server_result:?}"
+    );
     native_shutdown_tx.send(()).unwrap();
     native_server.await.unwrap().unwrap();
 }

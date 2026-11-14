@@ -119,6 +119,12 @@ where
 }
 
 fn tls13_config(certificate_pem: &[u8], private_key_pem: &[u8]) -> io::Result<ServerConfig> {
+    // Clients in this process call `ClientConfig::builder()`, which uses the
+    // process-default provider. Install ring so that call works even when no
+    // other component has installed one yet. This listener's own config is
+    // built with ring explicitly and does not depend on that default.
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
     let certificates = rustls_pemfile::certs(&mut BufReader::new(certificate_pem))
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()?;
     if certificates.is_empty() {
@@ -129,7 +135,9 @@ fn tls13_config(certificate_pem: &[u8], private_key_pem: &[u8]) -> io::Result<Se
     }
     let private_key = rustls_pemfile::private_key(&mut BufReader::new(private_key_pem))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS private key is missing"))?;
-    ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
+    ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&version::TLS13])
+        .map_err(io::Error::other)?
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(io::Error::other)
