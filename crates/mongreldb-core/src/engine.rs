@@ -1255,6 +1255,11 @@ pub struct Table {
     /// `SharedCtx`) since `run_id` is only unique within one table's own
     /// manifest.
     verified_runs: Arc<parking_lot::Mutex<std::collections::HashSet<u128>>>,
+    /// Open sorted-run readers keyed by run id. Runs are immutable once
+    /// written, so a point lookup must not reopen and remap the `.sr` on
+    /// every row. Drop the entry before deleting that file (Windows will not
+    /// remove a mapped file).
+    run_readers: Arc<parking_lot::Mutex<HashMap<u128, RunReader>>>,
     /// Table-level result cache (Phase 19.1): `canonical_query_key(conditions,
     /// projection, epoch)` → the survivor columns as typed `NativeColumn`s. Shared
     /// by the native `Condition` API and (via `query_cached`) the tool-call path,
@@ -3382,6 +3387,7 @@ impl Table {
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             verified_runs: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            run_readers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             snapshots: ctx.snapshots,
             commit_lock: ctx.commit_lock,
             // Build the persistent-cache result cache. We attempt to spawn a
@@ -3726,6 +3732,7 @@ impl Table {
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             verified_runs: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            run_readers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             snapshots: ctx.snapshots,
             commit_lock: ctx.commit_lock,
             result_cache: {
@@ -7407,12 +7414,9 @@ impl Table {
                     self.lookup_metrics
                         .get_run_opened
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Ok(mut reader) = self.open_reader(locator.run_id) else {
-                        continue;
-                    };
-                    // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
-                    // legacy runs without the column fall back to epoch visibility.
-                    let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
+                    let Ok(Ok(Some((_, row)))) = self.with_run_reader(locator.run_id, |reader| {
+                        reader.get_version_at(row_id, snapshot)
+                    }) else {
                         continue;
                     };
                     consider(&mut best, row, snapshot);
@@ -7443,12 +7447,9 @@ impl Table {
                     self.lookup_metrics
                         .get_run_opened
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Ok(mut reader) = self.open_reader(rr.run_id) else {
-                        continue;
-                    };
-                    // P0.5-T3: run materialisation restores SYS_COMMIT_TS when present;
-                    // legacy runs without the column fall back to epoch visibility.
-                    let Ok(Some((_, row))) = reader.get_version_at(row_id, snapshot) else {
+                    let Ok(Ok(Some((_, row)))) = self.with_run_reader(rr.run_id, |reader| {
+                        reader.get_version_at(row_id, snapshot)
+                    }) else {
                         continue;
                     };
                     consider(&mut best, row, snapshot);
@@ -14482,7 +14483,14 @@ impl Table {
         }
     }
 
+    pub(crate) fn release_run_reader(&self, run_id: u128) {
+        self.run_readers.lock().remove(&run_id);
+    }
+
     pub(crate) fn remove_run_entry(&self, name: &Path) -> Result<()> {
+        if let Some(run_id) = Self::run_id_from_entry_name(name) {
+            self.release_run_reader(run_id);
+        }
         match self.runs_root.as_deref() {
             Some(root) => match root.remove_file(name) {
                 Ok(()) => Ok(()),
@@ -14606,6 +14614,39 @@ impl Table {
 
     pub(crate) fn kek_ref(&self) -> Option<&Arc<Kek>> {
         self.kek.as_ref()
+    }
+
+    /// Borrow the immutable reader for `run_id`, opening it once per table.
+    fn with_run_reader<T>(
+        &self,
+        run_id: u128,
+        body: impl FnOnce(&mut RunReader) -> T,
+    ) -> Result<T> {
+        let mut cache = self.run_readers.lock();
+        if !cache.contains_key(&run_id) {
+            drop(cache);
+            let reader = self.open_reader(run_id)?;
+            cache = self.run_readers.lock();
+            // Bound the map to the warm fixtures (16 and 64 runs). A long-lived
+            // table must not pin every run it has ever point-queried.
+            if cache.len() >= 64 && !cache.contains_key(&run_id) {
+                cache.clear();
+            }
+            cache.entry(run_id).or_insert(reader);
+        }
+        let reader = cache
+            .get_mut(&run_id)
+            .expect("sorted-run reader is cached for this lookup");
+        Ok(body(reader))
+    }
+
+    fn run_id_from_entry_name(name: &Path) -> Option<u128> {
+        let file_name = name.file_name()?.to_str()?;
+        file_name
+            .strip_prefix("r-")?
+            .strip_suffix(".sr")?
+            .parse()
+            .ok()
     }
 
     pub(crate) fn open_reader(&self, run_id: u128) -> Result<RunReader> {

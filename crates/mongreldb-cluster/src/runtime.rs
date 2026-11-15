@@ -997,7 +997,7 @@ impl NodeRuntime {
                 )?;
                 std::fs::remove_file(&legacy_path)?;
                 if let Some(parent) = legacy_path.parent() {
-                    std::fs::File::open(parent)?.sync_all()?;
+                    mongreldb_types::durability::sync_directory(parent)?;
                 }
             }
             engine.finish_legacy_tablet_migration()?;
@@ -1464,9 +1464,26 @@ impl NodeRuntime {
     /// reservation releases with the drop). Absent tablets are a no-op.
     async fn drop_hosted_tablet(&mut self, tablet_id: TabletId) -> Result<(), RuntimeError> {
         if let Some(tablet) = self.tablets.remove(&tablet_id) {
-            tablet.group.shutdown().await?;
+            Self::release_tablet_storage(tablet).await?;
         }
         Ok(())
+    }
+
+    /// Stop one tablet's raft task and drop its storage core.
+    ///
+    /// `sink.close` breaks `database -> commit log -> group -> state machine
+    /// -> sink`. Dropping the group alone does not: the cycle keeps the
+    /// database lease and run files open, and the following `remove_dir_all`
+    /// fails on Windows with a sharing violation.
+    async fn release_tablet_storage(tablet: TabletGroup) -> Result<(), RuntimeError> {
+        let shutdown = tablet.group.shutdown().await;
+        let close = tablet
+            .sink
+            .lock()
+            .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))
+            .and_then(|mut sink| sink.close().map_err(RuntimeError::from));
+        shutdown?;
+        close
     }
 
     /// Adopts the persisted `tablet.json` descriptor into the in-memory copy
@@ -2083,8 +2100,7 @@ impl NodeRuntime {
                 tablet_id,
                 tablet.descriptor.raft_group_id,
             );
-            tablet.group.shutdown().await?;
-            drop(tablet);
+            Self::release_tablet_storage(tablet).await?;
             layout.teardown()?;
             report.torn_down.push(tablet_id);
         }

@@ -2984,21 +2984,22 @@ impl RunReader {
         let mut best: Option<(u64, Option<HlcTimestamp>, usize, usize)> = None; // (epoch, commit_ts, page_seq, local index)
         for (seq, _page_row_start) in candidate_pages {
             let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
-            let row_ids =
-                match self.decode_page_native_cached(ty.clone(), SYS_ROW_ID, seq, page_rows)? {
-                    columnar::NativeColumn::Int64 { data, .. } => data,
-                    _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
-                };
+            let row_id_col =
+                self.decode_page_native_cached(ty.clone(), SYS_ROW_ID, seq, page_rows)?;
+            let row_ids = match row_id_col.as_ref() {
+                columnar::NativeColumn::Int64 { data, .. } => data,
+                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
+            };
             let local = match row_ids.binary_search(&target) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
             let epoch_ty = self.resolve_type(SYS_EPOCH);
-            let epochs =
-                match self.decode_page_native_cached(epoch_ty, SYS_EPOCH, seq, page_rows)? {
-                    columnar::NativeColumn::Int64 { data, .. } => data,
-                    _ => return Err(MongrelError::InvalidArgument("sys epoch not int64".into())),
-                };
+            let epoch_col = self.decode_page_native_cached(epoch_ty, SYS_EPOCH, seq, page_rows)?;
+            let epochs = match epoch_col.as_ref() {
+                columnar::NativeColumn::Int64 { data, .. } => data,
+                _ => return Err(MongrelError::InvalidArgument("sys epoch not int64".into())),
+            };
             // `local` is one match; the row-id's full version group is the
             // contiguous run of equal row-ids around it within this page.
             let mut lo = local;
@@ -3013,10 +3014,10 @@ impl RunReader {
             // decode is amortized across the whole group loop, and skipped
             // entirely for runs that don't carry the column.
             let commit_ts_native = if has_commit_ts_col {
-                let page = self.read_page(SYS_COMMIT_TS, seq)?;
-                Some(columnar::decode_page_native(
+                Some(self.decode_page_native_cached(
                     TypeId::Bytes,
-                    &page,
+                    SYS_COMMIT_TS,
+                    seq,
                     page_rows,
                 )?)
             } else {
@@ -3202,12 +3203,13 @@ impl RunReader {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
-        let deleted = match self.decode_page_native_cached(
+        let deleted_col = self.decode_page_native_cached(
             self.resolve_type(SYS_DELETED),
             SYS_DELETED,
             seq,
             page_rows,
-        )? {
+        )?;
+        let deleted = match deleted_col.as_ref() {
             columnar::NativeColumn::Bool { data, .. } => data[local_index] != 0,
             _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
         };
@@ -3228,12 +3230,13 @@ impl RunReader {
             return Ok(None);
         };
         let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
-        let deleted = match self.decode_page_native_cached(
+        let deleted_col = self.decode_page_native_cached(
             self.resolve_type(SYS_DELETED),
             SYS_DELETED,
             seq,
             page_rows,
-        )? {
+        )?;
+        let deleted = match deleted_col.as_ref() {
             columnar::NativeColumn::Bool { data, .. } => data[local_index] != 0,
             _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
         };
@@ -3632,19 +3635,17 @@ impl RunReader {
         column_id: u16,
         seq: usize,
         nrows: usize,
-    ) -> Result<columnar::NativeColumn> {
+    ) -> Result<std::sync::Arc<columnar::NativeColumn>> {
         let key = page_cache_key(self.table_id, self.header.run_id, column_id, seq);
         if let Some(cache) = &self.decoded_cache {
             if let Some(hit) = cache.lock(&key).try_get(&key) {
-                return Ok((*hit).clone());
+                return Ok(hit);
             }
         }
         let raw = self.read_page(column_id, seq)?;
-        let col = columnar::decode_page_native(ty, &raw, nrows)?;
+        let col = std::sync::Arc::new(columnar::decode_page_native(ty, &raw, nrows)?);
         if let Some(cache) = &self.decoded_cache {
-            cache
-                .lock(&key)
-                .insert(key, std::sync::Arc::new(col.clone()));
+            cache.lock(&key).insert(key, col.clone());
         }
         Ok(col)
     }

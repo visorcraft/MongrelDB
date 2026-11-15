@@ -74,6 +74,7 @@ impl Table {
             };
             if !live.contains(&id) {
                 let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.release_run_reader(id);
                 if std::fs::remove_file(&path).is_ok() {
                     report.runs_removed += 1;
                     report.bytes_freed += bytes;

@@ -632,23 +632,33 @@ impl EngineApplySink {
     /// shutdown. Detaching the Raft commit log first breaks the ownership
     /// cycle `database -> commit log -> group -> state machine -> sink`.
     pub fn close(&mut self) -> Result<(), EngineSinkError> {
-        if let Some(db) = self.db.as_ref() {
-            db.detach_cluster_commit_log()?;
-            db.close()?;
-        }
+        let result = if let Some(db) = self.db.as_ref() {
+            db.detach_cluster_commit_log()
+                .and_then(|()| db.close())
+                .map_err(EngineSinkError::from)
+        } else {
+            Ok(())
+        };
+        // Drop the core even when detach or flush fails. Otherwise
+        // `database -> commit log -> group -> state machine -> sink` keeps
+        // the files open, and Windows refuses the tablet teardown
+        // (`ERROR_SHARING_VIOLATION`).
         self.db.take();
-        Ok(())
+        result
     }
 
     /// Releases the live replica core without flushing, matching process-loss
     /// semantics while still breaking in-process ownership cycles used by
     /// deterministic crash tests.
     pub fn crash(&mut self) -> Result<(), EngineSinkError> {
-        if let Some(db) = self.db.as_ref() {
-            db.detach_cluster_commit_log()?;
-        }
+        let result = if let Some(db) = self.db.as_ref() {
+            db.detach_cluster_commit_log()
+                .map_err(EngineSinkError::from)
+        } else {
+            Ok(())
+        };
         self.db.take();
-        Ok(())
+        result
     }
 
     /// Initializes the hidden clustered table used by tablet split/merge and
@@ -1885,9 +1895,9 @@ fn write_atomic_file(
     file.write_all(bytes).map_err(MongrelError::Io)?;
     file.sync_all().map_err(MongrelError::Io)?;
     std::fs::rename(&temporary, path).map_err(MongrelError::Io)?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(MongrelError::Io)?;
+    // `File::open` on a directory returns ERROR_ACCESS_DENIED on Windows.
+    // The durability helper opens it with FILE_FLAG_BACKUP_SEMANTICS.
+    mongreldb_types::durability::sync_directory(parent).map_err(MongrelError::Io)?;
     Ok(())
 }
 
@@ -1899,9 +1909,7 @@ fn remove_durable_file(path: &Path) -> Result<(), EngineSinkError> {
     match std::fs::remove_file(path) {
         Ok(()) => {
             let parent = path.parent().expect("tablet pin has parent");
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(MongrelError::Io)?;
+            mongreldb_types::durability::sync_directory(parent).map_err(MongrelError::Io)?;
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
