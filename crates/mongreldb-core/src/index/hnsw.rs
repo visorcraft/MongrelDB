@@ -340,17 +340,16 @@ impl Hnsw {
         }
         let ef = ef.max(k);
         // Re-inserts append a node; older nodes for that row id keep their
-        // obsolete bits. Upper layers may still route through those nodes,
-        // but the layer-0 beam must spend `ef` on the latest vector only.
-        // Otherwise stale copies fill the window and a later exact match
-        // (distance 0) never gets admitted.
-        let current = self.current_nodes();
+        // obsolete bits and still route the upper layers. Layer 0 scores the
+        // latest vector of every visited row, so a stale distance-0 copy can
+        // neither fill `ef` nor hide that row's current bits.
+        let latest = self.latest_node_for_each_visit();
         let mut ep: Vec<(Dist, usize)> = vec![(hamming(query_bits, &self.vectors[entry]), entry)];
         for lc in (1..=self.max_level).rev() {
             ep = self.search_layer_with_context(query_bits, ep, 1, lc, context, None)?;
         }
         let mut results =
-            self.search_layer_with_context(query_bits, ep, ef, 0, context, Some(&current))?;
+            self.search_layer_with_context(query_bits, ep, ef, 0, context, Some(&latest))?;
         results.sort_by_key(|(distance, node)| (*distance, self.row_ids[*node]));
         Ok(results
             .into_iter()
@@ -359,17 +358,58 @@ impl Hnsw {
             .collect())
     }
 
-    /// Node indexes that hold the latest inserted vector for their row id.
-    fn current_nodes(&self) -> Vec<bool> {
-        let mut latest = std::collections::HashMap::with_capacity(self.row_ids.len());
+    /// Put `node`'s row into the beam.
+    ///
+    /// With `latest`, the score is the row's newest vector, and each row is
+    /// admitted once. Without it, the visited node is admitted as itself.
+    fn admit_search_hit(
+        &self,
+        results: &mut BinaryHeap<(Dist, RowId, usize)>,
+        admitted_rows: &mut HashSet<RowId>,
+        latest: Option<&[usize]>,
+        ef: usize,
+        query_bits: &[u8],
+        node: usize,
+        own_distance: Dist,
+    ) {
+        let (representative, distance) = if let Some(latest) = latest {
+            let representative = latest[node];
+            let distance = if representative == node {
+                own_distance
+            } else {
+                hamming(query_bits, &self.vectors[representative])
+            };
+            (representative, distance)
+        } else {
+            (node, own_distance)
+        };
+        let row_id = self.row_ids[representative];
+        if latest.is_some() && !admitted_rows.insert(row_id) {
+            return;
+        }
+        let worst_key = results
+            .peek()
+            .map(|(distance, row_id, _)| (*distance, *row_id))
+            .unwrap_or((Dist::MAX, RowId(u64::MAX)));
+        let key = (distance, row_id);
+        if key < worst_key || results.len() < ef {
+            results.push((distance, row_id, representative));
+            if results.len() > ef {
+                results.pop();
+            }
+        }
+    }
+
+    /// For each node, the node index that holds the latest vector of its row.
+    fn latest_node_for_each_visit(&self) -> Vec<usize> {
+        let mut latest_of_row = std::collections::HashMap::with_capacity(self.row_ids.len());
         for (index, row_id) in self.row_ids.iter().enumerate() {
-            latest.insert(*row_id, index);
+            latest_of_row.insert(*row_id, index);
         }
-        let mut current = vec![false; self.row_ids.len()];
-        for index in latest.into_values() {
-            current[index] = true;
-        }
-        current
+        self.row_ids
+            .iter()
+            .map(|row_id| latest_of_row[row_id])
+            .collect()
     }
 
     /// Greedy/beam best-first search on a single layer; returns up to `ef`
@@ -435,12 +475,12 @@ impl Hnsw {
         ef: usize,
         layer: i32,
         context: Option<&AiExecutionContext>,
-        // `Some` restricts the result beam to those nodes (layer 0). `None`
-        // admits every visited node, which upper layers need so a stale
-        // router can still be an entry point.
-        current: Option<&[bool]>,
+        // `Some` maps every visited node to the latest node of its row (layer
+        // 0). The beam stores that latest vector, once per row. `None` admits
+        // the visited node itself, which upper layers need for routing.
+        latest: Option<&[usize]>,
     ) -> Result<Vec<(Dist, usize)>> {
-        let admit = |node: usize| current.is_none_or(|current| current[node]);
+        let mut admitted_rows: HashSet<RowId> = HashSet::new();
         let mut visited: HashSet<usize> = entry_points.iter().map(|(_, n)| *n).collect();
         // Candidate min-heap (by distance) drives exploration. Every unvisited
         // neighbor is pushed so the beam keeps walking the graph even when
@@ -453,11 +493,18 @@ impl Hnsw {
             .collect();
         // Result max-heap (by distance, bounded to `ef`) collects the beam's
         // top hits. Ties break by `RowId` so the final sort is stable.
-        let mut results: BinaryHeap<(Dist, RowId, usize)> = entry_points
-            .iter()
-            .filter(|(_, node)| admit(*node))
-            .map(|(d, n)| (*d, self.row_ids[*n], *n))
-            .collect();
+        let mut results: BinaryHeap<(Dist, RowId, usize)> = BinaryHeap::new();
+        for (distance, node) in &entry_points {
+            self.admit_search_hit(
+                &mut results,
+                &mut admitted_rows,
+                latest,
+                ef,
+                query_bits,
+                *node,
+                *distance,
+            );
+        }
         while let Some(Reverse((cd, c))) = candidates.pop() {
             if let Some(context) = context {
                 context.checkpoint()?;
@@ -480,23 +527,19 @@ impl Hnsw {
                     // admission check below would otherwise stop the beam at
                     // row_ids larger than the worst in `W` and hide strictly
                     // closer nodes reachable through equal-distance hops.
-                    // Stale nodes are queued too: they are the bridges to the
-                    // latest vector, but they must not consume a beam slot.
+                    // Stale nodes stay on that walk: their edges reach the
+                    // latest vector, and layer 0 scores that vector instead
+                    // of letting the stale copy occupy a beam slot.
                     candidates.push(Reverse((d, e)));
-                    if !admit(e) {
-                        continue;
-                    }
-                    let worst_key = results
-                        .peek()
-                        .map(|(distance, row_id, _)| (*distance, *row_id))
-                        .unwrap_or((Dist::MAX, RowId(u64::MAX)));
-                    let key = (d, self.row_ids[e]);
-                    if key < worst_key || results.len() < ef {
-                        results.push((d, self.row_ids[e], e));
-                        if results.len() > ef {
-                            results.pop();
-                        }
-                    }
+                    self.admit_search_hit(
+                        &mut results,
+                        &mut admitted_rows,
+                        latest,
+                        ef,
+                        query_bits,
+                        e,
+                        d,
+                    );
                 }
             }
         }
