@@ -3,12 +3,16 @@
 //!
 //! Fault-hook scenarios share the process-global `mongreldb_fault` registry,
 //! so they run sequentially inside ONE test function of this binary (same
-//! discipline as `fault_hooks.rs`); hook-free scenarios get their own
-//! functions.
+//! discipline as `fault_hooks.rs`). Every test in this binary also takes
+//! `TEST_LOCK`: an armed `raft.log.fsync.*` hook fires on every group's log,
+//! so a hook-free scenario running at the same time consumes the failure
+//! budget or stalls behind it.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use mongreldb_consensus::group::{ConsensusGroup, GroupConfig};
 use mongreldb_consensus::network::InMemoryTransport;
@@ -154,6 +158,7 @@ fn deadline_control(ms: u64) -> ExecutionControl {
 /// running in the background).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn leader_disk_receipt_precedes_commit_then_commits_after_heal() {
+    let _permit = TEST_LOCK.lock().await;
     let mut cluster = TestCluster::new();
     for id in [1, 2, 3] {
         let dir = cluster.tmp.path().join(format!("node-{id}"));
@@ -222,6 +227,7 @@ async fn leader_disk_receipt_precedes_commit_then_commits_after_heal() {
 /// durability boundary as the openraft flush callbacks (S2C).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_disk_receipt_under_deferred_fsync_policy() {
+    let _permit = TEST_LOCK.lock().await;
     let mut cluster = TestCluster::new();
     let dir = cluster.tmp.path().join("node-1");
     let mut config = group_config(1, &dir, "test-cluster");
@@ -264,6 +270,7 @@ async fn leader_disk_receipt_under_deferred_fsync_policy() {
 /// Stage 2G gateway wave (no bridge exists today).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn not_leader_propose_carries_leader_hint() {
+    let _permit = TEST_LOCK.lock().await;
     let cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
     let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
     let follower = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
@@ -293,6 +300,7 @@ async fn not_leader_propose_carries_leader_hint() {
 /// registry is process-global.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fsync_hooks_gate_leader_disk_receipts() {
+    let _permit = TEST_LOCK.lock().await;
     // (a) The signal follows the fsync: when the receipt is delivered, the
     // `raft.log.fsync.after` boundary has already been crossed.
     {

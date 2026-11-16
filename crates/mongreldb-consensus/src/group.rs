@@ -501,7 +501,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                 .map_err(|_| ConsensusError::DeadlineExceeded)?,
             None => write.await,
         }
-        .map_err(map_client_write_error)?;
+        .map_err(|err| map_client_write_error(err, self.other_leader()))?;
 
         Ok(GroupCommitReceipt {
             position: log_position_of(&response.log_id),
@@ -526,7 +526,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                 .map_err(|_| ConsensusError::DeadlineExceeded)?,
             None => write.await,
         }
-        .map_err(map_client_write_error)?;
+        .map_err(|err| map_client_write_error(err, self.other_leader()))?;
         Ok(GroupCommitReceipt {
             position: log_position_of(&response.log_id),
             commit_ts: HlcTimestamp::ZERO,
@@ -598,7 +598,9 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                         command_id,
                         quorum_committed: true,
                     }),
-                    Ok(Err(write_error)) => Err(map_client_write_api_error(write_error)),
+                    Ok(Err(write_error)) => {
+                        Err(map_client_write_api_error(write_error, self.other_leader()))
+                    }
                     // The raft core stopped without answering.
                     Err(_) => Err(ConsensusError::Closed),
                 }
@@ -644,7 +646,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
             .raft
             .get_read_log_id(openraft::ReadPolicy::ReadIndex)
             .await
-            .map_err(map_check_is_leader_error)?;
+            .map_err(|err| map_check_is_leader_error(err, self.other_leader()))?;
         let read_log_id = *read_log_id.log_id();
         let applied_index = applied.as_ref().map_or(0, |log_id| log_id.index);
         if read_log_id.index > applied_index {
@@ -994,7 +996,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 Ok(None)
             }
-            Err(other) => Err(map_client_write_error(other)),
+            Err(other) => Err(map_client_write_error(other, self.other_leader())),
         }
     }
 
@@ -1110,6 +1112,19 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         .await
     }
 
+    /// Leader id to put on a routed `NotLeader` when openraft omitted one.
+    ///
+    /// Openraft 0.10 builds `ForwardToLeader` from effective membership. A
+    /// learner that already has a committed vote (metrics `current_leader`)
+    /// but has not applied that membership yet gets an empty forward, so the
+    /// gateway would have nowhere to retry. Metrics still name the leader.
+    /// A hint of this node is a lease expiry, not a route, and stays unset.
+    fn other_leader(&self) -> Option<RaftNodeId> {
+        self.metrics()
+            .current_leader
+            .filter(|id| *id != self.config.node_id)
+    }
+
     /// Observability metrics (spec section 14.4).
     pub fn metrics(&self) -> GroupMetrics {
         let metrics = self.raft.metrics().borrow_watched().clone();
@@ -1205,11 +1220,15 @@ fn map_fatal(err: Fatal<MongrelRaftConfig>) -> ConsensusError {
 
 /// Maps the raft core's client-write answer (the `ForwardToLeader` reply a
 /// non-leader sends through the responder, spec section 11.7).
-fn map_client_write_api_error(err: ClientWriteError<MongrelRaftConfig>) -> ConsensusError {
+/// `known_other_leader` fills a hint openraft left empty.
+fn map_client_write_api_error(
+    err: ClientWriteError<MongrelRaftConfig>,
+    known_other_leader: Option<RaftNodeId>,
+) -> ConsensusError {
     match err {
         ClientWriteError::ForwardToLeader(forward)
         | ClientWriteError::LogEntryDiscarded(forward) => ConsensusError::NotLeader {
-            leader: forward.leader_id,
+            leader: forward.leader_id.or(known_other_leader),
         },
         ClientWriteError::PreconditionFailed(error) => {
             ConsensusError::InvalidRequest(error.to_string())
@@ -1225,9 +1244,10 @@ fn map_client_write_api_error(err: ClientWriteError<MongrelRaftConfig>) -> Conse
 
 fn map_client_write_error(
     err: RaftError<MongrelRaftConfig, ClientWriteError<MongrelRaftConfig>>,
+    known_other_leader: Option<RaftNodeId>,
 ) -> ConsensusError {
     match err {
-        RaftError::APIError(api) => map_client_write_api_error(api),
+        RaftError::APIError(api) => map_client_write_api_error(api, known_other_leader),
         RaftError::Fatal(Fatal::Stopped) => ConsensusError::Closed,
         other => ConsensusError::Raft(other.to_string()),
     }
@@ -1235,11 +1255,12 @@ fn map_client_write_error(
 
 fn map_check_is_leader_error(
     err: RaftError<MongrelRaftConfig, LinearizableReadError<MongrelRaftConfig>>,
+    known_other_leader: Option<RaftNodeId>,
 ) -> ConsensusError {
     match err {
         RaftError::APIError(LinearizableReadError::ForwardToLeader(forward)) => {
             ConsensusError::NotLeader {
-                leader: forward.leader_id,
+                leader: forward.leader_id.or(known_other_leader),
             }
         }
         RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
