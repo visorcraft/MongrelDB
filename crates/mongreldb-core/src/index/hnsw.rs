@@ -14,6 +14,15 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
 type Dist = u32;
+
+/// Layer-0/upper-layer result beam. `latest` redirects a visited node to the
+/// newest vector of its row; without it, the visited node is admitted as itself.
+struct LayerBeam<'a> {
+    results: BinaryHeap<(Dist, RowId, usize)>,
+    admitted_rows: HashSet<RowId>,
+    latest: Option<&'a [usize]>,
+    ef: usize,
+}
 /// Hard bound for graph hierarchy depth. Besides matching practical HNSW
 /// implementations, this makes graph-memory admission finite and prevents a
 /// pathological RNG sample from requesting an enormous layer vector.
@@ -358,21 +367,18 @@ impl Hnsw {
             .collect())
     }
 
-    /// Put `node`'s row into the beam.
+    /// Put `node`'s row into `beam`.
     ///
-    /// With `latest`, the score is the row's newest vector, and each row is
-    /// admitted once. Without it, the visited node is admitted as itself.
+    /// With `beam.latest`, the score is the row's newest vector, and each row
+    /// is admitted once. Without it, the visited node is admitted as itself.
     fn admit_search_hit(
         &self,
-        results: &mut BinaryHeap<(Dist, RowId, usize)>,
-        admitted_rows: &mut HashSet<RowId>,
-        latest: Option<&[usize]>,
-        ef: usize,
+        beam: &mut LayerBeam<'_>,
         query_bits: &[u8],
         node: usize,
         own_distance: Dist,
     ) {
-        let (representative, distance) = if let Some(latest) = latest {
+        let (representative, distance) = if let Some(latest) = beam.latest {
             let representative = latest[node];
             let distance = if representative == node {
                 own_distance
@@ -384,18 +390,19 @@ impl Hnsw {
             (node, own_distance)
         };
         let row_id = self.row_ids[representative];
-        if latest.is_some() && !admitted_rows.insert(row_id) {
+        if beam.latest.is_some() && !beam.admitted_rows.insert(row_id) {
             return;
         }
-        let worst_key = results
+        let worst_key = beam
+            .results
             .peek()
             .map(|(distance, row_id, _)| (*distance, *row_id))
             .unwrap_or((Dist::MAX, RowId(u64::MAX)));
         let key = (distance, row_id);
-        if key < worst_key || results.len() < ef {
-            results.push((distance, row_id, representative));
-            if results.len() > ef {
-                results.pop();
+        if key < worst_key || beam.results.len() < beam.ef {
+            beam.results.push((distance, row_id, representative));
+            if beam.results.len() > beam.ef {
+                beam.results.pop();
             }
         }
     }
@@ -480,7 +487,6 @@ impl Hnsw {
         // the visited node itself, which upper layers need for routing.
         latest: Option<&[usize]>,
     ) -> Result<Vec<(Dist, usize)>> {
-        let mut admitted_rows: HashSet<RowId> = HashSet::new();
         let mut visited: HashSet<usize> = entry_points.iter().map(|(_, n)| *n).collect();
         // Candidate min-heap (by distance) drives exploration. Every unvisited
         // neighbor is pushed so the beam keeps walking the graph even when
@@ -493,24 +499,21 @@ impl Hnsw {
             .collect();
         // Result max-heap (by distance, bounded to `ef`) collects the beam's
         // top hits. Ties break by `RowId` so the final sort is stable.
-        let mut results: BinaryHeap<(Dist, RowId, usize)> = BinaryHeap::new();
+        let mut beam = LayerBeam {
+            results: BinaryHeap::new(),
+            admitted_rows: HashSet::new(),
+            latest,
+            ef,
+        };
         for (distance, node) in &entry_points {
-            self.admit_search_hit(
-                &mut results,
-                &mut admitted_rows,
-                latest,
-                ef,
-                query_bits,
-                *node,
-                *distance,
-            );
+            self.admit_search_hit(&mut beam, query_bits, *node, *distance);
         }
         while let Some(Reverse((cd, c))) = candidates.pop() {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            let worst = results.peek().map(|(d, _, _)| *d).unwrap_or(Dist::MAX);
-            if cd > worst && results.len() >= ef {
+            let worst = beam.results.peek().map(|(d, _, _)| *d).unwrap_or(Dist::MAX);
+            if cd > worst && beam.results.len() >= ef {
                 break;
             }
             for &e in &self.graph[c][layer as usize] {
@@ -531,19 +534,12 @@ impl Hnsw {
                     // latest vector, and layer 0 scores that vector instead
                     // of letting the stale copy occupy a beam slot.
                     candidates.push(Reverse((d, e)));
-                    self.admit_search_hit(
-                        &mut results,
-                        &mut admitted_rows,
-                        latest,
-                        ef,
-                        query_bits,
-                        e,
-                        d,
-                    );
+                    self.admit_search_hit(&mut beam, query_bits, e, d);
                 }
             }
         }
-        Ok(results
+        Ok(beam
+            .results
             .into_vec()
             .into_iter()
             .map(|(distance, _, node)| (distance, node))
