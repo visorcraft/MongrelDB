@@ -574,15 +574,28 @@ async fn transfer_leader_to_voter() {
         .unwrap();
     assert_eq!(cluster.wait_consensus_leader(&[1, 2, 3]).await, target);
 
-    cluster
-        .group(target)
-        .propose(
-            CommandKind::Transaction,
-            envelope(1),
-            &ExecutionControl::default(),
-        )
-        .await
-        .unwrap();
+    // openraft 0.10 publishes `current_leader` before the new leader's write
+    // lease is valid. The first proposal then comes back as
+    // `NotLeader { leader: None }` (an empty ForwardToLeader / LeaseExpired).
+    // The handoff is done once the target accepts a write, not on the first try.
+    let deadline = Instant::now() + LEADER_TIMEOUT;
+    loop {
+        match cluster
+            .group(target)
+            .propose(
+                CommandKind::Transaction,
+                envelope(1),
+                &ExecutionControl::default(),
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(ConsensusError::NotLeader { .. }) if Instant::now() < deadline => {
+                tokio::time::sleep(FAST).await;
+            }
+            Err(error) => panic!("post-transfer propose failed: {error}"),
+        }
+    }
 
     // Transferring from a non-leader is rejected with the leader hint.
     let err = cluster
