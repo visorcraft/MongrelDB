@@ -4360,10 +4360,11 @@ dependencies = [
 [[package]]
 name = "opensrv-mysql"
 version = "0.7.0"
-source = "git+https://github.com/datafuselabs/opensrv.git?rev=3142eb545fab811bc9289091781ce6d771cf0bf7#3142eb545fab811bc9289091781ce6d771cf0bf7"
+source = "git+https://github.com/datafuselabs/opensrv.git?rev=6bbc3b65e6b19212c4f7fc4f40c20daf6f452deb#6bbc3b65e6b19212c4f7fc4f40c20daf6f452deb"
 dependencies = [
  "async-trait",
  "byteorder",
+ "bytes",
  "chrono",
  "mysql_common 0.32.4",
  "nom",
