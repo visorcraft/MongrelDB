@@ -124,7 +124,10 @@ if found:
         run "$scale_bin" loopback_point_query_p95_baseline --nocapture
     fi
     # Secondary: the P0 write-path bench (create + put hot path).
-    run env RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" CARGO_TARGET_DIR="$INSTR_TARGET" \
+    # Criterion plus the engine runtime can exhaust the runner's thread limit
+    # (pthread_create returns EAGAIN) while this instrumented bench is warming up.
+    run env RAYON_NUM_THREADS=1 TOKIO_WORKER_THREADS=2 \
+        RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" CARGO_TARGET_DIR="$INSTR_TARGET" \
         cargo bench -p mongreldb-core --bench write_path -- --sample-size 100 --measurement-time 3
     # Tertiary: the core qualification suite (embedded point query + scan).
     run env RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" CARGO_TARGET_DIR="$INSTR_TARGET" \

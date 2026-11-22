@@ -5,10 +5,16 @@
  * libmongreldb_ffi. Exercises the full create → schema → put → query →
  * transaction → auth lifecycle through pure C.
  */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+#define _POSIX_C_SOURCE 200809L
+
 #include "mongreldb.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <assert.h>
 
 #define CHECK(call) do { \
