@@ -102,6 +102,14 @@ fn build_with_runs_sized(
 }
 
 fn measure_point_query_latency(db: &Database, row_ids: &[RowId]) -> (u128, u128, u128) {
+    measure_point_query_latency_with_queries(db, row_ids, QUERIES)
+}
+
+fn measure_point_query_latency_with_queries(
+    db: &Database,
+    row_ids: &[RowId],
+    queries: usize,
+) -> (u128, u128, u128) {
     // Warm pass — touches every row once so the measured phase reads a warm
     // page cache / hot index, isolating run-count cost from cold-start.
     {
@@ -113,8 +121,8 @@ fn measure_point_query_latency(db: &Database, row_ids: &[RowId]) -> (u128, u128,
     }
 
     let mut lcg: u64 = 0x2545F4914F6CDD1D;
-    let mut samples_ns: Vec<u128> = Vec::with_capacity(QUERIES);
-    for _ in 0..QUERIES {
+    let mut samples_ns: Vec<u128> = Vec::with_capacity(queries);
+    for _ in 0..queries {
         lcg = lcg
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -173,34 +181,56 @@ fn point_lookup_scaling_with_immutable_run_count() {
 /// `thresholds.point_lookup_p95_ratio`, spec §13.9). Emits one record whose
 /// `samples` carry `point_query_latency.p95_us` for both `target_runs == 1`
 /// and `target_runs == 256` so the gate can compute p95(256) / p95(1)
-/// without cross-record joins. Heavy fixture (~1.28M rows at 256 runs), so
-/// it is marked `#[ignore]` and run by the closure pipeline in release mode
-/// via `-- --include-ignored`.
+/// without cross-record joins. Both fixtures contain 5,120 rows (20 per run at
+/// 256 runs) and are measured five times in interleaved order with 10,000
+/// queries per repetition, isolating run count from population size and timing
+/// drift. The heavy fixture is marked `#[ignore]` and run in release mode via
+/// `-- --include-ignored`.
 #[test]
 #[ignore = "expensive: 256 flushed runs; run with -- --ignored --nocapture"]
 fn point_lookup_scaling_256_to_1() {
-    let mut samples = Vec::new();
-    let mut dirs: Vec<tempfile::TempDir> = Vec::new();
+    const REPETITIONS: usize = 5;
+    const SCALING_QUERIES: usize = 10_000;
+    const TOTAL_ROWS: usize = 20 * 256;
+
+    let mut fixtures = Vec::new();
     for &runs in &[1usize, 256] {
-        let (dir, row_ids, actual_runs) = build_with_runs_sized(runs, ROWS_PER_RUN_FINE);
-        // Reopen via the same path to ensure runs are on-disk before measuring.
-        // Keep the dir alive until after the measurements.
-        let db_path = dir.path().to_path_buf();
-        let db = Database::open(&db_path).unwrap();
-        let (p50_ns, p95_ns, p99_ns) = measure_point_query_latency(&db, &row_ids);
+        let (dir, row_ids, actual_runs) = build_with_runs_sized(runs, TOTAL_ROWS / runs);
+        let db = Database::open(dir.path()).unwrap();
+        fixtures.push((dir, db, row_ids, actual_runs));
+    }
+
+    let mut measurements = [Vec::new(), Vec::new()];
+    for _ in 0..REPETITIONS {
+        for (index, (_dir, db, row_ids, _actual_runs)) in fixtures.iter().enumerate() {
+            measurements[index].push(measure_point_query_latency_with_queries(
+                db,
+                row_ids,
+                SCALING_QUERIES,
+            ));
+        }
+    }
+
+    let mut samples = Vec::new();
+    for (index, &runs) in [1usize, 256].iter().enumerate() {
+        let (_dir, _db, row_ids, actual_runs) = &fixtures[index];
+        let mut p50 = measurements[index].iter().map(|m| m.0).collect::<Vec<_>>();
+        let mut p95 = measurements[index].iter().map(|m| m.1).collect::<Vec<_>>();
+        let mut p99 = measurements[index].iter().map(|m| m.2).collect::<Vec<_>>();
         samples.push(serde_json::json!({
             "target_runs": runs,
             "actual_runs": actual_runs,
             "rows": row_ids.len(),
-            "queries": QUERIES,
+            "queries": SCALING_QUERIES,
+            "repetitions": REPETITIONS,
             "point_query_latency": {
-                "p50_us": p50_ns as f64 / 1e3,
-                "p95_us": p95_ns as f64 / 1e3,
-                "p99_us": p99_ns as f64 / 1e3,
+                "p50_us": percentile(&mut p50, 0.50) as f64 / 1e3,
+                "p95_us": percentile(&mut p95, 0.50) as f64 / 1e3,
+                "p99_us": percentile(&mut p99, 0.50) as f64 / 1e3,
             },
         }));
-        dirs.push(dir);
     }
+    assert_eq!(samples[0]["rows"], samples[1]["rows"]);
     println!(
         "{}",
         serde_json::json!({

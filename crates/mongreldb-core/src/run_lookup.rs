@@ -19,7 +19,7 @@
 //! The single-file API is retained for tests and small tables; the
 //! production open path uses [`RunLookupDirectory::read_checkpoint_sharded`].
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -98,9 +98,9 @@ impl RunLocatorList {
 /// path. Distinct from `CompleteMiss` because the directory gave no
 /// definitive answer and the row *could* still exist in an immutable run.
 #[derive(Debug, Clone)]
-pub(crate) enum DirectoryLookupDecision {
+pub(crate) enum DirectoryLookupDecision<'a> {
     CompleteMiss,
-    Candidates(Vec<RunLocator>),
+    Candidates(&'a RunLocatorList),
     UnavailableOrStale,
 }
 
@@ -114,12 +114,12 @@ pub(crate) struct VersionStamp {
     pub hlc: Option<HlcTimestamp>,
 }
 
-/// Per-`RowId` posting list. Backed by a `BTreeMap` for the in-memory
+/// Per-`RowId` posting list. Backed by a `HashMap` for the in-memory
 /// representation; the on-disk checkpoint uses delta-encoded `RowId` keys.
 #[derive(Debug, Default, Clone)]
 pub struct RunLookupDirectory {
     /// `(RowId -> newest-first RunLocator list)`.
-    postings: BTreeMap<RowId, RunLocatorList>,
+    postings: HashMap<RowId, RunLocatorList>,
     /// Fingerprint of the active run-set + schema/index generation that
     /// produced this directory. `None` for an in-memory rebuild not yet
     /// checkpointed.
@@ -145,11 +145,11 @@ impl RunLookupDirectory {
     /// Distinguishes a complete directory miss (no postings → open zero
     /// immutable readers) from the absence of any usable directory
     /// (`UnavailableOrStale` → range-scan fallback).
-    pub(crate) fn decide(&self, row_id: RowId) -> DirectoryLookupDecision {
+    pub(crate) fn decide(&self, row_id: RowId) -> DirectoryLookupDecision<'_> {
         match self.postings.get(&row_id) {
             None => DirectoryLookupDecision::CompleteMiss,
             Some(list) if list.is_empty() => DirectoryLookupDecision::CompleteMiss,
-            Some(list) => DirectoryLookupDecision::Candidates(list.locators.clone()),
+            Some(list) => DirectoryLookupDecision::Candidates(list),
         }
     }
 
@@ -205,6 +205,12 @@ impl RunLookupDirectory {
         self.postings.len()
     }
 
+    fn sorted_postings(&self) -> Vec<(&RowId, &RunLocatorList)> {
+        let mut postings: Vec<_> = self.postings.iter().collect();
+        postings.sort_unstable_by_key(|(row_id, _)| **row_id);
+        postings
+    }
+
     /// Maximum number of locators for any single `RowId`.
     pub fn max_locators_per_row(&self) -> usize {
         self.postings
@@ -240,7 +246,7 @@ impl RunLookupDirectory {
         let key_count = self.postings.len() as u32;
         body.extend_from_slice(&key_count.to_le_bytes());
         let mut prev: u64 = 0;
-        for (row_id, list) in &self.postings {
+        for (row_id, list) in self.sorted_postings() {
             let cur = row_id.0;
             let delta = cur.checked_sub(prev).ok_or_else(|| {
                 io::Error::new(
@@ -353,7 +359,7 @@ impl RunLookupDirectory {
         }
         let key_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
         let mut cursor = &body[16..];
-        let mut postings: BTreeMap<RowId, RunLocatorList> = BTreeMap::new();
+        let mut postings: HashMap<RowId, RunLocatorList> = HashMap::new();
         let mut prev: u64 = 0;
         for _ in 0..key_count {
             let (delta, consumed) = decode_varint(cursor)?;
@@ -475,7 +481,7 @@ impl RunLookupDirectory {
         // Best-effort: clear any prior shards before publishing new ones.
         clear_shards(base_dir)?;
         let max = max_shard_bytes.max(1024 * 1024); // sanity floor
-        let mut iter = self.postings.iter().peekable();
+        let mut iter = self.sorted_postings().into_iter().peekable();
         let mut shard_no: usize = 0;
         while let Some((first_row_id, _)) = iter.peek() {
             shard_no += 1;
@@ -550,7 +556,7 @@ impl RunLookupDirectory {
                 "no run-lookup directory shards present",
             ));
         }
-        let mut merged: BTreeMap<RowId, RunLocatorList> = BTreeMap::new();
+        let mut merged: HashMap<RowId, RunLocatorList> = HashMap::new();
         for path in paths {
             let shard = read_single_shard(&path, fingerprint)?;
             for (rid, list) in shard {
@@ -654,7 +660,7 @@ fn write_single_shard(
     Ok(())
 }
 
-fn read_single_shard(path: &Path, fingerprint: u64) -> io::Result<BTreeMap<RowId, RunLocatorList>> {
+fn read_single_shard(path: &Path, fingerprint: u64) -> io::Result<HashMap<RowId, RunLocatorList>> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     // Shards are bounded by `max_shard_bytes`. A pathologically large shard
@@ -698,7 +704,7 @@ fn read_single_shard(path: &Path, fingerprint: u64) -> io::Result<BTreeMap<RowId
     }
     let key_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
     let mut cursor = &body[16..];
-    let mut postings: BTreeMap<RowId, RunLocatorList> = BTreeMap::new();
+    let mut postings: HashMap<RowId, RunLocatorList> = HashMap::new();
     let mut prev: u64 = 0;
     for _ in 0..key_count {
         let (delta, consumed) = decode_varint(cursor)?;
@@ -1109,7 +1115,7 @@ pub fn rebuild_from_runs_system_only(runs: &[RunRef], table: &Table) -> Result<R
             Option<HlcTimestamp>,
             bool,
         );
-        let mut per_row: BTreeMap<RowId, RunRowAgg> = BTreeMap::new();
+        let mut per_row: HashMap<RowId, RunRowAgg> = HashMap::new();
         reader.for_each_system(|row_id, committed_epoch, commit_ts, deleted| {
             let entry = per_row.entry(row_id).or_insert((
                 committed_epoch,

@@ -82,6 +82,10 @@
         {
           "jq": "[.[] | select(.test==\"point_lookup_scaling_with_immutable_run_count\")][0].samples | length >= 3",
           "label": "scaling samples >= 3"
+        },
+        {
+          "jq": "[.[] | select(.test==\"point_lookup_scaling_256_to_1\")] | length == 1 and (.[0] | (.samples | length == 2) and (.samples[0].rows == .samples[1].rows) and all(.samples[]; .repetitions >= 5))",
+          "label": "256-to-1 samples use equal populations and at least five repetitions"
         }
       ]
     },

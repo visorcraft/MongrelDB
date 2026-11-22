@@ -13,12 +13,16 @@
 # computed and checked against hard tripwires; failure exits nonzero.
 #
 # Usage: scripts/run-p0-p2-measurements.sh OUT_DIR [REPS]
+# P0P2_SOURCE_ROOT runs the current harness against another clean source tree;
+# P0P2_MEASURE_ONLY=1 skips candidate threshold evaluation for baseline harvests.
 set -euo pipefail
 
 OUT_DIR="${1:?usage: scripts/run-p0-p2-measurements.sh OUT_DIR [REPS]}"
 REPS="${2:-${P0P2_REPS:-5}}"
 mkdir -p "$OUT_DIR"
-cd "$(dirname "$0")/.."
+SOURCE_ROOT="${P0P2_SOURCE_ROOT:-$(dirname "$0")/..}"
+SOURCE_ROOT="$(cd "$SOURCE_ROOT" && pwd)"
+cd "$SOURCE_ROOT"
 
 TOOLCHAIN="1.97.1"
 SHA="$(git rev-parse HEAD)"
@@ -72,6 +76,11 @@ for rep in $(seq 1 "$REPS"); do
         -p mongreldb-server --test scale_test --features cluster,oidc,vault-kms \
         loopback_point_query_p95_baseline
 done
+
+if [[ "${P0P2_MEASURE_ONLY:-0}" == "1" ]]; then
+    echo "== wrote baseline measurements under $OUT_DIR"
+    exit 0
+fi
 
 # Machine-enforced multi-rep medians (B468-10). Thresholds are tripwires with
 # headroom above measured healthy values in BENCHMARKS.md (µs unless noted).

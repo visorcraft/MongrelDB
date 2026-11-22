@@ -646,10 +646,48 @@ check_required_artifacts() {
   return "$gate_fail"
 }
 
+# Harvest the configured baseline on this runner before measuring the candidate.
+# The current harness runs against a clean detached source tree so older commits
+# do not need the multi-repetition evaluator added later.
+harvest_p0p2_baseline() {
+  local destination="$1"
+  local ratio_config="$REPO_ROOT/docs/ai/p0p2-baseline-ratios.json"
+  local baseline_sha worktree
+  baseline_sha="$(jq -er '
+      [.surfaces[].baseline_sha] | unique
+      | if length == 1 then .[0] else error("baseline SHAs differ") end
+    ' "$ratio_config")" || return 1
+  git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || {
+    echo "FAIL: P0/P2 baseline commit missing: $baseline_sha" >&2
+    return 1
+  }
+
+  worktree="${RUNNER_TEMP:-/tmp}/mongreldb-p0p2-baseline-$$"
+  git worktree add --detach "$worktree" "$baseline_sha" || return 1
+  mkdir -p "$destination"
+  if ! P0P2_SOURCE_ROOT="$worktree" P0P2_MEASURE_ONLY=1 \
+      bash "$REPO_ROOT/scripts/run-p0-p2-measurements.sh" "$destination"; then
+    git worktree remove --force "$worktree"
+    return 1
+  fi
+  git worktree remove --force "$worktree" || return 1
+
+  local file
+  for file in p0-results.jsonl p2-standalone-results.jsonl p2-full-feature-results.jsonl; do
+    if [[ ! -s "$destination/$file" ]] || ! jq -se --arg sha "$baseline_sha" \
+        'length > 0 and all(.[];
+          .environment.sha == $sha and .environment.tree == "clean")' \
+        "$destination/$file" >/dev/null; then
+      echo "FAIL: invalid exact-SHA P0/P2 baseline evidence: $file" >&2
+      return 1
+    fi
+  done
+}
+
 # --------------------------------------------------------------------------
 # Self-test battery (§13.13). Runs fail-closed assertions against fixture
-# files under scripts/fixtures/residual-closure/. NEVER touches the real
-# worktree beyond reading the contract and fixtures.
+# files under scripts/fixtures/residual-closure/ and validates the configured
+# baseline against git history without running the real workload.
 # --------------------------------------------------------------------------
 run_self_tests() {
   echo "[*] Running orchestrator self-tests"
@@ -1253,6 +1291,33 @@ EOF
   fi
 
 
+  # FF-10/12: the configured same-runner baseline must contain every benchmark
+  # surface; a documentation-only SHA cannot produce the required evidence.
+  set +e
+  baseline_sha="$(jq -er '
+      [.surfaces[].baseline_sha] | unique
+      | if length == 1 then .[0] else error("baseline SHAs differ") end
+    ' "$REPO_ROOT/docs/ai/p0p2-baseline-ratios.json")"
+  baseline_ok=$?
+  if [[ "$baseline_ok" -eq 0 ]]; then
+    git -C "$REPO_ROOT" cat-file -e "$baseline_sha^{commit}" 2>/dev/null \
+      && git -C "$REPO_ROOT" cat-file -e \
+        "$baseline_sha:crates/mongreldb-core/tests/p0_p2_bench.rs" 2>/dev/null \
+      && git -C "$REPO_ROOT" cat-file -e \
+        "$baseline_sha:crates/mongreldb-core/tests/qualification.rs" 2>/dev/null \
+      && git -C "$REPO_ROOT" cat-file -e \
+        "$baseline_sha:crates/mongreldb-server/tests/scale_test.rs" 2>/dev/null
+    baseline_ok=$?
+  fi
+  set -e
+  if [[ "$baseline_ok" -eq 0 ]]; then
+    echo "  [ OK ] p0p2_baseline_sha_contains_benchmark_surfaces"
+    passed=$((passed + 1))
+  else
+    failures+=("p0p2_baseline_sha_contains_benchmark_surfaces")
+  fi
+
+
   # R170-06/07: hard-coded approximate success without checkpoints must fail
   # semantic threshold evaluation (measured fields required).
   printf '%s\n' \
@@ -1666,6 +1731,8 @@ if [[ ! -s "$OUT/p0-results.jsonl" \
     echo "RESIDUAL_CLOSURE_SKIP_P0P2=1 but P0/P2 JSONL missing — fail closed" >&2
     exit 1
   fi
+  harvest_p0p2_baseline "$OUT/baseline" \
+    || { echo "P0/P2 baseline harvest failed — fail closed" >&2; exit 1; }
   bash "$REPO_ROOT/scripts/run-p0-p2-measurements.sh" "$OUT" \
     || { echo "P0/P2 harvest failed — fail closed" >&2; exit 1; }
 fi

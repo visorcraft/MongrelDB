@@ -1323,6 +1323,7 @@ pub struct Table {
     /// data only — open must not fail when the checkpoint is missing or stale
     /// (the existing range-scan fallback stays the safety net).
     run_lookup: RunLookupState,
+    active_run_fingerprint: u64,
 }
 
 /// Per-table row-to-run lookup directory state (Issue 4 / spec §8.4).
@@ -3433,6 +3434,7 @@ impl Table {
             read_generation_pin: None,
             lookup_metrics: LookupMetrics::default(),
             run_lookup: RunLookupState::default(),
+            active_run_fingerprint: 0,
         })
     }
 
@@ -3769,6 +3771,7 @@ impl Table {
             read_generation_pin: None,
             lookup_metrics: LookupMetrics::default(),
             run_lookup: RunLookupState::default(),
+            active_run_fingerprint: 0,
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -3906,6 +3909,17 @@ impl Table {
         Ok(db)
     }
 
+    fn refresh_active_run_fingerprint(&mut self) {
+        let active_ids: Vec<u128> = self.run_refs.iter().map(|r| r.run_id).collect();
+        self.active_run_fingerprint = crate::run_lookup::compute_fingerprint(
+            &active_ids,
+            self.schema.schema_id,
+            self.global_idx_epoch,
+            active_ids.len() as u64,
+            crate::run_lookup::DIRECTORY_FORMAT_VERSION,
+        );
+    }
+
     /// Best-effort load of the run-lookup directory on open. Tries the
     /// sharded checkpoint first; if it's missing, corrupt, or stale, the
     /// in-memory state is left in `complete = false` and the existing
@@ -3922,6 +3936,7 @@ impl Table {
             run_generation,
             crate::run_lookup::DIRECTORY_FORMAT_VERSION,
         );
+        self.active_run_fingerprint = fingerprint;
         // Build a candidate from the sharded checkpoint in `_runs/`.
         let runs_dir = match self.runs_root.as_deref() {
             Some(root) => match root.io_path() {
@@ -4061,6 +4076,7 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.refresh_active_run_fingerprint();
         self.run_row_id_ranges
             .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         Ok(run_id as u128)
@@ -5911,6 +5927,7 @@ impl Table {
         self.had_deletes = true;
         self.agg_cache = Arc::new(HashMap::new());
         self.global_idx_epoch = 0;
+        self.refresh_active_run_fingerprint();
         self.indexes_complete = true;
         self.pending_delete_rids.clear();
         self.pending_put_cols.clear();
@@ -6734,6 +6751,7 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.refresh_active_run_fingerprint();
         self.run_row_id_ranges
             .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         Ok(())
@@ -6944,6 +6962,7 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.refresh_active_run_fingerprint();
         self.run_row_id_ranges
             .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         self.live_count = self.live_count.saturating_add(write_n as u64);
@@ -7044,6 +7063,7 @@ impl Table {
             run_generation,
             crate::run_lookup::DIRECTORY_FORMAT_VERSION,
         );
+        self.active_run_fingerprint = fingerprint;
         let dir = match crate::run_lookup::RunLookupDirectory::rebuild_from_runs(&active_runs, self)
         {
             Ok(d) => d,
@@ -7210,6 +7230,7 @@ impl Table {
         };
         if written.is_ok() {
             self.global_idx_epoch = epoch.0;
+            self.refresh_active_run_fingerprint();
             let _ = self.persist_manifest(epoch);
             // FND-006: the index generation is published.
             let _ = crate::catalog::inject_hook("index.publish.after");
@@ -7220,6 +7241,7 @@ impl Table {
     /// (used when the live indexes are known stale, e.g. compaction to empty).
     pub(crate) fn invalidate_index_checkpoint(&mut self) {
         self.global_idx_epoch = 0;
+        self.refresh_active_run_fingerprint();
         if let Some(root) = self.idx_root.as_deref() {
             let _ = root.remove_file(global_idx::IDX_FILENAME);
         } else {
@@ -7235,6 +7257,7 @@ impl Table {
     pub(crate) fn prepare_indexes_for_run_replacement(&mut self) {
         self.indexes_complete = false;
         self.global_idx_epoch = 0;
+        self.refresh_active_run_fingerprint();
         if let Some(root) = self.idx_root.as_deref() {
             let _ = root.remove_file(global_idx::IDX_FILENAME);
         } else {
@@ -7320,19 +7343,9 @@ impl Table {
         // is marked complete AND the active run set is non-empty; otherwise
         // we fall back to the per-run range filter below.
         let decision = if self.run_lookup.complete {
-            // Defensive: verify the in-memory directory's fingerprint is
-            // still consistent with the active run set. A divergence means
-            // the directory is stale and we should fall back rather than
-            // miss versions.
-            let active_ids: Vec<u128> = self.run_refs.iter().map(|r| r.run_id).collect();
-            let expected_fp = crate::run_lookup::compute_fingerprint(
-                &active_ids,
-                self.schema.schema_id,
-                self.global_idx_epoch,
-                active_ids.len() as u64,
-                crate::run_lookup::DIRECTORY_FORMAT_VERSION,
-            );
-            if self.run_lookup.fingerprint == expected_fp {
+            // Defensive: verify the in-memory directory's fingerprint against
+            // the active fingerprint refreshed whenever the topology changes.
+            if self.run_lookup.fingerprint == self.active_run_fingerprint {
                 match self.run_lookup.directory.as_ref() {
                     Some(dir) => dir.decide(row_id),
                     None => crate::run_lookup::DirectoryLookupDecision::UnavailableOrStale,
@@ -7362,24 +7375,27 @@ impl Table {
                     .directory_complete_miss_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            crate::run_lookup::DirectoryLookupDecision::Candidates(mut locators) => {
+            crate::run_lookup::DirectoryLookupDecision::Candidates(list) => {
                 // Snapshot-aware candidate ordering (REM-B §6.13): an
                 // HLC-authoritative snapshot considers fully stamped
                 // locators by newest possible visible HLC first; an
                 // epoch-only snapshot stays epoch-first. Ordering is a
                 // performance hint only — early-stop correctness never
                 // depends on it.
-                locators.sort_by(|a, b| {
-                    if snapshot.uses_hlc_authority() {
-                        b.max_hlc
-                            .cmp(&a.max_hlc)
-                            .then_with(|| b.max_epoch.cmp(&a.max_epoch))
-                    } else {
-                        b.max_epoch
-                            .cmp(&a.max_epoch)
-                            .then_with(|| b.max_hlc.cmp(&a.max_hlc))
-                    }
-                });
+                let mut locators = std::borrow::Cow::Borrowed(list.locators.as_slice());
+                if locators.len() > 1 {
+                    locators.to_mut().sort_by(|a, b| {
+                        if snapshot.uses_hlc_authority() {
+                            b.max_hlc
+                                .cmp(&a.max_hlc)
+                                .then_with(|| b.max_epoch.cmp(&a.max_epoch))
+                        } else {
+                            b.max_epoch
+                                .cmp(&a.max_epoch)
+                                .then_with(|| b.max_hlc.cmp(&a.max_hlc))
+                        }
+                    });
+                }
                 // Apply the conservative snapshot filter and the safe
                 // early-stop proof — locators that provably cannot contain a
                 // visible version, or whose maximum visible version is
@@ -7387,7 +7403,7 @@ impl Table {
                 // is opened in newest-first order.
                 let mut opened: std::collections::HashSet<u128> = std::collections::HashSet::new();
                 let mut early_stopped: u64 = 0;
-                for locator in &locators {
+                for locator in locators.iter() {
                     // REM-004 early-stop: once we have a winner, skip
                     // locators that provably cannot beat it.
                     let stamp = best
@@ -7405,7 +7421,7 @@ impl Table {
                     if locator.is_impossible_for(snapshot) {
                         continue;
                     }
-                    if !opened.insert(locator.run_id) {
+                    if locators.len() > 1 && !opened.insert(locator.run_id) {
                         continue;
                     }
                     self.lookup_metrics
@@ -11763,6 +11779,7 @@ impl Table {
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
+        self.refresh_active_run_fingerprint();
         self.run_row_id_ranges
             .insert(run_id as u128, (header.min_row_id, header.max_row_id));
         self.live_count = self.live_count.saturating_add(write_n as u64);
@@ -14087,6 +14104,7 @@ impl Table {
         self.auto_inc = resolve_auto_inc(&self.schema);
         self.column_keys = build_column_keys(self.kek.as_deref(), &self.schema);
         self.clear_result_cache();
+        self.refresh_active_run_fingerprint();
         let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
     }
 
@@ -14541,6 +14559,7 @@ impl Table {
 
     pub(crate) fn link_run(&mut self, run_ref: crate::manifest::RunRef) {
         self.run_refs.push(run_ref);
+        self.refresh_active_run_fingerprint();
     }
 
     /// Link a spilled run found during shared-WAL recovery (spec §8.5).
@@ -14608,6 +14627,7 @@ impl Table {
         }
         self.live_count = self.live_count.saturating_add(run_ref.row_count);
         self.run_refs.push(run_ref);
+        self.refresh_active_run_fingerprint();
         self.indexes_complete = false;
         true
     }
@@ -14623,21 +14643,19 @@ impl Table {
         body: impl FnOnce(&mut RunReader) -> T,
     ) -> Result<T> {
         let mut cache = self.run_readers.lock();
-        if !cache.contains_key(&run_id) {
-            drop(cache);
-            let reader = self.open_reader(run_id)?;
-            cache = self.run_readers.lock();
-            // Bound the map to the warm fixtures (16 and 64 runs). A long-lived
-            // table must not pin every run it has ever point-queried.
-            if cache.len() >= 64 && !cache.contains_key(&run_id) {
-                cache.clear();
-            }
-            cache.entry(run_id).or_insert(reader);
+        if let Some(reader) = cache.get_mut(&run_id) {
+            return Ok(body(reader));
         }
-        let reader = cache
-            .get_mut(&run_id)
-            .expect("sorted-run reader is cached for this lookup");
-        Ok(body(reader))
+        drop(cache);
+        let reader = self.open_reader(run_id)?;
+        cache = self.run_readers.lock();
+        // Keep the bounded warm set large enough for the 256-run scaling
+        // contract; clearing it on every 65th run forces random point reads
+        // to reopen readers continuously.
+        if cache.len() >= 256 && !cache.contains_key(&run_id) {
+            cache.clear();
+        }
+        Ok(body(cache.entry(run_id).or_insert(reader)))
     }
 
     fn run_id_from_entry_name(name: &Path) -> Option<u128> {
@@ -14701,6 +14719,7 @@ impl Table {
 
     pub(crate) fn set_run_refs(&mut self, refs: Vec<RunRef>) {
         self.run_refs = refs;
+        self.refresh_active_run_fingerprint();
         self.refresh_run_row_id_ranges();
     }
 

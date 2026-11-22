@@ -222,8 +222,9 @@ latencies in µs, 1,000 queries for the scaling pair and 10,000 per layout:
 | 256 | hot-key history | 9.9 | 18.8 | 20.5 |
 | 256 | wide-miss | 50.0 | 53.9 | 146.1 |
 
-The scaling gate compares the 1-run against the 256-run warm p95:
-56.1 / 40.9 = **1.37 ≤ 1.4** (`POINT_LOOKUP_MAX_P95_RATIO`), recorded in the
+The scaling gate compares equal-population (5,120-row) fixtures using the median
+of five interleaved warm measurements. Latest local release result:
+1.930 / 1.814 = **1.06 ≤ 1.4** (`POINT_LOOKUP_MAX_P95_RATIO`), recorded in the
 `point-lookup-runs.jsonl` evidence artifact as the
 `point_lookup_scaling_256_to_1` record; exceeding the ratio fails `overall`
 in the closure status. Layout counters (`directory_lookup_hit`,
@@ -432,7 +433,7 @@ median p95 tripwires are exceeded (`p0p2-threshold-verdict.jsonl`).
 | C | Async persistent result cache | DONE (15/15 contract tests) |
 | D | True streaming cursors | test surface DONE (7/9; 2 ignored with explicit gap notes) |
 | F | HOT fallback observability | DONE (6/6 lookup + 1/1 hot_metrics + 289/289 server) |
-| B | Point lookup directory | DONE (28/28 directory tests; 256-run scaling gate 1.37 ≤ 1.4 measured on the exact-SHA tree) |
+| B | Point lookup directory | DONE (28/28 directory tests; equal-population 256-run scaling gate 1.06 ≤ 1.4 measured locally) |
 | E | Non-Bitmap churn oracle | oracle + strict snapshot-aware model DONE (13/13 on seed 1, all nine families); 30-night / 4-week durable history accumulates in CI |
 | Final | Closure workflow + docs | `scripts/run-residual-closure.sh` + contract-driven workflow (`residual-closure-contract.json`) + one-seed-per-job 8-seed churn matrix + `verify-exact-sha` + churn-history gate + ADR-0014 + hot metrics export + REM-J P0/P2 harvester all shipped |
 
@@ -486,7 +487,9 @@ working tree.
 - Oracle pin pairing + boundary compact retention and measured ineligible hits are in
   `index_churn_oracle` (see residual commits after `ff577180`).
 - P0/P2 **same-runner** ratios require `OUT_DIR/baseline/*.jsonl` harvested from the
-  configured per-surface `baseline_sha` on the **same runner**; missing surfaces fail
+  configured `baseline_sha` on the **same runner**. The residual-closure orchestrator
+  creates a clean detached worktree at that SHA and harvests the baseline with the same
+  repetition count before measuring the candidate; missing or dirty evidence fails
   closed. Static reference medians in `docs/ai/p0p2-baseline-ratios.json` are **not**
   same-runner evidence.
 - Exact-SHA residual-closure artifact for this train is **not** claimed until the
