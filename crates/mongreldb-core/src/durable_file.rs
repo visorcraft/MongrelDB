@@ -268,7 +268,7 @@ impl DurableRoot {
                     Err(e) => return Err(e),
                 };
                 if meta.is_file() {
-                    std::fs::File::open(&path)?.sync_all()?;
+                    mongreldb_types::durability::sync_file(&path)?;
                 } else if meta.is_dir() {
                     // Best-effort: entry-name durability for immediate
                     // subdirectories (e.g. `_wal/`, `_runs/`).
@@ -560,13 +560,13 @@ impl DurableRoot {
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             let (path, _ancestors) = self.windows_path(relative.as_ref())?;
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)?;
             ensure_windows_regular(&file, &path).map_err(mongrel_error_to_io)?;
@@ -823,7 +823,7 @@ impl DurableRoot {
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             let (path, _ancestors) = self.windows_path(relative.as_ref())?;
             let file = std::fs::OpenOptions::new()
@@ -831,7 +831,7 @@ impl DurableRoot {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&path)?;
             ensure_windows_regular(&file, &path).map_err(mongrel_error_to_io)?;
@@ -1233,13 +1233,13 @@ impl DurableRoot {
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             };
             let (path, _ancestors) = self.windows_path(relative)?;
             return std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path);
         }
@@ -1643,15 +1643,20 @@ where
 
 #[cfg(windows)]
 fn open_windows_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    // Every Windows durable handle shares delete. Without FILE_SHARE_DELETE,
+    // a later rename or delete of that path returns ERROR_ACCESS_DENIED (os
+    // error 5) while the handle is still open. That is the Table::create
+    // failure from the Windows qualification nightly.
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(path)
 }
@@ -1661,15 +1666,15 @@ fn open_windows_for_delete(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let mut options = std::fs::OpenOptions::new();
     options
         .read(true)
         .access_mode(GENERIC_READ | DELETE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(path)
 }

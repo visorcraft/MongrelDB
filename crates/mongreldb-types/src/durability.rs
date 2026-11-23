@@ -3,6 +3,16 @@
 use std::io;
 use std::path::Path;
 
+/// Flushes file data. Opened for write because Windows `FlushFileBuffers`
+/// returns `ERROR_ACCESS_DENIED` on a read-only handle.
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
 /// Flushes directory metadata so published entries survive a crash.
 pub fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
@@ -84,7 +94,9 @@ fn sync_tree_recursive_impl(dir: &Path) -> io::Result<()> {
             sync_tree_recursive_impl(&path)?;
             sync_directory(&path)?;
         } else if meta.is_file() {
-            std::fs::File::open(&path)?.sync_all()?;
+            // A read-only handle makes FlushFileBuffers return
+            // ERROR_ACCESS_DENIED on Windows.
+            sync_file(&path)?;
         }
     }
     sync_directory(dir)
@@ -97,5 +109,21 @@ mod tests {
     #[test]
     fn syncs_directory() {
         sync_directory(&std::env::current_dir().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn syncs_file_through_a_writable_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "mongreldb-sync-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        let result = sync_file(&path);
+        let _ = std::fs::remove_file(&path);
+        result.unwrap();
     }
 }
