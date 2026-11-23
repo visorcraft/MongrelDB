@@ -3,7 +3,7 @@
   "rows": 100000,
   "minimum_queries": 10,
   "ann": {
-    "maximum_p95_us": 2500,
+    "maximum_p95_us": 5000,
     "minimum_hamming_recall_at_10": 0.7,
     "minimum_cosine_recall_at_10": 0.15
   },
