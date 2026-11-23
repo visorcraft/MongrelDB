@@ -7,12 +7,18 @@ use mongreldb::*;
 use std::ffi::{CStr, CString};
 
 fn make_tempdir() -> std::path::PathBuf {
+    // These tests run in parallel in one process. A nanosecond timestamp can
+    // collide, and the second mongreldb_create then fails because that
+    // database is already open.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "mdb_ffi_test_{}_{}",
+        "mdb_ffi_test_{}_{}_{}",
         std::process::id(),
+        n,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
