@@ -3598,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "base64 0.23.1",
@@ -3621,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-cluster"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "getrandom 0.4.3",
  "mongreldb-consensus",
@@ -3646,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-consensus"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "bincode",
  "futures",
@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -3709,14 +3709,14 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-fault"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "mongreldb-ffi"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "cc",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-log"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -3756,7 +3756,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-migrate-mysql"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "futures",
@@ -3778,7 +3778,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-mysql-wire"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "async-trait",
@@ -3798,7 +3798,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-node"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "base64 0.23.1",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-perf"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "duckdb",
  "mongreldb-core",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-protocol"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "mongreldb-types",
  "prost",
@@ -3848,7 +3848,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "aes-gcm",
  "arrow 59.3.2",
@@ -3876,7 +3876,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-server"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "arrow 59.3.2",
  "async-trait",
@@ -3912,7 +3912,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-sim"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3921,7 +3921,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.66.3"
+version = "0.67.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
