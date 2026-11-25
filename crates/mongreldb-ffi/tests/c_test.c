@@ -360,8 +360,8 @@ int main(void) {
     assert(build_info != NULL);
     /* Version is checked against CARGO_PKG_VERSION of the linked library
      * after bump-version; print the payload so CI mismatches are obvious. */
-    if (strstr(build_info, "\"engine_version\":\"0.67.0\"") == NULL ||
-        strstr(build_info, "\"query_version\":\"0.67.0\"") == NULL) {
+    if (strstr(build_info, "\"engine_version\":\"0.67.1\"") == NULL ||
+        strstr(build_info, "\"query_version\":\"0.67.1\"") == NULL) {
         fprintf(stderr, "unexpected mongreldb_build_info: %s\n", build_info);
         mongreldb_free_string(build_info);
         return 1;

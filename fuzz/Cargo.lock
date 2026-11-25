@@ -2527,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-fault"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "thiserror",
 ]
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-log"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-protocol"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "mongreldb-types",
  "prost",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-server"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.67.0"
+version = "0.67.1"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
