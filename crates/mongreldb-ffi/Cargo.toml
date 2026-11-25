@@ -30,7 +30,7 @@ mongreldb-query = { path = "../mongreldb-query", version = "0.67.0" }
 # Migration planning/checksum (shared with all language bindings via kit-core).
 # Resolved from crates.io since the FFI is a standalone crate.
 mongreldb-kit-core = "=0.67.0"
-arrow = "59"
+arrow = "60"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
 parking_lot = "0.13"
 serde_json = { version = "1", features = ["preserve_order"] }

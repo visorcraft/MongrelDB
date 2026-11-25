@@ -9,7 +9,7 @@ repository = "https://github.com/visorcraft/MongrelDB"
 homepage.workspace = true
 
 [dependencies]
-arrow = "59"
+arrow = "60"
 async-trait = "0.1"
 mongreldb-client = { path = "../mongreldb-client", version = "0.67.0" }
 mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.67.0" }

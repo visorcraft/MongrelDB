@@ -433,7 +433,7 @@ impl TableProvider for MongrelProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -531,7 +531,7 @@ impl TableProvider for MongrelProvider {
                     .map_err(core_err)?
             };
             enforce_source_rows_limit(&rows, registered_query.as_ref())?;
-            if projection.is_some_and(Vec::is_empty) {
+            if projection.is_some_and(<[usize]>::is_empty) {
                 return Ok(Arc::new(scan::MongrelScanExec::new_row_count(rows.len())));
             }
             let batch = arrow_conv::rows_to_batch(&rows, &self.core_schema)
@@ -1689,7 +1689,7 @@ fn translate_sqlparser_predicate(
                 values,
             })
         }
-        // `col IS NULL` / `col IS NOT NULL`. sqlparser 0.62 represents these as
+        // `col IS NULL` / `col IS NOT NULL`. sqlparser 0.63 represents these as
         // `IsNull(expr)` / `IsNotNull(expr)` (and, defensively, `IsBoolean`).
         Expr::IsNull(inner) => {
             let cid = col_def(sp_ident_name(inner)?)?.id;
@@ -4961,7 +4961,7 @@ fn parse_stmt_ident(s: &str) -> Option<String> {
 }
 
 /// Whether `sql` is an `EXPLAIN ANALYZE ...` statement. EXPLAIN ANALYZE falls
-/// through to DataFusion 55 (which executes the plan and reports per-operator
+/// through to DataFusion 56 (which executes the plan and reports per-operator
 /// timing), but its output must never be result-cached: the timing metrics are
 /// request-specific and would be misleading on a cache hit.
 fn is_explain_analyze(sql: &str) -> bool {

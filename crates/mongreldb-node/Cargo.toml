@@ -19,7 +19,7 @@ mongreldb-query = { path = "../mongreldb-query", version = "0.67.0" }
 napi = { version = "2", default-features = false, features = ["dyn-symbols", "napi8", "tokio_rt"] }
 napi-derive = "2"
 parking_lot = "0.13"
-arrow = "59"
+arrow = "60"
 base64 = "0.23"
 bytemuck = "1"
 ureq = { version = "2", features = ["json"] }

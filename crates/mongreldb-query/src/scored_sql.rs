@@ -506,7 +506,7 @@ impl TableProvider for LiveScoredProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -525,7 +525,7 @@ impl TableProvider for LiveScoredProvider {
             schema,
             execute: Arc::clone(&self.execute),
             runtime: Arc::clone(&self.runtime),
-            projection: projection.cloned(),
+            projection: projection.map(<[usize]>::to_vec),
             limit,
         }))
     }

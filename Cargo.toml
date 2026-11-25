@@ -21,8 +21,8 @@ resolver = "2"
 
 # Held at the newest release that still builds with the rest of the graph:
 # bincode 1.3 (2.x rejects `#[serde(skip)]` on the WAL row codec; 3.0.0 does
-# not compile), arrow 59 and sqlparser 0.62 (datafusion 55.2's latest
-# compatible pair; arrow 60 and sqlparser 0.64 do not unify).
+# not compile) and sqlparser 0.63 (datafusion 56.0's compatible release;
+# sqlparser 0.64 does not unify).
 #
 # opensrv-mysql 0.7.0 (latest crates.io release) pins tokio-rustls 0.25 /
 # rustls 0.22, which pulls the vulnerable rustls-webpki 0.102 line. Upstream

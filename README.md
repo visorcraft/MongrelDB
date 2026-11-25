@@ -14,7 +14,7 @@
   <a href="https://github.com/visorcraft/MongrelDB/releases/latest"><img src="https://img.shields.io/github/v/release/visorcraft/MongrelDB?sort=semver" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0" />
   <img src="https://img.shields.io/badge/built%20with-Rust-000000?logo=rust&amp;logoColor=white" alt="Built with Rust" />
-  <img src="https://img.shields.io/badge/engine-DataFusion%2055-4B8BBE" alt="DataFusion 55" />
+  <img src="https://img.shields.io/badge/engine-DataFusion%2056-4B8BBE" alt="DataFusion 56" />
   <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-333333?logo=linux&amp;logoColor=white" alt="Platform: Linux, macOS, Windows" />
 </p>
 
@@ -199,7 +199,7 @@ Latest local release-build measurements are in
   `DatabaseHandle`s to one shared core via `DatabaseManager::open_shared`
   (Stage 1A); a second independent open, including path aliases, returns
   `DatabaseLocked` immediately.
-- **SQL surface:** DataFusion 55 with `WITH RECURSIVE` CTEs, window functions
+- **SQL surface:** DataFusion 56 with `WITH RECURSIVE` CTEs, window functions
   (`OVER`/`PARTITION BY`), `CREATE TABLE AS SELECT`, session-scoped
   `CREATE VIEW` plus `CREATE MATERIALIZED VIEW`, multi-statement execution in a
   single `run()` call, and an FTS ranking UDF
@@ -487,7 +487,7 @@ crates/mongreldb-core/    WAL, memtable, Bε-tree, sorted runs (mmap'd), vectori
                           columnar codec, six secondary index kinds (Bitmap/PGM/FM/
                           ANN/Sparse/MinHash), page stats, encryption, constraints,
                           compaction, GC, check/doctor
-crates/mongreldb-query/   DataFusion 55 SQL + Arrow frontend (predicate/projection
+crates/mongreldb-query/   DataFusion 56 SQL + Arrow frontend (predicate/projection
                           pushdown, multi-table joins, ann_search/sparse_match UDF,
                           result cache, Arrow IPC shadow, materialized views)
 crates/mongreldb-types/   shared durable/network types: cluster-wide identifiers,

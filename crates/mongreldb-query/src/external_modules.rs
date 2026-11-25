@@ -1087,7 +1087,7 @@ impl TableProvider for ExternalTableProvider {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -1096,7 +1096,7 @@ impl TableProvider for ExternalTableProvider {
         });
         let schema = self.table.schema();
         let request = ExternalPlanRequest {
-            projection: projection.cloned(),
+            projection: projection.map(<[usize]>::to_vec),
             filters: filters
                 .iter()
                 .map(|filter| external_filter_from_expr(filter, &schema))
@@ -1127,7 +1127,7 @@ impl TableProvider for ExternalTableProvider {
             schema: output_schema,
             db: Arc::clone(&self.db),
             table: Arc::clone(&self.table),
-            projection: projection.cloned(),
+            projection: projection.map(<[usize]>::to_vec),
             filters: filters.to_vec(),
             limit,
         }))

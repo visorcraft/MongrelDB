@@ -30,10 +30,10 @@ use sqlparser::ast::{
     CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, DataType,
     Delete, DropPolicy, DropTrigger, Expr, FromTable, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, IndexColumn, Insert, ObjectName, ObjectType, OnConflictAction,
-    OnInsert, Owner, Query, RenameTableNameKind, Set, SetExpr, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionIsolationLevel, TransactionMode,
-    TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod, Truncate,
-    UnaryOperator, Value as SqlValue,
+    OnInsert, OrderBySort, Owner, Query, RenameTableNameKind, Set, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionIsolationLevel,
+    TransactionMode, TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind,
+    TriggerPeriod, Truncate, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -5401,6 +5401,9 @@ fn add_table_constraint(
             "UNIQUE and FOREIGN KEY enforcement is provided by MongrelDB Kit, not core SQL DDL"
                 .into(),
         )),
+        TableConstraint::Exclude(_) => Err(MongrelQueryError::Schema(
+            "EXCLUDE constraints are not supported".into(),
+        )),
     }
 }
 
@@ -6004,10 +6007,12 @@ fn apply_order_by(
                 Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.as_str()),
                 _ => None,
             }?;
-            name_to_id
-                .get(column_name)
-                .copied()
-                .map(|column_id| (column_id, expr.options.asc == Some(false)))
+            name_to_id.get(column_name).copied().map(|column_id| {
+                (
+                    column_id,
+                    matches!(expr.options.sort, Some(OrderBySort::Desc)),
+                )
+            })
         })
         .collect::<Vec<_>>();
     if rows.len() < 2 || sort_specs.is_empty() {
@@ -7196,6 +7201,11 @@ fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
             | TableConstraint::FulltextOrSpatial(_) => {
                 return Err(MongrelQueryError::Schema(
                     "UNIQUE, FOREIGN KEY, and SPATIAL constraints are not enforced by core SQL DDL; use MongrelDB Kit for those constraints".into(),
+                ));
+            }
+            TableConstraint::Exclude(_) => {
+                return Err(MongrelQueryError::Schema(
+                    "EXCLUDE constraints are not supported".into(),
                 ));
             }
         }
@@ -11737,5 +11747,34 @@ mod ssi_sql_tests {
             .await
             .expect("FOR UPDATE inside BEGIN acquires row locks");
         session.run("COMMIT").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclude_table_constraint_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+        let err = session
+            .run("CREATE TABLE t (id BIGINT PRIMARY KEY, EXCLUDE USING gist (id WITH =))")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("EXCLUDE"),
+            "unexpected CREATE TABLE error: {err}"
+        );
+
+        session
+            .run("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        let err = session
+            .run("ALTER TABLE t ADD CONSTRAINT t_excl EXCLUDE USING gist (id WITH =)")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("EXCLUDE"),
+            "unexpected ALTER TABLE error: {err}"
+        );
     }
 }
